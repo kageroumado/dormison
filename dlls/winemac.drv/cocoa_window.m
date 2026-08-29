@@ -2432,7 +2432,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         NSImage* dockIcon = [[[NSImage alloc] initWithSize:NSMakeSize(256, 256)] autorelease];
         [dockIcon lockFocus];
 
-        CGContextRef cgcontext = [[NSGraphicsContext currentContext] graphicsPort];
+        CGContextRef cgcontext = [[NSGraphicsContext currentContext] CGContext];
 
         CGRect rect = CGRectMake(8, 8, 240, 240);
         size_t width = CGImageGetWidth(windowImage);
