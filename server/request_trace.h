@@ -3536,6 +3536,31 @@ static void dump_alpc_create_port_reply( const struct alpc_create_port_reply *re
     fprintf( stderr, " handle=%04x", req->handle );
 }
 
+static void dump_dcomp_create_shared_visual_request( const struct dcomp_create_shared_visual_request *req )
+{
+}
+
+static void dump_dcomp_create_shared_visual_reply( const struct dcomp_create_shared_visual_reply *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
+static void dump_dcomp_set_shared_visual_info_request( const struct dcomp_set_shared_visual_info_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+    dump_uint64( ", target_root=", &req->target_root );
+}
+
+static void dump_dcomp_get_shared_visual_info_request( const struct dcomp_get_shared_visual_info_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
+static void dump_dcomp_get_shared_visual_info_reply( const struct dcomp_get_shared_visual_info_reply *req )
+{
+    dump_uint64( " target_root=", &req->target_root );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3848,6 +3873,9 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_request,
     (dump_func)dump_d3dkmt_mutex_release_request,
     (dump_func)dump_alpc_create_port_request,
+    (dump_func)dump_dcomp_create_shared_visual_request,
+    (dump_func)dump_dcomp_set_shared_visual_info_request,
+    (dump_func)dump_dcomp_get_shared_visual_info_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4160,6 +4188,9 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_reply,
     NULL,
     (dump_func)dump_alpc_create_port_reply,
+    (dump_func)dump_dcomp_create_shared_visual_reply,
+    NULL,
+    (dump_func)dump_dcomp_get_shared_visual_info_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4472,6 +4503,9 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "d3dkmt_mutex_acquire",
     "d3dkmt_mutex_release",
     "alpc_create_port",
+    "dcomp_create_shared_visual",
+    "dcomp_set_shared_visual_info",
+    "dcomp_get_shared_visual_info",
 };
 
 static const struct
@@ -4555,6 +4589,7 @@ static const struct
     { "INVALID_USER_BUFFER",         STATUS_INVALID_USER_BUFFER },
     { "IO_REPARSE_DATA_INVALID",     STATUS_IO_REPARSE_DATA_INVALID },
     { "IO_REPARSE_TAG_INVALID",      STATUS_IO_REPARSE_TAG_INVALID },
+    { "IO_REPARSE_TAG_NOT_HANDLED",  STATUS_IO_REPARSE_TAG_NOT_HANDLED },
     { "IO_TIMEOUT",                  STATUS_IO_TIMEOUT },
     { "KERNEL_APC",                  STATUS_KERNEL_APC },
     { "KEY_DELETED",                 STATUS_KEY_DELETED },

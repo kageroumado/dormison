@@ -1,0 +1,7 @@
+TESTDLL = dcomp.dll
+IMPORTS = d2d1 d3d10_1 user32 gdi32
+
+PARENTSRC = ../
+SOURCES = \
+	dcomp.c \
+	dcomp_private_iface.idl

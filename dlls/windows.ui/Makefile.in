@@ -7,6 +7,8 @@ SOURCES = \
 	corewindow.c \
 	inputpane.c \
 	main.c \
+	radialcontroller.c \
+	radialcontrollermenuitem.c \
 	uisettings.c \
 	uiviewsettings.c \
 	weakref.c

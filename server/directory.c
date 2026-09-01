@@ -138,6 +138,7 @@ static struct type_descr *types[] =
     &apc_reserve_type,
     &completion_reserve_type,
     &alpc_port_type,
+    &composition_type,
 };
 
 static void object_type_dump( struct object *obj, int verbose )

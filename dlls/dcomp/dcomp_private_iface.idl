@@ -1,0 +1,361 @@
+/*
+ * Copyright 2024 Zhiyi Zhang for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#pragma makedep header
+
+import "dcomp.idl";
+
+[
+    object,
+    uuid(d14b6158-c3fa-4bce-9c1f-b61d8665eab0),
+    local,
+    pointer_default(unique)
+]
+interface IDCompositionDesktopDevicePartner : IDCompositionDesktopDevice
+{
+    HRESULT CreateSharedResource([in] REFIID riid, [out] void **obj);
+    HRESULT OpenSharedResourceHandle([in] IUnknown *unknown, [out] HANDLE *handle);
+    HRESULT CreateFromSharedVisualHandle([in] HANDLE handle, [in] REFIID iid, [out] void **out);
+}
+
+[
+    object,
+    uuid(28d6ad3d-ee2a-4bcd-9419-7d54800435b1),
+    local,
+    pointer_default(unique)
+]
+interface IDCompositionDeviceUnknown : IDCompositionDesktopDevicePartner
+{
+    HRESULT Unknown1();
+    HRESULT Unknown2();
+    HRESULT Unknown3();
+    HRESULT Unknown4();
+    HRESULT Unknown5();
+    HRESULT Unknown6();
+    HRESULT Unknown7();
+    HRESULT Unknown8();
+    HRESULT Unknown9();
+    HRESULT Unknown10();
+    HRESULT Unknown11();
+    HRESULT Unknown12();
+    HRESULT Unknown13();
+    HRESULT Unknown14();
+    HRESULT Unknown15();
+    HRESULT Unknown16(void **parameter1);
+    HRESULT Unknown17(void **parameter1);
+    HRESULT Unknown18();
+    HRESULT Unknown19();
+    HRESULT Unknown20();
+    HRESULT Unknown21();
+    HRESULT Unknown22();
+    HRESULT Unknown23();
+    HRESULT Unknown24();
+    HRESULT Unknown25();
+    HRESULT Unknown26();
+    HRESULT Unknown27();
+    HRESULT Unknown28();
+    HRESULT Unknown29();
+    HRESULT Unknown30();
+    HRESULT Unknown31();
+    HRESULT Unknown32();
+    HRESULT Unknown33();
+    HRESULT Unknown34();
+    HRESULT Unknown35();
+    HRESULT Unknown36();
+    HRESULT Unknown37();
+    HRESULT Unknown38();
+    HRESULT Unknown39();
+    HRESULT Unknown40();
+    HRESULT Unknown41();
+    HRESULT Unknown42();
+    HRESULT Unknown43();
+    HRESULT Unknown44();
+    HRESULT Unknown45();
+    HRESULT Unknown46();
+    HRESULT Unknown47();
+    HRESULT Unknown48();
+    HRESULT Unknown49();
+    HRESULT Unknown50();
+    HRESULT Unknown51();
+    HRESULT Unknown52();
+    HRESULT Unknown53();
+    HRESULT Unknown54();
+    HRESULT Unknown55();
+    HRESULT Unknown56();
+    HRESULT Unknown57();
+    HRESULT Unknown58();
+    HRESULT Unknown59();
+    HRESULT Unknown60();
+    HRESULT Unknown61();
+    HRESULT Unknown62();
+    HRESULT Unknown63();
+    HRESULT Unknown64();
+    HRESULT Unknown65();
+    HRESULT Unknown66();
+    HRESULT Unknown67();
+    HRESULT Unknown68();
+    HRESULT Unknown69();
+    HRESULT Unknown70();
+    HRESULT Unknown71();
+    HRESULT Unknown72();
+    HRESULT Unknown73();
+    HRESULT Unknown74();
+    HRESULT Unknown75();
+    HRESULT Unknown76();
+    HRESULT Unknown77();
+    HRESULT Unknown78();
+    HRESULT Unknown79();
+    HRESULT Unknown80();
+    HRESULT Unknown81();
+    HRESULT Unknown82();
+    HRESULT Unknown83();
+    HRESULT Unknown84();
+    HRESULT Unknown85();
+    HRESULT Unknown86();
+    HRESULT Unknown87();
+    HRESULT Unknown88();
+    HRESULT Unknown89();
+    HRESULT Unknown90();
+    HRESULT Unknown91();
+    HRESULT Unknown92();
+    HRESULT Unknown93();
+    HRESULT Unknown94();
+    HRESULT Unknown95();
+    HRESULT Unknown96();
+    HRESULT Unknown97();
+    HRESULT Unknown98();
+    HRESULT Unknown99();
+}
+
+[
+    object,
+    uuid(2c4eef28-1bc0-4736-b7dd-b62692f9bd67),
+    local,
+    pointer_default(unique)
+]
+interface IDCompositionVisualUnknown : IDCompositionVisual2
+{
+    HRESULT Unknown1();
+    HRESULT Unknown2();
+    HRESULT Unknown3();
+    HRESULT Unknown4();
+    HRESULT Unknown5();
+    HRESULT Unknown6();
+    HRESULT Unknown7();
+    HRESULT Unknown8();
+    HRESULT Unknown9();
+    HRESULT Unknown10();
+    HRESULT Unknown11();
+    HRESULT Unknown12();
+    HRESULT Unknown13();
+    HRESULT Unknown14(void *parameter1);
+    HRESULT Unknown15();
+    HRESULT Unknown16();
+    HRESULT Unknown17();
+    HRESULT Unknown18();
+    HRESULT Unknown19(float parameter1);
+    HRESULT Unknown20(float parameter1);
+    HRESULT Unknown21();
+    HRESULT Unknown22();
+    HRESULT Unknown23();
+    HRESULT Unknown24();
+    HRESULT Unknown25();
+    HRESULT Unknown26();
+    HRESULT Unknown27();
+    HRESULT Unknown28();
+    HRESULT Unknown29();
+    HRESULT Unknown30();
+    HRESULT Unknown31();
+    HRESULT Unknown32();
+    HRESULT Unknown33();
+    HRESULT Unknown34();
+    HRESULT Unknown35();
+    HRESULT Unknown36();
+    HRESULT Unknown37();
+    HRESULT Unknown38();
+    HRESULT Unknown39();
+    HRESULT Unknown40();
+    HRESULT Unknown41();
+    HRESULT Unknown42();
+    HRESULT Unknown43();
+    HRESULT Unknown44();
+    HRESULT Unknown45();
+    HRESULT Unknown46();
+    HRESULT Unknown47();
+    HRESULT Unknown48();
+    HRESULT Unknown49();
+    HRESULT Unknown50();
+    HRESULT Unknown51();
+    HRESULT Unknown52();
+    HRESULT Unknown53();
+    HRESULT Unknown54();
+    HRESULT Unknown55();
+    HRESULT Unknown56();
+    HRESULT Unknown57();
+    HRESULT Unknown58();
+    HRESULT Unknown59();
+    HRESULT Unknown60();
+    HRESULT Unknown61();
+    HRESULT Unknown62();
+    HRESULT Unknown63();
+    HRESULT Unknown64();
+    HRESULT Unknown65();
+    HRESULT Unknown66();
+    HRESULT Unknown67();
+    HRESULT Unknown68();
+    HRESULT Unknown69();
+    HRESULT Unknown70();
+    HRESULT Unknown71();
+    HRESULT Unknown72();
+    HRESULT Unknown73();
+    HRESULT Unknown74();
+    HRESULT Unknown75();
+    HRESULT Unknown76();
+    HRESULT Unknown77();
+    HRESULT Unknown78();
+    HRESULT Unknown79();
+    HRESULT Unknown80();
+    HRESULT Unknown81();
+    HRESULT Unknown82();
+    HRESULT Unknown83();
+    HRESULT Unknown84();
+    HRESULT Unknown85();
+    HRESULT Unknown86();
+    HRESULT Unknown87();
+    HRESULT Unknown88();
+    HRESULT Unknown89();
+    HRESULT Unknown90();
+    HRESULT Unknown91();
+    HRESULT Unknown92();
+    HRESULT Unknown93();
+    HRESULT Unknown94();
+    HRESULT Unknown95();
+    HRESULT Unknown96();
+    HRESULT Unknown97();
+    HRESULT Unknown98();
+    HRESULT Unknown99();
+}
+
+[
+    object,
+    uuid(5680c979-14c8-48b5-8b92-3247379fd907),
+    local,
+    pointer_default(unique)
+]
+interface IDCompositionSurfaceUnknown : IDCompositionSurface
+{
+    HRESULT Unknown1();
+    HRESULT Unknown2();
+    HRESULT Unknown3(UINT, UINT);
+    HRESULT Unknown4();
+    HRESULT Unknown5();
+    HRESULT Unknown6();
+    HRESULT Unknown7();
+    HRESULT Unknown8();
+    HRESULT Unknown9();
+    HRESULT Unknown10();
+    HRESULT Unknown11();
+    HRESULT Unknown12();
+    HRESULT Unknown13();
+    HRESULT Unknown14();
+    HRESULT Unknown15();
+    HRESULT Unknown16();
+    HRESULT Unknown17();
+    HRESULT Unknown18();
+    HRESULT Unknown19();
+    HRESULT Unknown20();
+    HRESULT Unknown21();
+    HRESULT Unknown22();
+    HRESULT Unknown23();
+    HRESULT Unknown24();
+    HRESULT Unknown25();
+    HRESULT Unknown26();
+    HRESULT Unknown27();
+    HRESULT Unknown28();
+    HRESULT Unknown29();
+    HRESULT Unknown30();
+    HRESULT Unknown31();
+    HRESULT Unknown32();
+    HRESULT Unknown33();
+    HRESULT Unknown34();
+    HRESULT Unknown35();
+    HRESULT Unknown36();
+    HRESULT Unknown37();
+    HRESULT Unknown38();
+    HRESULT Unknown39();
+    HRESULT Unknown40();
+    HRESULT Unknown41();
+    HRESULT Unknown42();
+    HRESULT Unknown43();
+    HRESULT Unknown44();
+    HRESULT Unknown45();
+    HRESULT Unknown46();
+    HRESULT Unknown47();
+    HRESULT Unknown48();
+    HRESULT Unknown49();
+    HRESULT Unknown50();
+    HRESULT Unknown51();
+    HRESULT Unknown52();
+    HRESULT Unknown53();
+    HRESULT Unknown54();
+    HRESULT Unknown55();
+    HRESULT Unknown56();
+    HRESULT Unknown57();
+    HRESULT Unknown58();
+    HRESULT Unknown59();
+    HRESULT Unknown60();
+    HRESULT Unknown61();
+    HRESULT Unknown62();
+    HRESULT Unknown63();
+    HRESULT Unknown64();
+    HRESULT Unknown65();
+    HRESULT Unknown66();
+    HRESULT Unknown67();
+    HRESULT Unknown68();
+    HRESULT Unknown69();
+    HRESULT Unknown70();
+    HRESULT Unknown71();
+    HRESULT Unknown72();
+    HRESULT Unknown73();
+    HRESULT Unknown74();
+    HRESULT Unknown75();
+    HRESULT Unknown76();
+    HRESULT Unknown77();
+    HRESULT Unknown78();
+    HRESULT Unknown79();
+    HRESULT Unknown80();
+    HRESULT Unknown81();
+    HRESULT Unknown82();
+    HRESULT Unknown83();
+    HRESULT Unknown84();
+    HRESULT Unknown85();
+    HRESULT Unknown86();
+    HRESULT Unknown87();
+    HRESULT Unknown88();
+    HRESULT Unknown89();
+    HRESULT Unknown90();
+    HRESULT Unknown91();
+    HRESULT Unknown92();
+    HRESULT Unknown93();
+    HRESULT Unknown94();
+    HRESULT Unknown95();
+    HRESULT Unknown96();
+    HRESULT Unknown97();
+    HRESULT Unknown98();
+    HRESULT Unknown99();
+}

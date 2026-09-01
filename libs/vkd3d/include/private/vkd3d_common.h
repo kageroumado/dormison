@@ -337,7 +337,7 @@ static inline unsigned int vkd3d_popcount(unsigned int v)
 {
 #ifdef _MSC_VER
     return __popcnt(v);
-#elif defined(__MINGW32__)
+#elif defined(HAVE_BUILTIN_POPCOUNT)
     return __builtin_popcount(v);
 #else
     v -= (v >> 1) & 0x55555555;
@@ -401,12 +401,7 @@ static inline unsigned int vkd3d_log2i(unsigned int x)
 
 static inline unsigned int vkd3d_ctz(uint32_t v)
 {
-#ifdef _WIN32
-    ULONG result;
-    if (_BitScanForward(&result, v))
-        return (unsigned int)result;
-    return 32;
-#elif defined(HAVE_BUILTIN_CTZ)
+#ifdef HAVE_BUILTIN_CTZ
     return __builtin_ctz(v);
 #else
     unsigned int c = 31;
@@ -517,6 +512,11 @@ static inline int vkd3d_u64_compare(uint64_t x, uint64_t y)
 static inline int vkd3d_ptr_compare(const void *x, const void *y)
 {
     return (x > y) - (x < y);
+}
+
+static inline int vkd3d_ptrptr_compare(const void *x, const void *y)
+{
+    return vkd3d_ptr_compare(*(void **)x, *(void **)y);
 }
 
 #define VKD3D_BITMAP_SIZE(x) (((x) + 0x1f) >> 5)
@@ -678,9 +678,9 @@ struct vkd3d_mutex
 };
 
 #ifdef _WIN32
-#define VKD3D_MUTEX_INITIALIZER {{NULL, -1, 0, 0, 0, 0}}
+#define VKD3D_MUTEX_INITIALIZER {.lock = {NULL, -1, 0, 0, 0, 0}}
 #else
-#define VKD3D_MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
+#define VKD3D_MUTEX_INITIALIZER {.lock = PTHREAD_MUTEX_INITIALIZER}
 #endif
 
 static inline void vkd3d_mutex_init(struct vkd3d_mutex *lock)

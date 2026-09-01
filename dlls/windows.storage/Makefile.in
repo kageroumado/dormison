@@ -6,4 +6,5 @@ SOURCES = \
 	async_private.idl \
 	classes.idl \
 	main.c \
+	storagefile.c \
 	streams.c

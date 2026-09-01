@@ -38,6 +38,15 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
 
     *factory = NULL;
 
+    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Input_RadialController ))
+        IActivationFactory_QueryInterface( radialcontroller_factory, &IID_IActivationFactory, (void **)factory );
+
+    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Input_RadialControllerConfiguration ))
+        IActivationFactory_QueryInterface( radialcontrollerconfiguration_factory, &IID_IActivationFactory, (void **)factory );
+
+    if (!wcscmp( buffer, RuntimeClass_Windows_UI_Input_RadialControllerMenuItem ))
+        IActivationFactory_QueryInterface( radialcontrollermenuitem_factory, &IID_IActivationFactory, (void **)factory );
+
     if (!wcscmp( buffer, RuntimeClass_Windows_UI_ViewManagement_AccessibilitySettings ))
         IActivationFactory_QueryInterface( accessibilitysettings_factory, &IID_IActivationFactory, (void **)factory );
 

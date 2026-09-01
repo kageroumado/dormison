@@ -5,7 +5,7 @@
 1033 stub @
 1038 stub @
 1039 stub @
-1040 stub @
+1040 stdcall -noname DCompositionCreateSharedVisualHandle(ptr)
 1041 stub @
 1042 stub @
 

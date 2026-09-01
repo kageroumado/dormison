@@ -20,10 +20,14 @@
 #define WIDL_C_INLINE_WRAPPERS
 #endif
 #define COBJMACROS
+
 #define CONST_VTABLE
 #include "vkd3d.h"
 #include "vkd3d_blob.h"
 #include "vkd3d_memory.h"
+#include "d3d10effect.h"
+#include "d3d10_1shader.h"
+#include "d3d11shader.h"
 #include "d3d12shader.h"
 
 struct vkd3d_blob

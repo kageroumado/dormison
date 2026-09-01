@@ -732,6 +732,103 @@ static void info_win32_active_threads(void)
     }
 }
 
+static BOOL read_process_memory(HANDLE process, const void *ptr, void *buffer, SIZE_T length)
+{
+    SIZE_T read;
+    return ReadProcessMemory(process, ptr, buffer, length, &read) && (read == length);
+}
+
+static BOOL get_process_cmdline(HANDLE process, PEB *peb, UNICODE_STRING *cmdline)
+{
+    RTL_USER_PROCESS_PARAMETERS *params;
+
+    if (!read_process_memory(process, &peb->ProcessParameters, &params, sizeof(params)))
+        return FALSE;
+
+    if (!read_process_memory(process, &params->CommandLine, cmdline, sizeof(*cmdline)))
+        return FALSE;
+
+    return TRUE;
+}
+
+static BOOL get_process_cmdline_wow64(HANDLE process, PEB *peb, UNICODE_STRING *cmdline)
+{
+    DWORD params;
+    struct
+    {
+        USHORT Length;
+        USHORT MaximumLength;
+        DWORD  Buffer;
+    } cmdline32;
+
+    /* &peb->ProcessParameters */
+    if (!read_process_memory(process, (char *)peb + 0x10, &params, sizeof(params)))
+        return FALSE;
+
+    /* &params->CommandLine */
+    if (!read_process_memory(process, (char *)(DWORD_PTR)params + 0x40, &cmdline32, sizeof(cmdline32)))
+        return FALSE;
+
+    cmdline->Length = cmdline32.Length;
+    cmdline->MaximumLength = cmdline32.MaximumLength;
+    cmdline->Buffer = (WCHAR *)(DWORD_PTR)cmdline32.Buffer;
+    return TRUE;
+}
+
+static char *get_process_args(DWORD pid)
+{
+    PROCESS_BASIC_INFORMATION info;
+    BOOL self_wow64, process_wow64;
+    UNICODE_STRING cmdline;
+    WCHAR *tempW = NULL;
+    char *args = NULL;
+    HANDLE process;
+    DWORD len;
+    BOOL ret;
+
+    if (!(process = OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ, FALSE, pid)))
+        return FALSE;
+    if (NtQueryInformationProcess(process, ProcessBasicInformation, &info, sizeof(info), NULL))
+        goto done;
+
+    IsWow64Process(GetCurrentProcess(), &self_wow64);
+    if (!IsWow64Process(process, &process_wow64))
+        goto done;
+
+    if (process_wow64 == self_wow64)
+        ret = get_process_cmdline(process, info.PebBaseAddress, &cmdline);
+    else if (!self_wow64 && process_wow64)
+        ret = get_process_cmdline_wow64(process, info.PebBaseAddress, &cmdline);
+    else
+        ret = FALSE; /* can't read process args of 64-bit process with 32-bit winedbg */
+
+    if (!ret) goto done;
+
+    /* protect against malicious content */
+    if (cmdline.Length > 4096 || (cmdline.Length & 1))
+        goto done;
+
+    if (!(tempW = calloc(1, cmdline.Length + 2)))
+        goto done;
+    if (!read_process_memory(process, cmdline.Buffer, tempW, cmdline.Length))
+        goto done;
+
+    if (!(len = WideCharToMultiByte(CP_ACP, 0, tempW, -1, NULL, 0, NULL, NULL)))
+        goto done;
+    if (!(args = malloc(len)))
+        goto done;
+    if (!WideCharToMultiByte(CP_ACP, 0, tempW, -1, args, len, NULL, NULL))
+    {
+        free(args);
+        args = NULL;
+    }
+
+done:
+    free(tempW);
+    CloseHandle(process);
+    return args;
+}
+
 void info_win32_threads(void)
 {
     if (!dbg_curr_process || dbg_curr_process->active_debuggee)
@@ -741,12 +838,20 @@ void info_win32_threads(void)
         struct dbg_process *pcs;
         struct dbg_thread *thread;
         WCHAR *description;
+        char *args;
 
         dbg_printf("%-8.8s %-8.8s %s    %s (all IDs are in hex)\n",
                    "process", "tid", "prio", "name");
         LIST_FOR_EACH_ENTRY(pcs, &dbg_process_list, struct dbg_process, entry)
         {
             dbg_printf("%08lx%s %ls\n", pcs->pid, " (D)", pcs->imageName);
+            args = get_process_args(pcs->pid);
+            if (args)
+            {
+                dbg_printf("\t[%s]\n", args);
+                free(args);
+            }
+
             LIST_FOR_EACH_ENTRY(thread, &pcs->threads, struct dbg_thread, entry)
             {
                 description = dbg_fetch_thread_name(thread);

@@ -4338,3 +4338,25 @@ enum inproc_sync_type
 @REPLY
     obj_handle_t        handle;         /* handle to the ALPC port */
 @END
+
+
+/* Create a DirectComposition shared visual handle */
+@REQ(dcomp_create_shared_visual)
+@REPLY
+    obj_handle_t  handle;                     /* created shared visual handle */
+@END
+
+
+/* Set info for a DirectComposition shared visual object */
+@REQ(dcomp_set_shared_visual_info)
+    obj_handle_t  handle;                    /* shared visual handle */
+    client_ptr_t  target_root;               /* root IDCompositionVisual pointer for the target created from this shared visual */
+@END
+
+
+/* Get info for a DirectComposition shared visual */
+@REQ(dcomp_get_shared_visual_info)
+    obj_handle_t  handle;                     /* shared visual handle */
+@REPLY
+    client_ptr_t  target_root;                /* root IDCompositionVisual pointer for the target created from this shared visual */
+@END

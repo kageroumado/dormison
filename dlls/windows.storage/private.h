@@ -46,6 +46,7 @@ HRESULT async_operation_buffer_uint32_create( IUnknown *invoker, IUnknown *param
 HRESULT async_operation_uint32_uint32_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
         IAsyncOperationWithProgress_UINT32_UINT32 **out );
 
+extern IActivationFactory *storagefile_factory;
 extern IActivationFactory *random_access_stream_reference_factory;
 extern IActivationFactory *memory_stream_activation_factory;
 

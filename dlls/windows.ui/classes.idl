@@ -39,6 +39,12 @@ namespace Windows.UI.Core {
     runtimeclass CoreWindow;
 }
 
+namespace Windows.UI.Input {
+    runtimeclass RadialController;
+    runtimeclass RadialControllerConfiguration;
+    runtimeclass RadialControllerMenuItem;
+}
+
 namespace Windows.UI.ViewManagement {
     runtimeclass AccessibilitySettings;
     runtimeclass UISettings;

@@ -1,0 +1,45 @@
+/*
+ * Copyright 2025 Ignacy Kuchciński
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+import "inspectable.idl";
+
+[
+    uuid(1b0535c9-57ad-45c1-9d79-ad5c34360513),
+    object,
+    local
+]
+interface IRadialControllerInterop : IInspectable
+{
+    HRESULT CreateForWindow(
+        [in, annotation("__in")] HWND window,
+        [in, annotation("__in")] REFIID riid,
+        [out, retval, iid_is(riid), annotation("__com_outptr")] void **radialcontroller);
+}
+
+[
+    uuid(787cdaac-3186-476d-87e4-b9374a7b9970),
+    object,
+    local
+]
+interface IRadialControllerConfigurationInterop : IInspectable
+{
+    HRESULT GetForWindow(
+        [in, annotation("__in")] HWND window,
+        [in, annotation("__in")] REFIID riid,
+        [out, retval, iid_is(riid), annotation("__com_outptr")] void **radialcontrollerconfiguration);
+}

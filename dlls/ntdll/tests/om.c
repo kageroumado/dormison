@@ -2202,6 +2202,10 @@ static void test_token(void)
 #define ALPC_PORT_GENERIC_EXECUTE     0
 #define ALPC_PORT_GENERIC_READ        (STANDARD_RIGHTS_READ|0x1)
 #define ALPC_PORT_GENERIC_WRITE       (DELETE|0x1)
+#define COMPOSITION_GENERIC_EXECUTE   STANDARD_RIGHTS_READ
+#define COMPOSITION_GENERIC_READ      (STANDARD_RIGHTS_READ|0x1)
+#define COMPOSITION_GENERIC_WRITE     (STANDARD_RIGHTS_READ|0x2)
+#define COMPOSITION_ALL_ACCESS        (STANDARD_RIGHTS_REQUIRED|0x3)
 #define DEBUG_GENERIC_EXECUTE         (STANDARD_RIGHTS_EXECUTE|SYNCHRONIZE)
 #define DEBUG_GENERIC_READ            (STANDARD_RIGHTS_READ|DEBUG_READ_EVENT)
 #define DEBUG_GENERIC_WRITE           (STANDARD_RIGHTS_WRITE|DEBUG_PROCESS_ASSIGN)
@@ -2334,6 +2338,7 @@ static void test_object_types(void)
 #define TYPE(name,gen,extra,broken) { name, { gen ## _GENERIC_READ, gen ## _GENERIC_WRITE, \
                 gen ## _GENERIC_EXECUTE, gen ## _ALL_ACCESS }, gen ## _ALL_ACCESS | extra, broken }
         TYPE( L"ALPC Port",     ALPC_PORT, 0, 0 ),
+        TYPE( L"Composition",   COMPOSITION, 0, 0 ),
         TYPE( L"DebugObject",   DEBUG, 0, 0 ),
         TYPE( L"Desktop",       DESKTOP, 0, 0 ),
         TYPE( L"Device",        FILE, 0, 0 ),

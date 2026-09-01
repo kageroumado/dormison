@@ -33,11 +33,16 @@
 #include "windows.foundation.h"
 #define WIDL_using_Windows_UI
 #include "windows.ui.h"
+#define WIDL_using_Windows_UI_Input
+#include "windows.ui.input.h"
 #define WIDL_using_Windows_UI_Core
 #include "windows.ui.core.h"
 #define WIDL_using_Windows_UI_ViewManagement
 #include "windows.ui.viewmanagement.h"
 
+extern IActivationFactory *radialcontroller_factory;
+extern IActivationFactory *radialcontrollerconfiguration_factory;
+extern IActivationFactory *radialcontrollermenuitem_factory;
 extern IActivationFactory *accessibilitysettings_factory;
 extern IActivationFactory *uisettings_factory;
 extern IActivationFactory *uiviewsettings_factory;

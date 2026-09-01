@@ -390,10 +390,13 @@ static void STDMETHODCALLTYPE dxgi_factory_UnregisterOcclusionStatus(IWineDXGIFa
 static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWineDXGIFactory *iface,
         IUnknown *device, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *output, IDXGISwapChain1 **swapchain)
 {
+    HWND hwnd;
+
     FIXME("iface %p, device %p, desc %p, output %p, swapchain %p stub!\n",
             iface, device, desc, output, swapchain);
 
-    return E_NOTIMPL;
+    hwnd = CreateWindowA("static", NULL, WS_POPUP, 0, 0, desc->Width, desc->Height, 0, 0, 0, NULL);
+    return dxgi_factory_CreateSwapChainForHwnd(iface, device, hwnd, desc, NULL, output, swapchain);
 }
 
 static UINT STDMETHODCALLTYPE dxgi_factory_GetCreationFlags(IWineDXGIFactory *iface)

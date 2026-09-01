@@ -4725,4 +4725,21 @@ Call ok(dateErr <> 0, "Day(""15.03.2026"") en-US should error: err=" & dateErr)
 Call SetLocale(origLcid)
 Call ok(GetLocale() = origLcid, "restore: GetLocale = " & GetLocale())
 
+function wmi_array_bstr()
+const HKEY_LOCAL_MACHINE = &H80000002
+Dim oReg
+
+Set oReg = GetObject("winmgmts:{impersonationLevel=impersonate}!\\.\root\default:StdRegProv")
+
+Dim strKeyPath, strSubkey, arrSubKeys
+strKeyPath = "Software\Microsoft\NET Framework Setup\NDP"
+oReg.EnumKey HKEY_LOCAL_MACHINE, strKeyPath, arrSubKeys
+
+Call ok(getVT(arrSubKeys) = "VT_ARRAY|VT_VARIANT*", "getVT(arrSubKeys) = " & getVT(arrSubKeys))
+For Each strSubkey In arrSubKeys
+Next
+end function
+
+Call wmi_array_bstr()
+
 reportSuccess()
