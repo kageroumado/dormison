@@ -1084,7 +1084,6 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         [window setHidesOnDeactivate:NO];
         [window setReleasedWhenClosed:NO];
 
-        [window setOneShot:YES];
         [window disableCursorRects];
         [window setShowsResizeIndicator:NO];
         [window setHasShadow:wf->shadow];
