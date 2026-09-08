@@ -1593,9 +1593,11 @@ static void install_root_pnp_devices(void)
     }
     root_devices[] =
     {
-        {"root\\wine\\winebth", "root\\winebth\0", "C:\\windows\\inf\\winebth.inf"},
+        /* Never add winebth or wineusb here: anything installed lands in the SetupAPI
+         * ROOT enumeration, and services.exe force-starts the backing driver on every
+         * boot regardless of its registry Start value (is_root_pnp_service in
+         * programs/services/services.c). winebus stays because Steam Input rides on it. */
         {"root\\wine\\winebus", "root\\winebus\0", "C:\\windows\\inf\\winebus.inf"},
-        {"root\\wine\\wineusb", "root\\wineusb\0", "C:\\windows\\inf\\wineusb.inf"},
     };
     SP_DEVINFO_DATA device = {sizeof(device)};
     unsigned int i;

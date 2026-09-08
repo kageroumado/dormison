@@ -71,6 +71,7 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include "msync.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
@@ -449,6 +450,54 @@ static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_
     return errno_to_status( errno );
 }
 
+#elif defined(__APPLE__)
+
+static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
+{
+    return msync_release_semaphore_obj( obj, count, prev_count );
+}
+
+static NTSTATUS linux_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION *info )
+{
+    return msync_query_semaphore_obj( obj, info );
+}
+
+static NTSTATUS linux_set_event_obj( int obj, LONG *prev_state )
+{
+    return msync_set_event_obj( obj, prev_state );
+}
+
+static NTSTATUS linux_reset_event_obj( int obj, LONG *prev_state )
+{
+    return msync_reset_event_obj( obj, prev_state );
+}
+
+static NTSTATUS linux_pulse_event_obj( int obj, LONG *prev_state )
+{
+    return msync_pulse_event_obj( obj, prev_state );
+}
+
+static NTSTATUS linux_query_event_obj( int obj, EVENT_BASIC_INFORMATION *info )
+{
+    return msync_query_event_obj( obj, info );
+}
+
+static NTSTATUS linux_release_mutex_obj( int obj, LONG *prev_count )
+{
+    return msync_release_mutex_obj( obj, prev_count );
+}
+
+static NTSTATUS linux_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info )
+{
+    return msync_query_mutex_obj( obj, info );
+}
+
+static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_TYPE type,
+                                 int alert_fd, const LARGE_INTEGER *timeout )
+{
+    return msync_wait_objs( count, objs, type == WaitAny, alert_fd, timeout );
+}
+
 #else /* NTSYNC_IOC_EVENT_READ */
 
 static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
@@ -634,7 +683,11 @@ static void release_inproc_sync( struct inproc_sync *sync )
     LONG ref = InterlockedDecrement( &sync->refcount );
 
     assert( ref >= 0 );
-    if (!ref) close( fd );
+    if (!ref)
+    {
+        if (do_msync()) msync_close( fd );
+        else close( fd );
+    }
 }
 
 static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
@@ -675,8 +728,12 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync 
         {
             obj_handle_t fd_handle;
             sync->refcount = 1;
-            sync->fd = wine_server_receive_fd( &fd_handle );
-            assert( wine_server_ptr_handle(fd_handle) == handle );
+            if (do_msync()) sync->fd = reply->shm_idx;
+            else
+            {
+                sync->fd = wine_server_receive_fd( &fd_handle );
+                assert( wine_server_ptr_handle(fd_handle) == handle );
+            }
             sync->access = reply->access;
             sync->type = reply->type;
             sync->closed = 0;
@@ -884,8 +941,12 @@ static int get_inproc_alert_fd(void)
         {
             if (!server_call_unlocked( req ))
             {
-                data->alert_fd = fd = wine_server_receive_fd( &token );
-                assert( token == reply->handle );
+                if (do_msync()) data->alert_fd = fd = reply->handle;
+                else
+                {
+                    data->alert_fd = fd = wine_server_receive_fd( &token );
+                    assert( token == reply->handle );
+                }
             }
         }
         SERVER_END_REQ;
@@ -962,8 +1023,8 @@ done:
 /******************************************************************************
  *              NtCreateSemaphore (NTDLL.@)
  */
-NTSTATUS WINAPI NtCreateSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
-                                   LONG initial, LONG max )
+NTSTATUS WINAPI GPT_IMPORT(NtCreateSemaphore)( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+                                               LONG initial, LONG max )
 {
     unsigned int ret;
     data_size_t len;
@@ -990,6 +1051,14 @@ NTSTATUS WINAPI NtCreateSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJ
     free( objattr );
     return ret;
 }
+#if defined(__APPLE__) && defined(__x86_64__)
+NTSTATUS __attribute__((ms_abi)) msthunk_NtCreateSemaphore( HANDLE *handle, ACCESS_MASK access,
+    const OBJECT_ATTRIBUTES *attr, LONG initial, LONG max )
+{
+    return sysv_NtCreateSemaphore( handle, access, attr, initial, max );
+}
+GPT_ABI_WRAPPER( NtCreateSemaphore );
+#endif
 
 
 /******************************************************************************
@@ -1062,7 +1131,7 @@ NTSTATUS WINAPI NtQuerySemaphore( HANDLE handle, SEMAPHORE_INFORMATION_CLASS cla
 /******************************************************************************
  *              NtReleaseSemaphore (NTDLL.@)
  */
-NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous )
+NTSTATUS WINAPI GPT_IMPORT(NtReleaseSemaphore)( HANDLE handle, ULONG count, ULONG *previous )
 {
     unsigned int ret;
 
@@ -1083,13 +1152,20 @@ NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous 
     SERVER_END_REQ;
     return ret;
 }
+#if defined(__APPLE__) && defined(__x86_64__)
+NTSTATUS __attribute__((ms_abi)) msthunk_NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous )
+{
+    return sysv_NtReleaseSemaphore( handle, count, previous );
+}
+GPT_ABI_WRAPPER( NtReleaseSemaphore );
+#endif
 
 
 /**************************************************************************
  *              NtCreateEvent (NTDLL.@)
  */
-NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
-                               EVENT_TYPE type, BOOLEAN state )
+NTSTATUS WINAPI GPT_IMPORT(NtCreateEvent)( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+                                           EVENT_TYPE type, BOOLEAN state )
 {
     unsigned int ret;
     data_size_t len;
@@ -1116,6 +1192,14 @@ NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_
     free( objattr );
     return ret;
 }
+#if defined(__APPLE__) && defined(__x86_64__)
+NTSTATUS __attribute__((ms_abi)) msthunk_NtCreateEvent( HANDLE *handle, ACCESS_MASK access,
+    const OBJECT_ATTRIBUTES *attr, EVENT_TYPE type, BOOLEAN state )
+{
+    return sysv_NtCreateEvent( handle, access, attr, type, state );
+}
+GPT_ABI_WRAPPER( NtCreateEvent );
+#endif
 
 
 /******************************************************************************
@@ -1148,7 +1232,7 @@ NTSTATUS WINAPI NtOpenEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_AT
 /******************************************************************************
  *              NtSetEvent (NTDLL.@)
  */
-NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
+NTSTATUS WINAPI GPT_IMPORT(NtSetEvent)( HANDLE handle, LONG *prev_state )
 {
     unsigned int ret;
 
@@ -1167,6 +1251,13 @@ NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
     SERVER_END_REQ;
     return ret;
 }
+#if defined(__APPLE__) && defined(__x86_64__)
+NTSTATUS __attribute__((ms_abi)) msthunk_NtSetEvent( HANDLE handle, LONG *prev_state )
+{
+    return sysv_NtSetEvent( handle, prev_state );
+}
+GPT_ABI_WRAPPER( NtSetEvent );
+#endif
 
 
 /******************************************************************************
@@ -1181,7 +1272,7 @@ NTSTATUS WINAPI NtSetEventBoostPriority( HANDLE handle )
 /******************************************************************************
  *              NtResetEvent (NTDLL.@)
  */
-NTSTATUS WINAPI NtResetEvent( HANDLE handle, LONG *prev_state )
+NTSTATUS WINAPI GPT_IMPORT(NtResetEvent)( HANDLE handle, LONG *prev_state )
 {
     unsigned int ret;
 
@@ -1200,22 +1291,36 @@ NTSTATUS WINAPI NtResetEvent( HANDLE handle, LONG *prev_state )
     SERVER_END_REQ;
     return ret;
 }
+#if defined(__APPLE__) && defined(__x86_64__)
+NTSTATUS __attribute__((ms_abi)) msthunk_NtResetEvent( HANDLE handle, LONG *prev_state )
+{
+    return sysv_NtResetEvent( handle, prev_state );
+}
+GPT_ABI_WRAPPER( NtResetEvent );
+#endif
 
 
 /******************************************************************************
  *              NtClearEvent (NTDLL.@)
  */
-NTSTATUS WINAPI NtClearEvent( HANDLE handle )
+NTSTATUS WINAPI GPT_IMPORT(NtClearEvent)( HANDLE handle )
 {
     /* FIXME: same as NtResetEvent ??? */
     return NtResetEvent( handle, NULL );
 }
+#if defined(__APPLE__) && defined(__x86_64__)
+NTSTATUS __attribute__((ms_abi)) msthunk_NtClearEvent( HANDLE handle )
+{
+    return sysv_NtClearEvent( handle );
+}
+GPT_ABI_WRAPPER( NtClearEvent );
+#endif
 
 
 /******************************************************************************
  *              NtPulseEvent (NTDLL.@)
  */
-NTSTATUS WINAPI NtPulseEvent( HANDLE handle, LONG *prev_state )
+NTSTATUS WINAPI GPT_IMPORT(NtPulseEvent)( HANDLE handle, LONG *prev_state )
 {
     unsigned int ret;
 
@@ -1234,6 +1339,13 @@ NTSTATUS WINAPI NtPulseEvent( HANDLE handle, LONG *prev_state )
     SERVER_END_REQ;
     return ret;
 }
+#if defined(__APPLE__) && defined(__x86_64__)
+NTSTATUS __attribute__((ms_abi)) msthunk_NtPulseEvent( HANDLE handle, LONG *prev_state )
+{
+    return sysv_NtPulseEvent( handle, prev_state );
+}
+GPT_ABI_WRAPPER( NtPulseEvent );
+#endif
 
 
 /******************************************************************************

@@ -448,6 +448,15 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
         instance->obj.extensions.has_VK_EXT_surface_maintenance1 = 1;
     if (vulkan_funcs.host_extensions.has_VK_KHR_get_physical_device_properties2)
         instance->obj.extensions.has_VK_KHR_get_physical_device_properties2 = 1;
+    /* MoltenVK reports itself as a portability driver, and since loader 1.3.216 the host
+     * loader hides those from an instance that did not ask for them — answering
+     * VK_ERROR_INCOMPATIBLE_DRIVER when it is the only driver present. Windows
+     * applications have no reason to set the flag themselves, so set it for them. */
+    if (vulkan_funcs.host_extensions.has_VK_KHR_portability_enumeration)
+    {
+        instance->obj.extensions.has_VK_KHR_portability_enumeration = 1;
+        info->flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
     if (use_external_memory())
         instance->obj.extensions.has_VK_KHR_external_memory_capabilities = 1;
 

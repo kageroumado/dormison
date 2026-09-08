@@ -35,6 +35,15 @@
 #include <sys/ioctl.h>
 #include <sys/kern_event.h>
 #endif
+#ifdef HAVE_NET_IF_H
+#include <net/if.h>
+#endif
+#ifdef HAVE_NETINET_IN_H
+#include <netinet/in.h>
+#endif
+#ifdef HAVE_IFADDRS_H
+#include <ifaddrs.h>
+#endif
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -341,6 +350,41 @@ static NTSTATUS unix_nsi_get_notification( void *args )
 }
 #endif
 
+/* Whether an interface with an address of the module's family is up. The
+ * change notification is edge-triggered, so a registration made after the
+ * interface came up is answered from this. */
+static NTSTATUS unix_nsi_interface_state( void *args )
+{
+    struct nsi_interface_state_params *params = args;
+#ifdef HAVE_IFADDRS_H
+    struct ifaddrs *ifaddrs, *ifa;
+    int family;
+
+    if (NmrIsEqualNpiModuleId( &params->module, &NPI_MS_IPV4_MODULEID )) family = AF_INET;
+    else if (NmrIsEqualNpiModuleId( &params->module, &NPI_MS_IPV6_MODULEID )) family = AF_INET6;
+    else return STATUS_NOT_SUPPORTED;
+
+    params->up = FALSE;
+    if (getifaddrs( &ifaddrs ))
+    {
+        ERR( "getifaddrs failed, errno %d.\n", errno );
+        return STATUS_UNSUCCESSFUL;
+    }
+    for (ifa = ifaddrs; ifa; ifa = ifa->ifa_next)
+    {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != family) continue;
+        if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+        if (!(ifa->ifa_flags & IFF_UP)) continue;
+        params->up = TRUE;
+        break;
+    }
+    freeifaddrs( ifaddrs );
+    return STATUS_SUCCESS;
+#else
+    return STATUS_NOT_IMPLEMENTED;
+#endif
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     icmp_get_reply,
@@ -349,4 +393,5 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     unix_nsi_get_all_parameters_ex,
     unix_nsi_get_parameter_ex,
     unix_nsi_get_notification,
+    unix_nsi_interface_state,
 };

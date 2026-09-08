@@ -110,6 +110,7 @@ struct thread_data
     DWORD        tid;               /* thread id */
     BOOL         allow_writes;      /* ThreadAllowWrites flags */
     BOOL         suspend;           /* suspend on startup */
+    int          exiting;           /* set once exit_thread() has started tearing the thread down */
     pthread_t    pthread_id;        /* pthread thread id */
     void        *jmp_buf;           /* setjmp buffer for exception handling */
     void        *start;             /* thread entry point */
@@ -173,6 +174,9 @@ static const SIZE_T page_size = 0x1000;
 static const SIZE_T signal_stack_mask = 0xffff;
 static const SIZE_T signal_stack_size = 0x10000 - offsetof( struct thread_data, signal_stack );
 static const SIZE_T kernel_stack_size = 0x100000;
+#if defined(__APPLE__) && defined(__x86_64__)
+extern NTSTATUS d3dmetal_user_callback_off_stack( ULONG id, const void *args, ULONG len, void **ret_ptr, ULONG *ret_len );
+#endif
 static const SIZE_T min_kernel_stack  = 0x2000;
 static const LONG teb_offset = 0x2000;
 
@@ -225,6 +229,7 @@ extern struct _KUSER_SHARED_DATA *user_shared_data;
 extern ULONG process_cookie;
 
 extern void init_environment(void);
+extern void load_sevo_env(void);
 extern void init_startup_info(void);
 extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
                                   const RTL_USER_PROCESS_PARAMETERS *params,
@@ -236,6 +241,7 @@ extern NTSTATUS load_builtin( struct pe_mapping_info *pe_mapping, USHORT machine
                               ULONG_PTR limit_low, ULONG_PTR limit_high, off_t offset );
 extern NTSTATUS load_unixlib_by_name( const UNICODE_STRING *nt_name, void **handle_ret );
 extern BOOL is_system_dir_path( const UNICODE_STRING *path, WORD *machine );
+extern char *sevo_program_env( const char *program, const char *key );
 extern NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine, void **module );
 extern NTSTATUS load_start_exe( UNICODE_STRING *nt_name, void **module );
 extern ULONG_PTR redirect_arm64ec_rva( void *module, ULONG_PTR rva, const IMAGE_ARM64EC_METADATA *metadata );
@@ -735,6 +741,44 @@ static inline int is_gdt_sel( WORD sel )
 {
     return !(sel & 4);
 }
+
+/* ABI wrapper for libd3dshared (CrossOver CX Hack 23015): its native Mach-O
+ * code calls NT syscalls directly with ms_abi arguments (rcx, rdx, r8, r9).
+ * The trampoline compares the return address with libd3dshared's code range
+ * and jumps to the ms_abi thunk for a caller inside it, to the SysV entry
+ * for any other. */
+#if defined(__APPLE__) && defined(__x86_64__)
+#include <wine/asm.h>
+
+extern void *libd3dshared_load_addr, *libd3dshared_code_end;
+
+#define GPT_IMPORT(name) sysv_##name
+#define GPT_ABI_WRAPPER(name) \
+    asm(".text\n\t" \
+        ".align 4\n\t" \
+        ".globl " __ASM_NAME(#name) "\n\t" \
+        __ASM_NAME(#name) ":\n\t" \
+        "push %rax\n\t" \
+        "push %rcx\n\t" \
+        "movq " __ASM_NAME("libd3dshared_load_addr") "@GOTPCREL(%rip), %rax\n\t" \
+        "cmpq $0, (%rax)\n\t" \
+        "je " __ASM_LOCAL_LABEL("jmp_sysv_" #name) "\n\t" \
+        "movq 16(%rsp), %rcx\n\t" \
+        "cmpq (%rax), %rcx\n\t" \
+        "jb " __ASM_LOCAL_LABEL("jmp_sysv_" #name) "\n\t" \
+        "movq " __ASM_NAME("libd3dshared_code_end") "@GOTPCREL(%rip), %rax\n\t" \
+        "cmpq (%rax), %rcx\n\t" \
+        "ja " __ASM_LOCAL_LABEL("jmp_sysv_" #name) "\n\t" \
+        "pop %rcx\n\t" \
+        "pop %rax\n\t" \
+        "jmp " __ASM_NAME("msthunk_" #name) "\n\t" \
+        __ASM_LOCAL_LABEL("jmp_sysv_" #name) ":\n\t" \
+        "pop %rcx\n\t" \
+        "pop %rax\n\t" \
+        "jmp " __ASM_NAME("sysv_" #name) "\n\t" );
+#else
+#define GPT_IMPORT(name) name
+#endif
 
 #endif  /* defined(__i386__) || defined(__x86_64__) */
 

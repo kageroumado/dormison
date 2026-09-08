@@ -27,6 +27,8 @@
 #include <dlfcn.h>
 
 #import "cocoa_window.h"
+#import "d3dmetal_objc.h"
+#include "sevo_presenter.h"
 
 #include "macdrv_cocoa.h"
 #import "cocoa_app.h"
@@ -65,16 +67,47 @@ typedef uint32_t CAContextID;
 @end
 
 
-static NSUInteger style_mask_for_features(const struct macdrv_window_features* wf)
+/* Whether a window with these features is presented through the scaler: a
+   titled, non-utility window and, unless every window is asked for, one the
+   program itself made non-resizable. A program that resizes is left to
+   resize: re-rendering at the new size beats scaling the old frame. */
+static BOOL features_allow_presentation_scaling(const struct macdrv_window_features* wf)
+{
+    if (!wf->title_bar || wf->utility) return NO;
+    switch (resizable_windows)
+    {
+    case RESIZABLE_WINDOWS_ALL: return YES;
+    case RESIZABLE_WINDOWS_FIXED:
+    case RESIZABLE_WINDOWS_WINDOW: return !wf->resizable;
+    default: return NO;
+    }
+}
+
+static NSScreen* screen_covered_by_rect(NSRect rect, NSArray* screens);
+
+/* Whether a window with these features and this content is a fullscreen-style
+   window to show in a window: borderless, covering a screen, with the window
+   mode asked for. */
+static BOOL features_want_windowing(const struct macdrv_window_features* wf, NSRect contentRect)
+{
+    if (resizable_windows != RESIZABLE_WINDOWS_WINDOW || wf->title_bar) return NO;
+    return screen_covered_by_rect(contentRect, [NSScreen screens]) != nil;
+}
+
+static NSUInteger style_mask_for_features(const struct macdrv_window_features* wf, BOOL windowed)
 {
     NSUInteger style_mask;
 
-    if (wf->title_bar)
+    if (windowed)
+        style_mask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable |
+                     NSWindowStyleMaskResizable;
+    else if (wf->title_bar)
     {
         style_mask = NSWindowStyleMaskTitled;
         if (wf->close_button) style_mask |= NSWindowStyleMaskClosable;
         if (wf->minimize_button) style_mask |= NSWindowStyleMaskMiniaturizable;
-        if (wf->resizable || wf->maximize_button) style_mask |= NSWindowStyleMaskResizable;
+        if (wf->resizable || wf->maximize_button || features_allow_presentation_scaling(wf))
+            style_mask |= NSWindowStyleMaskResizable;
         if (wf->utility) style_mask |= NSWindowStyleMaskUtilityWindow;
     }
     else style_mask = NSWindowStyleMaskBorderless;
@@ -368,15 +401,41 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 @interface WineMetalView : WineBaseView
 {
     id<MTLDevice> _device;
+    /* With the presenter: the layer the renderer draws into, off screen,
+       and the presenter that turns its frames into the backing layer's. */
+    WineMetalLayer* _rendererLayer;
+    void* _presenter;
 }
 
     - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device;
+    /* The layer a renderer is given to draw into: the renderer's own layer
+       under the presenter, the backing layer otherwise. */
+    - (CAMetalLayer*) rendererLayer;
+    /* The view's size, scale or presentation scale changed. */
+    - (void) presentationLayoutChanged;
+
+@end
+
+
+/* A GDI window surface drawn by the presenter: the view's backing layer is
+   the presenter's on-screen layer, covering the content view, below every
+   client view. The presenter reads the surface's DIB; this view only gives
+   its layer a place and a size. */
+@interface WineSurfaceView : WineBaseView
+{
+    void* _presenter;
+}
+
+    - (id) initWithFrame:(NSRect)frame presenter:(void*)presenter;
+    - (void*) presenter;
+    - (void) presentationLayoutChanged;
 
 @end
 
 
 @interface WineContentView : WineBaseView <NSTextInputClient, NSViewLayerContentScaleDelegate>
 {
+@public void *d3dmetal_client_surface;
     CGRect surfaceRect;
     CGImageRef colorImage;
     CGImageRef shapeImage;
@@ -393,7 +452,12 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     int backingSize[2];
 
     WineMetalView *_metalView;
+    WineSurfaceView *_surfaceView;
     NSMutableDictionary<NSNumber*, CALayerHost*>* _caLayerHosts;
+
+    /* Device pixels per point of this view's coordinates while its window is
+       presentation-scaled; 0 until the window first scales it. */
+    CGFloat _presentationDeviceScale;
 }
 
 @property (readonly, nonatomic) BOOL everHadGLContext;
@@ -406,8 +470,13 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (void) wine_setBackingSize:(const int*)newBackingSize;
 
     - (WineMetalView*) newMetalViewWithDevice:(id<MTLDevice>)device;
+    - (void) attachSurfaceView:(void*)presenter;
+    - (void) detachSurfaceView:(void*)presenter;
     - (void) addCALayerHostViewWithContextId:(CAContextID)contextId;
     - (void) removeCALayerHostView:(CAContextID)contextId;
+
+    - (void) setPresentationDeviceScale:(CGFloat)deviceScale;
+    - (void) applyPresentationFilters;
 
 @end
 
@@ -447,6 +516,120 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) windowDidDrawContent;
 
+    - (NSSize) wineContentSize;
+    - (void) applyPresentationConstraints;
+    - (void) syncWineFrameToRealFrame;
+    - (void) setWindowFeatures:(const struct macdrv_window_features*)wf forContentRect:(NSRect)contentRect;
+
+@end
+
+
+/* The Metal layers that D3DMetal renders into off screen and a CALayerHost
+   composites here, by context id: a presentation-scaled window sets their
+   sampling filter along with its own layers'. Main thread only. */
+static NSMutableDictionary<NSNumber*, CALayer*>* remote_layers;
+
+static void register_remote_layer(CAContextID context_id, CALayer* layer)
+{
+    if (!remote_layers) remote_layers = [[NSMutableDictionary alloc] init];
+    remote_layers[@(context_id)] = layer;
+}
+
+static void unregister_remote_layer(CAContextID context_id)
+{
+    [remote_layers removeObjectForKey:@(context_id)];
+}
+
+static CALayer* remote_layer_for_context(CAContextID context_id)
+{
+    return remote_layers[@(context_id)];
+}
+
+/* Core Animation resamples every layer of a presentation-scaled window. An
+   integer factor keeps nearest — an exact 2x is crisper than anything
+   smoothed — and any other factor gets linear, trilinear when shrinking.
+   This is the scaling a window gets with the presenter off. */
+static void apply_presentation_filter(CALayer* layer, CGFloat deviceScale)
+{
+    CGFloat factor;
+    BOOL integral;
+
+    if (!layer) return;
+    factor = deviceScale / MAX(layer.contentsScale, 0.01);
+    integral = fabs(factor - round(factor)) < 0.01;
+    layer.magnificationFilter = integral ? kCAFilterNearest : kCAFilterLinear;
+    layer.minificationFilter = integral ? kCAFilterNearest : kCAFilterTrilinear;
+}
+
+/* Under the PresentationLog option, every frame decision goes to stderr. */
+static void presentation_log(WineWindow* window, const char* what, NSRect real, NSRect wine, NSRect box)
+{
+    if (!presentation_log_on) return;
+    fprintf(stderr, "sevo:presentation %p %s real=%s wine=%s box=%s\n", window, what,
+            [NSStringFromRect(real) UTF8String], [NSStringFromRect(wine) UTF8String],
+            [NSStringFromRect(box) UTF8String]);
+}
+
+/* Every presented view under `view`, client views included, learns the new
+   presentation scale; the presenter's layer sits at device pixels. */
+static void notify_metal_views(NSView* view)
+{
+    for (NSView* subview in [view subviews])
+    {
+        if ([subview isKindOfClass:[WineMetalView class]])
+            [(WineMetalView*)subview presentationLayoutChanged];
+        else if ([subview isKindOfClass:[WineSurfaceView class]])
+            [(WineSurfaceView*)subview presentationLayoutChanged];
+        else
+            notify_metal_views(subview);
+    }
+}
+
+/* The Metal view and swapchain lifecycle, on stderr beside the presenter's
+   own lines, under the PresenterLog option. */
+static void presenter_trace(const char* format, ...)
+{
+    va_list args;
+    if (!presenter_log_on) return;
+    fputs("sevo:presenter ", stderr);
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+    fputc('\n', stderr);
+}
+
+/* Wine's content view for a window, or the content view itself for the
+   OpenGL dummy window, which is a plain NSWindow. */
+static NSView* wine_content_view_of(NSWindow* window)
+{
+    if ([window isKindOfClass:[WineWindow class]])
+        return [(WineWindow*)window wineContentView];
+    return [window contentView];
+}
+
+
+/* The window's content view. Wine's own content view sits inside it at the
+   same size normally, and scaled to fit once the user has resized a
+   presentation-scaled window, black showing through where the aspect
+   ratios differ. */
+@interface WineStageView : NSView
+@end
+
+@implementation WineStageView
+
+    - (BOOL) isFlipped
+    {
+        return YES;
+    }
+
+    - (void) resizeSubviewsWithOldSize:(NSSize)oldSize
+    {
+        NSWindow* window = [self window];
+        [super resizeSubviewsWithOldSize:oldSize];
+        if ([window isKindOfClass:[WineWindow class]])
+            [(WineWindow*)window layoutPresentation];
+    }
+
 @end
 
 
@@ -480,7 +663,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (BOOL)acceptsFirstResponder
     {
-        return [[self window] contentView] == self;
+        return wine_content_view_of([self window]) == self;
     }
 
     - (BOOL) mouseDownCanMoveWindow
@@ -541,7 +724,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         CGRect imageRect;
         CALayer* layer = [self layer];
 
-        if ([window contentView] != self)
+        if ([window wineContentView] != self)
             return;
 
         if (window.closing)
@@ -686,7 +869,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     {
         BOOL invalidateAncestors = _cachedHasGLDescendantValid;
         _cachedHasGLDescendantValid = NO;
-        if (invalidateAncestors && self != [[self window] contentView])
+        if (invalidateAncestors && self != wine_content_view_of([self window]))
         {
             WineContentView* superview = (WineContentView*)[self superview];
             if ([superview isKindOfClass:[WineContentView class]])
@@ -707,15 +890,63 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         }
     }
 
+    /* The surface view covers this view's bounds, below every client view.
+       It is sized here rather than by autoresizing: a presentation-scaled
+       window gives this view a frame that differs from its bounds, and
+       autoresizing would follow the frame while subviews live in the
+       bounds. */
+    - (void) attachSurfaceView:(void*)presenter
+    {
+        WineSurfaceView* view;
+
+        [self detachSurfaceView:NULL];
+        view = [[WineSurfaceView alloc] initWithFrame:[self bounds] presenter:presenter];
+        [self addSubview:view positioned:NSWindowBelow relativeTo:nil];
+        _surfaceView = view;
+        [self applyPresentationFilters];
+        [view presentationLayoutChanged];
+        presenter_trace("surface view %p created for content view %p in window %p", view, self, [self window]);
+    }
+
+    /* Removes the surface view; with a presenter, only when it is that
+       presenter's. */
+    - (void) detachSurfaceView:(void*)presenter
+    {
+        if (!_surfaceView) return;
+        if (presenter && [_surfaceView presenter] != presenter) return;
+        presenter_trace("surface view %p released", _surfaceView);
+        [_surfaceView removeFromSuperview];
+        [_surfaceView release];
+        _surfaceView = nil;
+    }
+
+    - (void) setFrameSize:(NSSize)size
+    {
+        [super setFrameSize:size];
+        if (_surfaceView) [_surfaceView setFrame:[self bounds]];
+    }
+
+    - (void) setBoundsSize:(NSSize)size
+    {
+        [super setBoundsSize:size];
+        if (_surfaceView) [_surfaceView setFrame:[self bounds]];
+    }
+
     - (WineMetalView*) newMetalViewWithDevice:(id<MTLDevice>)device
     {
-        if (_metalView) return _metalView;
+        if (_metalView)
+        {
+            presenter_trace("metal view %p reused for content view %p", _metalView, self);
+            return _metalView;
+        }
 
         WineMetalView* view = [[WineMetalView alloc] initWithFrame:[self bounds] device:device];
+        presenter_trace("metal view %p created for content view %p in window %p", view, self, [self window]);
         [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
         [self setAutoresizesSubviews:YES];
         [self addSubview:view positioned:NSWindowBelow relativeTo:nil];
         _metalView = view;
+        [self applyPresentationFilters];
 
         [(WineWindow*)self.window windowDidDrawContent];
 
@@ -738,6 +969,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
         [self.layer addSublayer:host];
         [_caLayerHosts setObject:host forKey:@(contextId)];
+        [self applyPresentationFilters];
 
         [(WineWindow*)self.window windowDidDrawContent];
     }
@@ -747,6 +979,26 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         NSNumber* key = @(contextId);
         [[_caLayerHosts objectForKey:key] removeFromSuperlayer];
         [_caLayerHosts removeObjectForKey:key];
+    }
+
+    - (void) setPresentationDeviceScale:(CGFloat)deviceScale
+    {
+        _presentationDeviceScale = deviceScale;
+        [self applyPresentationFilters];
+    }
+
+    - (void) applyPresentationFilters
+    {
+        if (_presentationDeviceScale <= 0) return;
+        apply_presentation_filter([self layer], _presentationDeviceScale);
+        for (NSView* subview in [self subviews])
+            apply_presentation_filter([subview layer], _presentationDeviceScale);
+        for (NSNumber* contextId in _caLayerHosts)
+        {
+            apply_presentation_filter(_caLayerHosts[contextId], _presentationDeviceScale);
+            apply_presentation_filter(remote_layer_for_context([contextId unsignedIntValue]),
+                                      _presentationDeviceScale);
+        }
     }
 
     - (void) setLayerRetinaProperties:(BOOL)mode
@@ -1020,25 +1272,233 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) dealloc
     {
+        /* The renderer holds its own reference to the layer and may ask it
+           for a drawable after this view is gone. */
+        _rendererLayer.presenter = NULL;
+        _rendererLayer.wineView = nil;
+        if (_presenter) sevo_presenter_detach(_presenter);
+        [_rendererLayer release];
         [_device release];
         [super dealloc];
     }
 
     - (void) setRetinaMode:(BOOL)mode
     {
-        self.layer.contentsScale = mode ? 2.0 : 1.0;
+        [self rendererLayer].contentsScale = mode ? 2.0 : 1.0;
         [super setRetinaMode:mode];
+        [self presentationLayoutChanged];
     }
 
+    /* The renderer's layer, and under the presenter the on-screen layer the
+       presenter draws that one's frames into, which is then the backing
+       layer: the renderer keeps drawing at Wine's scale, the screen gets
+       device pixels. */
     - (CALayer*) makeBackingLayer
     {
-        CAMetalLayer *layer = [CAMetalLayer layer];
+        WineMetalLayer *layer = [WineMetalLayer layer];
         layer.device = _device;
         layer.framebufferOnly = YES;
         layer.magnificationFilter = kCAFilterNearest;
         layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
         layer.contentsScale = retina_on ? 2.0 : 1.0;
-        return layer;
+        if (!presenter_on) return layer;
+
+        _presenter = sevo_presenter_attach(layer);
+        presenter_trace("backing layer for metal view %p: presenter %p", self, _presenter);
+        if (!_presenter) return layer;
+        _rendererLayer = [layer retain];
+        layer.presenter = _presenter;
+        layer.wineView = self;
+        return (CALayer*)sevo_presenter_onscreen_layer(_presenter);
+    }
+
+    - (CAMetalLayer*) rendererLayer
+    {
+        return _rendererLayer ? _rendererLayer : (CAMetalLayer*)self.layer;
+    }
+
+    /* Device pixels per point of this view: the window's presentation
+       scale, which is 1 for a window shown at Wine's size, times the
+       backing scale. The view may sit in a client view nested inside the
+       window's content view, so the window is asked, not the superview. */
+    - (void) presentationLayoutChanged
+    {
+        NSWindow* window = [self window];
+        CGFloat deviceScale = 0;
+
+        if (!_presenter) return;
+        if ([window isKindOfClass:[WineWindow class]])
+            deviceScale = [(WineWindow*)window presentationScale] * [window backingScaleFactor];
+        else if (window)
+            deviceScale = [window backingScaleFactor];
+        if (deviceScale <= 0) deviceScale = 1;
+        sevo_presenter_layout(_presenter, deviceScale, retina_on ? 2.0 : 1.0,
+                              NSWidth([self bounds]), NSHeight([self bounds]));
+    }
+
+    - (void) setFrameSize:(NSSize)size
+    {
+        [super setFrameSize:size];
+        [self presentationLayoutChanged];
+    }
+
+    - (void) viewDidChangeBackingProperties
+    {
+        [super viewDidChangeBackingProperties];
+        [self presentationLayoutChanged];
+    }
+
+    - (void) viewDidMoveToWindow
+    {
+        [super viewDidMoveToWindow];
+        [self presentationLayoutChanged];
+    }
+
+    /* The delegate method is claimed only under the presenter, which sets
+       the backing layer's scale itself; without it AppKit keeps its own
+       rule. */
+    - (BOOL) respondsToSelector:(SEL)selector
+    {
+        if (selector == @selector(layer:shouldInheritContentsScale:fromWindow:))
+            return _presenter != NULL;
+        return [super respondsToSelector:selector];
+    }
+
+    - (BOOL) layer:(CALayer*)layer shouldInheritContentsScale:(CGFloat)newScale fromWindow:(NSWindow*)window
+    {
+        return NO;
+    }
+
+    - (BOOL) isOpaque
+    {
+        return YES;
+    }
+
+@end
+
+
+@implementation WineSurfaceView
+
+    /* The presenter's layer is hosted as a sublayer rather than returned
+       from makeBackingLayer: AppKit displays a view's backing layer on its
+       own schedule and empties one whose view draws nothing, which loses
+       every presented frame of a window that draws once and stops. A
+       sublayer is the presenter's alone. */
+    - (id) initWithFrame:(NSRect)frame presenter:(void*)presenter
+    {
+        self = [super initWithFrame:frame];
+        if (self)
+        {
+            CALayer* layer = (CALayer*)sevo_presenter_onscreen_layer(presenter);
+
+            _presenter = presenter;
+            self.wantsLayer = YES;
+            self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
+            layer.anchorPoint = CGPointZero;
+            layer.position = CGPointZero;
+            layer.bounds = CGRectMake(0, 0, NSWidth(frame), NSHeight(frame));
+            [self.layer addSublayer:layer];
+        }
+        return self;
+    }
+
+    - (void) dealloc
+    {
+        [(CALayer*)sevo_presenter_onscreen_layer(_presenter) removeFromSuperlayer];
+        [super dealloc];
+    }
+
+    - (void*) presenter
+    {
+        return _presenter;
+    }
+
+    /* The hosted layer covers the view. Its own contentsScale is the
+       presenter's, so this is points. */
+    - (void) sizeHostedLayer
+    {
+        CALayer* hosted = (CALayer*)sevo_presenter_onscreen_layer(_presenter);
+        CGRect bounds = CGRectMake(0, 0, NSWidth([self bounds]), NSHeight([self bounds]));
+
+        if (CGRectEqualToRect(hosted.bounds, bounds)) return;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        hosted.bounds = bounds;
+        hosted.position = CGPointZero;
+        [CATransaction commit];
+    }
+
+    - (void) layout
+    {
+        [super layout];
+        [self sizeHostedLayer];
+    }
+
+    - (void) setRetinaMode:(BOOL)mode
+    {
+        [super setRetinaMode:mode];
+        [self presentationLayoutChanged];
+    }
+
+    /* AppKit asks a layer-backed view to fill its layer through updateLayer;
+       presenting the surface's last frame again puts the picture back after
+       the system emptied the layer behind a covered window. */
+    - (BOOL) wantsUpdateLayer
+    {
+        return YES;
+    }
+
+    - (void) updateLayer
+    {
+        sevo_presenter_surface_refresh(_presenter);
+    }
+
+    /* Device pixels per point of this view: the window's presentation
+       scale times the backing scale, as for a Metal view. The DIB's pixels
+       per point is Wine's Retina mode. */
+    - (void) presentationLayoutChanged
+    {
+        NSWindow* window = [self window];
+        CGFloat deviceScale = 0;
+
+        if ([window isKindOfClass:[WineWindow class]])
+            deviceScale = [(WineWindow*)window presentationScale] * [window backingScaleFactor];
+        else if (window)
+            deviceScale = [window backingScaleFactor];
+        if (deviceScale <= 0) deviceScale = 1;
+        sevo_presenter_layout(_presenter, deviceScale, retina_on ? 2.0 : 1.0,
+                              NSWidth([self bounds]), NSHeight([self bounds]));
+    }
+
+    - (void) setFrameSize:(NSSize)size
+    {
+        [super setFrameSize:size];
+        [self sizeHostedLayer];
+        [self presentationLayoutChanged];
+    }
+
+    - (void) viewDidChangeBackingProperties
+    {
+        [super viewDidChangeBackingProperties];
+        [self presentationLayoutChanged];
+    }
+
+    - (void) viewDidMoveToWindow
+    {
+        [super viewDidMoveToWindow];
+        [self presentationLayoutChanged];
+    }
+
+    - (BOOL) respondsToSelector:(SEL)selector
+    {
+        if (selector == @selector(layer:shouldInheritContentsScale:fromWindow:))
+            return YES;
+        return [super respondsToSelector:selector];
+    }
+
+    - (BOOL) layer:(CALayer*)layer shouldInheritContentsScale:(CGFloat)newScale fromWindow:(NSWindow*)window
+    {
+        return NO;
     }
 
     - (BOOL) isOpaque
@@ -1072,8 +1532,10 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
         [[WineApplicationController sharedController] flipRect:&window_frame];
 
+        BOOL windowed = features_want_windowing(wf, window_frame);
+
         window = [[[self alloc] initWithContentRect:window_frame
-                                          styleMask:style_mask_for_features(wf)
+                                          styleMask:style_mask_for_features(wf, windowed)
                                             backing:NSBackingStoreBuffered
                                               defer:YES] autorelease];
 
@@ -1100,9 +1562,16 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
         [window registerForDraggedTypes:@[@"public.data" /* UTTypeData */, @"public.content" /* UTTypeContent */]];
 
+        WineStageView* stage = [[[WineStageView alloc] initWithFrame:NSZeroRect] autorelease];
+        if (!stage)
+            return nil;
+        [stage setWantsLayer:YES];
+        [stage setAutoresizesSubviews:YES];
+
         contentView = [[[WineContentView alloc] initWithFrame:NSZeroRect] autorelease];
         if (!contentView)
             return nil;
+        [contentView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 
         /* We use tracking areas in addition to setAcceptsMouseMovedEvents:YES
            because they give us mouse moves in the background. */
@@ -1116,7 +1585,13 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
             return nil;
         [contentView addTrackingArea:trackingArea];
 
-        [window setContentView:contentView];
+        [window setContentView:stage];
+        [contentView setFrame:[stage bounds]];
+        [stage addSubview:contentView];
+        window->wineContentView = contentView;
+        window->presentationFeatures = *wf;
+        window->presentationWindowed = windowed;
+        window->presentationScalable = windowed || features_allow_presentation_scaling(wf);
         [window setInitialFirstResponder:contentView];
 
         [nc addObserver:window
@@ -1155,9 +1630,203 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         [super dealloc];
     }
 
+    - (WineContentView*) wineContentView
+    {
+        return wineContentView;
+    }
+
+    /* The size the program draws at and measures its coordinates in. */
+    - (NSSize) wineContentSize
+    {
+        return wineContentRect.size;
+    }
+
+    - (BOOL) presentationWindowed
+    {
+        return presentationWindowed;
+    }
+
+    - (BOOL) presentationScaled
+    {
+        NSSize real, wine;
+
+        if (!presentationScalable || NSIsEmptyRect(wineContentRect)) return NO;
+        real = [self contentRectForFrameRect:self.frame].size;
+        wine = [self wineContentSize];
+        return fabs(real.width - wine.width) >= 0.5 || fabs(real.height - wine.height) >= 0.5;
+    }
+
+    - (CGFloat) presentationScale
+    {
+        NSSize wine = [self wineContentSize];
+        if (!self.presentationScaled || wine.width < 1) return 1;
+        return NSWidth([wineContentView frame]) / wine.width;
+    }
+
+    /* The real frame and the frame Wine believes in share a top-left corner:
+       Wine's window is anchored where the user put the real one and keeps
+       its own size, so a move reaches the program and a resize does not. */
+    - (void) syncWineFrameToRealFrame
+    {
+        NSRect frame;
+
+        /* Wine's window fills the screen it believes in, wherever the real
+           one goes. */
+        if (presentationWindowed) return;
+        if (!self.presentationScaled) return;
+        frame = self.frame;
+        wineFrame.origin.x = NSMinX(frame);
+        wineFrame.origin.y = NSMaxY(frame) - NSHeight(wineFrame);
+        wineContentRect = [self contentRectForFrameRect:wineFrame];
+    }
+
+    /* Where a fullscreen-style window first lands as a window: the largest
+       box of the program's aspect within four fifths of the visible area of
+       the screen it covers, centered, at most the program's own size. */
+    - (NSRect) defaultWindowedFrameForContentRect:(NSRect)contentRect
+    {
+        NSScreen* screen = screen_covered_by_rect(contentRect, [NSScreen screens]);
+        NSRect visible, box;
+        NSSize wine = contentRect.size;
+        CGFloat scale;
+
+        if (!screen) screen = [NSScreen mainScreen];
+        visible = NSInsetRect([screen visibleFrame], NSWidth([screen visibleFrame]) / 10,
+                              NSHeight([screen visibleFrame]) / 10);
+        scale = MIN(1.0, MIN(NSWidth(visible) / wine.width, NSHeight(visible) / wine.height));
+        box.size = NSMakeSize(floor(wine.width * scale), floor(wine.height * scale));
+        box.origin.x = floor(NSMidX(visible) - box.size.width / 2);
+        box.origin.y = floor(NSMidY(visible) - box.size.height / 2);
+        return [self frameRectForContentRect:box];
+    }
+
+    /* Re-derives the window's style for its current features and content:
+       a program switching between a screen-sized borderless window and
+       anything else moves in or out of windowed presentation. */
+    - (void) updateWindowingForContentRect:(NSRect)contentRect
+    {
+        if (features_want_windowing(&presentationFeatures, contentRect) == presentationWindowed) return;
+        [self setWindowFeatures:&presentationFeatures forContentRect:contentRect];
+    }
+
+    /* The aspect ratio is the program's; the size is the user's, down to a
+       quarter of what the program drew and up to anything. The ratio is held
+       in -windowWillResize:toSize: alone, never through contentAspectRatio:
+       AppKit re-fits a window to that ratio every time it restores it from
+       the Dock, its fit rounds down, and each minimize costs a few points
+       that the delegate, which only derives height from width, never gives
+       back. */
+    - (void) applyPresentationConstraints
+    {
+        NSSize wine = [self wineContentSize];
+
+        [self setContentAspectRatio:NSZeroSize];
+        if (wine.width >= 1 && wine.height >= 1)
+            [self setContentMinSize:NSMakeSize(MAX(1, wine.width / 4), MAX(1, wine.height / 4))];
+        [self setContentMaxSize:NSMakeSize(FLT_MAX, FLT_MAX)];
+        [self layoutPresentation];
+    }
+
+    /* Fits Wine's content into the stage: the largest box of Wine's aspect
+       ratio, centered, snapped to device pixels so no edge lands between
+       two of them. The content view keeps Wine's coordinate system in its
+       bounds and takes the box as its frame; AppKit turns the difference
+       into a layer transform, so every surface, client view and layer host
+       inside scales with it and points convert through the view. */
+    - (void) layoutPresentation
+    {
+        NSView* stage = [self contentView];
+        NSSize area, wine;
+        NSRect box;
+        BOOL scaled;
+
+        if (!presentationScalable || !wineContentView || !stage) return;
+
+        area = [stage bounds].size;
+        wine = [self wineContentSize];
+        box = [stage bounds];
+        if (area.width >= 1 && area.height >= 1 && wine.width >= 1 && wine.height >= 1)
+        {
+            CGFloat scale = MIN(area.width / wine.width, area.height / wine.height);
+            CGFloat pixel = 1.0 / MAX(1.0, [self backingScaleFactor]);
+
+            box.size.width = MAX(pixel, floor(wine.width * scale / pixel) * pixel);
+            box.size.height = MAX(pixel, floor(wine.height * scale / pixel) * pixel);
+            box.origin.x = floor((area.width - box.size.width) / 2 / pixel) * pixel;
+            box.origin.y = floor((area.height - box.size.height) / 2 / pixel) * pixel;
+        }
+        else
+            wine = box.size;
+
+        if (!NSEqualRects([wineContentView frame], box))
+            [wineContentView setFrame:box];
+        if (!NSEqualSizes([wineContentView bounds].size, wine))
+            [wineContentView setBoundsSize:wine];
+
+        scaled = self.presentationScaled;
+        presentation_log(self, scaled ? "layout scaled" : "layout 1:1", self.frame, wineFrame, box);
+        [stage layer].backgroundColor = scaled ? CGColorGetConstantColor(kCGColorBlack) : NULL;
+        [wineContentView setPresentationDeviceScale:(scaled ? box.size.width / wine.width : 1.0)
+                                                    * [self backingScaleFactor]];
+        notify_metal_views(wineContentView);
+    }
+
+    /* Wine's content rect and the box it is drawn in, both in top-left-origin
+       screen points. */
+    - (void) getPresentationWineRect:(NSRect*)wineRect box:(NSRect*)boxRect
+    {
+        WineApplicationController* controller = [WineApplicationController sharedController];
+        NSRect content = [self contentRectForFrameRect:self.frame];
+        NSRect wine = [self contentRectForFrameRect:wineFrame];
+        NSRect box = [wineContentView frame];
+
+        [controller flipRect:&content];
+        [controller flipRect:&wine];
+        box.origin.x += NSMinX(content);
+        box.origin.y += NSMinY(content);
+        *wineRect = wine;
+        *boxRect = box;
+    }
+
+    - (CGPoint) winePointFromScreenPoint:(CGPoint)point
+    {
+        NSRect wine, box;
+
+        if (!self.presentationScaled) return point;
+        [self getPresentationWineRect:&wine box:&box];
+        if (NSWidth(box) < 1 || NSHeight(box) < 1) return point;
+        point.x = NSMinX(wine) + (point.x - NSMinX(box)) * NSWidth(wine) / NSWidth(box);
+        point.y = NSMinY(wine) + (point.y - NSMinY(box)) * NSHeight(wine) / NSHeight(box);
+        return point;
+    }
+
+    - (CGPoint) screenPointFromWinePoint:(CGPoint)point
+    {
+        NSRect wine, box;
+
+        if (!self.presentationScaled) return point;
+        [self getPresentationWineRect:&wine box:&box];
+        if (NSWidth(wine) < 1 || NSHeight(wine) < 1) return point;
+        point.x = NSMinX(box) + (point.x - NSMinX(wine)) * NSWidth(box) / NSWidth(wine);
+        point.y = NSMinY(box) + (point.y - NSMinY(wine)) * NSHeight(box) / NSHeight(wine);
+        return point;
+    }
+
+    - (BOOL) wineContentContainsScreenPoint:(CGPoint)point
+    {
+        NSRect wine, box;
+
+        if (!self.presentationScaled) return NO;
+        [self getPresentationWineRect:&wine box:&box];
+        return CGRectContainsPoint(NSRectToCGRect(wine), point);
+    }
+
     - (BOOL) preventResizing
     {
         BOOL preventForClipping = cursor_clipping_locks_windows && [[WineApplicationController sharedController] clippingCursor];
+        /* Resizing a presentation-scaled window reaches no program, so
+           nothing the program is doing needs it held still. */
+        if (presentationScalable) return NO;
         return ([self styleMask] & NSWindowStyleMaskResizable) && (disabled || !resizable || preventForClipping);
     }
 
@@ -1184,7 +1853,9 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         if ([self collectionBehavior] & NSWindowCollectionBehaviorFullScreenPrimary)
             [[self standardWindowButton:NSWindowFullScreenButton] setEnabled:!self.disabled];
 
-        if ([self preventResizing])
+        if (presentationScalable)
+            [self applyPresentationConstraints];
+        else if ([self preventResizing])
         {
             NSSize size = [self contentRectForFrameRect:self.wine_fractionalFrame].size;
             [self setContentMinSize:size];
@@ -1228,12 +1899,24 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) setWindowFeatures:(const struct macdrv_window_features*)wf
     {
+        [self setWindowFeatures:wf forContentRect:wineContentRect];
+    }
+
+    - (void) setWindowFeatures:(const struct macdrv_window_features*)wf forContentRect:(NSRect)contentRect
+    {
         static const NSUInteger usedStyles = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable |
                                              NSWindowStyleMaskResizable | NSWindowStyleMaskUtilityWindow | NSWindowStyleMaskBorderless |
                                              NSWindowStyleMaskNonactivatingPanel;
         NSUInteger currentStyle = [self styleMask];
-        NSUInteger newStyle = style_mask_for_features(wf) | (currentStyle & ~usedStyles);
+        BOOL windowed = features_want_windowing(wf, contentRect);
+        NSUInteger newStyle = style_mask_for_features(wf, windowed) | (currentStyle & ~usedStyles);
 
+        presentationFeatures = *wf;
+        if (windowed != presentationWindowed)
+        {
+            presentationWindowed = windowed;
+            presentationPlaced = NO;
+        }
         self.preventsAppActivation = wf->prevents_app_activation;
 
         if (newStyle != currentStyle)
@@ -1265,8 +1948,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
             // -setStyleMask: resets the firstResponder to the window.  Set it
             // back to the content view.
-            if ([[self contentView] acceptsFirstResponder])
-                [self makeFirstResponder:[self contentView]];
+            if ([wineContentView acceptsFirstResponder])
+                [self makeFirstResponder:wineContentView];
 
             [self adjustFullScreenBehavior:[self collectionBehavior]];
 
@@ -1275,6 +1958,24 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         }
 
         resizable = wf->resizable;
+        /* The style mask may have changed above, and the same content has a
+           different frame under the new style. */
+        if (!NSIsEmptyRect(wineContentRect))
+            wineFrame = [self frameRectForContentRect:wineContentRect];
+        if ((windowed || features_allow_presentation_scaling(wf)) != presentationScalable)
+        {
+            presentationScalable = !presentationScalable;
+            if (!presentationScalable)
+            {
+                /* Back to the window Wine believes in, at Wine's own size. */
+                NSView* stage = [self contentView];
+                [self setFrame:wineFrame display:YES];
+                [wineContentView setFrame:[stage bounds]];
+                [wineContentView setBoundsSize:[stage bounds].size];
+                [stage layer].backgroundColor = NULL;
+                [wineContentView setPresentationDeviceScale:[self backingScaleFactor]];
+            }
+        }
         [self adjustFeaturesForState];
         [self setHasShadow:wf->shadow];
     }
@@ -1961,7 +2662,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) updateFullscreen
     {
-        NSRect contentRect = [self contentRectForFrameRect:self.wine_fractionalFrame];
+        /* A scaled window is as large as it looks, whatever Wine believes. */
+        NSRect contentRect = [self contentRectForFrameRect:presentationScalable ? self.frame : self.wine_fractionalFrame];
         BOOL nowFullscreen = !([self styleMask] & NSWindowStyleMaskFullScreen) && screen_covered_by_rect(contentRect, [NSScreen screens]);
 
         if (nowFullscreen != fullscreen)
@@ -1978,9 +2680,73 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) setFrameAndWineFrame:(NSRect)frame
     {
-        [self setFrame:frame display:YES];
+        /* The content is what Wine asked for; the frame around it follows
+           the style, which windowing may change here. */
+        NSRect contentRect = [self contentRectForFrameRect:frame];
+        NSRect realFrame;
 
+        [self updateWindowingForContentRect:contentRect];
+        frame = [self frameRectForContentRect:contentRect];
+        realFrame = frame;
+        if (presentationWindowed)
+        {
+            /* Wine's frame is the screen's. The real frame is placed once;
+               after that its width and top edge are the user's and its
+               height follows the program's aspect, so a program that changes
+               what it draws at (a window first taller than the screen, then
+               the screen's size) shows no stage. */
+            if (presentationPlaced)
+            {
+                NSRect content = [self contentRectForFrameRect:self.frame];
+                NSSize wine = contentRect.size;
+
+                realFrame = self.frame;
+                if (wine.width >= 1 && wine.height >= 1 && NSWidth(content) >= 1)
+                {
+                    CGFloat height = round(NSWidth(content) * wine.height / wine.width);
+                    if (fabs(height - NSHeight(content)) >= 1)
+                    {
+                        content.origin.y = NSMaxY(content) - height;
+                        content.size.height = height;
+                        realFrame = [self frameRectForContentRect:content];
+                    }
+                }
+            }
+            else
+            {
+                realFrame = [self defaultWindowedFrameForContentRect:contentRect];
+                presentationPlaced = YES;
+                [self setContentAspectRatio:NSZeroSize];
+                [self setContentMinSize:NSZeroSize];
+                [self setContentMaxSize:NSMakeSize(FLT_MAX, FLT_MAX)];
+            }
+            presentation_log(self, "setFrameAndWineFrame windowed", realFrame, frame, [wineContentView frame]);
+        }
+        else if (presentationScalable)
+        {
+            if (self.presentationScaled)
+            {
+                /* The size is the user's. Wine moving the window or changing
+                   what it draws at both land in the scaled view. */
+                realFrame.size = self.frame.size;
+                realFrame.origin.y = NSMaxY(frame) - NSHeight(realFrame);
+            }
+            else
+            {
+                /* Wine's new size is the size; the constraints, which
+                   -setFrame:display: honors, would hold it at the old one. */
+                [self setContentAspectRatio:NSZeroSize];
+                [self setContentMinSize:NSZeroSize];
+                [self setContentMaxSize:NSMakeSize(FLT_MAX, FLT_MAX)];
+            }
+            presentation_log(self, "setFrameAndWineFrame", realFrame, frame, [wineContentView frame]);
+        }
+        /* Before the frame lands: setting it lays the stage out, which must
+           already see the new content size or it scales for one frame. */
         wineFrame = frame;
+        wineContentRect = contentRect;
+        [self setFrame:realFrame display:YES];
+
         roundedWineFrame = self.frame;
         CGFloat junk;
 #if CGFLOAT_IS_DOUBLE
@@ -2000,6 +2766,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
             fabsf(wineFrame.size.height - roundedWineFrame.size.height) >= 1)
             roundedWineFrame = wineFrame;
 #endif
+        if (presentationScalable)
+            [self applyPresentationConstraints];
     }
 
     - (void) setFrameFromWine:(NSRect)contentRect
@@ -2081,6 +2849,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (NSRect) wine_fractionalFrame
     {
         NSRect frame = self.frame;
+        if (self.presentationScaled)
+            return wineFrame;
         if (NSEqualRects(frame, roundedWineFrame))
             frame = wineFrame;
         return frame;
@@ -2110,8 +2880,8 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (BOOL) needsTransparency
     {
-        WineContentView *view = self.contentView;
-        return self.contentView.layer.mask || [view hasShapeImage] || self.usePerPixelAlpha ||
+        WineContentView *view = wineContentView;
+        return view.layer.mask || [view hasShapeImage] || self.usePerPixelAlpha ||
                 (gl_surface_mode == GL_SURFACE_BEHIND && [view hasGLDescendant]);
     }
 
@@ -2120,14 +2890,14 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         if (![self isOpaque] && !self.needsTransparency)
         {
             self.shapeChangedSinceLastDraw = TRUE;
-            [[self contentView] setNeedsDisplay:YES];
+            [wineContentView setNeedsDisplay:YES];
             [self setBackgroundColor:[NSColor windowBackgroundColor]];
             [self setOpaque:YES];
         }
         else if ([self isOpaque] && self.needsTransparency)
         {
             self.shapeChangedSinceLastDraw = TRUE;
-            [[self contentView] setNeedsDisplay:YES];
+            [wineContentView setNeedsDisplay:YES];
             [self setBackgroundColor:[NSColor clearColor]];
             [self setOpaque:NO];
         }
@@ -2135,7 +2905,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) setShape:(CGPathRef)newShape
     {
-        CALayer* layer = [[self contentView] layer];
+        CALayer* layer = [wineContentView layer];
         CAShapeLayer* mask = (CAShapeLayer*)layer.mask;
         if (CGPathEqualToPath(newShape, mask.path)) return;
 
@@ -2145,9 +2915,9 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
             layer.mask = mask = nil;
 
         if (mask.path)
-            [[self contentView] setNeedsDisplayInRect:NSRectFromCGRect(CGPathGetBoundingBox(mask.path))];
+            [wineContentView setNeedsDisplayInRect:NSRectFromCGRect(CGPathGetBoundingBox(mask.path))];
         if (newShape)
-            [[self contentView] setNeedsDisplayInRect:NSRectFromCGRect(CGPathGetBoundingBox(newShape))];
+            [wineContentView setNeedsDisplayInRect:NSRectFromCGRect(CGPathGetBoundingBox(newShape))];
 
         mask.path = newShape;
         self.shapeChangedSinceLastDraw = TRUE;
@@ -2211,7 +2981,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     {
         savedContentMinSize = minSize;
         savedContentMaxSize = maxSize;
-        if (![self preventResizing])
+        if (![self preventResizing] && !presentationScalable)
         {
             [self setContentMinSize:minSize];
             [self setContentMaxSize:maxSize];
@@ -2349,7 +3119,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (BOOL) isEmptyShaped
     {
-        CAShapeLayer* mask = (CAShapeLayer*)[[self contentView] layer].mask;
+        CAShapeLayer* mask = (CAShapeLayer*)[wineContentView layer].mask;
         return ([mask isEmptyShaped]);
     }
 
@@ -2685,6 +3455,13 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
             [super miniaturize:sender];
             return;
         }
+        /* A fullscreen-style window shown in a window: the program has no
+           minimize box to answer with, so the window minimizes on its own. */
+        if (presentationWindowed)
+        {
+            [super miniaturize:sender];
+            return;
+        }
 
         macdrv_event* event = macdrv_create_event(WINDOW_MINIMIZE_REQUESTED, self);
         [queue postEvent:event];
@@ -2787,9 +3564,9 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
         [transform scaleBy:scale];
 
-        [[self contentView] layer].mask.contentsScale = mode ? 2.0 : 1.0;
+        [wineContentView layer].mask.contentsScale = mode ? 2.0 : 1.0;
 
-        for (WineBaseView* subview in [self.contentView subviews])
+        for (WineBaseView* subview in [wineContentView subviews])
         {
             if ([subview isKindOfClass:[WineBaseView class]])
                 [subview setRetinaMode:mode];
@@ -2836,10 +3613,10 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
             return;
 
         CAShapeLayer *shapeLayer = [CAShapeLayer layer];
-        shapeLayer.bounds = self.contentView.layer.bounds;
-        shapeLayer.position = self.contentView.layer.position;
-        shapeLayer.geometryFlipped = self.contentView.layer.geometryFlipped;
-        shapeLayer.anchorPoint = self.contentView.layer.anchorPoint;
+        shapeLayer.bounds = wineContentView.layer.bounds;
+        shapeLayer.position = wineContentView.layer.position;
+        shapeLayer.geometryFlipped = wineContentView.layer.geometryFlipped;
+        shapeLayer.anchorPoint = wineContentView.layer.anchorPoint;
         shapeLayer.fillColor = CGColorGetConstantColor(kCGColorBlack);
 
         CGMutablePathRef path = CGPathCreateMutable();
@@ -2864,7 +3641,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         shapeLayer.path = path;
         CGPathRelease(path);
 
-        [self.contentView.layer addSublayer:shapeLayer];
+        [wineContentView.layer addSublayer:shapeLayer];
         self.contentViewMaskLayer = shapeLayer;
     }
 
@@ -3010,7 +3787,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     {
         WineApplicationController* controller = [WineApplicationController sharedController];
 
-        if (!ignore_windowDeminiaturize)
+        if (!ignore_windowDeminiaturize && !presentationWindowed)
             [self postDidUnminimizeEvent];
         ignore_windowDeminiaturize = FALSE;
 
@@ -3110,7 +3887,14 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void)windowDidResize:(NSNotification *)notification skipSizeMove:(BOOL)skipSizeMove
     {
-        NSRect frame = self.wine_fractionalFrame;
+        NSRect frame;
+
+        if (presentationScalable)
+        {
+            [self syncWineFrameToRealFrame];
+            [self layoutPresentation];
+        }
+        frame = self.wine_fractionalFrame;
 
         if ([self inLiveResize])
         {
@@ -3134,7 +3918,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
                             resizing:[self inLiveResize]
                         skipSizeMove:skipSizeMove];
 
-        [[[self contentView] inputContext] invalidateCharacterCoordinates];
+        [[wineContentView inputContext] invalidateCharacterCoordinates];
         [self updateFullscreen];
     }
 
@@ -3210,6 +3994,23 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (NSSize) windowWillResize:(NSWindow*)sender toSize:(NSSize)frameSize
     {
+        if (presentationScalable)
+        {
+            /* The program is not asked — it would answer with the size it
+               drew at — and the aspect ratio is the only rule. */
+            NSSize wine = [self wineContentSize];
+            NSSize asked = frameSize;
+            if (wine.width >= 1 && wine.height >= 1)
+            {
+                NSRect content = [self contentRectForFrameRect:NSMakeRect(0, 0, frameSize.width, frameSize.height)];
+                content.size.height = round(content.size.width * wine.height / wine.width);
+                frameSize = [self frameRectForContentRect:content].size;
+            }
+            presentation_log(self, "windowWillResize", NSMakeRect(0, 0, asked.width, asked.height),
+                             NSMakeRect(0, 0, wine.width, wine.height), NSMakeRect(0, 0, frameSize.width, frameSize.height));
+            return frameSize;
+        }
+
         if ([self inLiveResize])
         {
             if (maximized)
@@ -3369,7 +4170,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (NSDragOperation) draggingUpdated:(id <NSDraggingInfo>)sender
     {
         NSDragOperation ret;
-        NSPoint pt = [[self contentView] convertPoint:[sender draggingLocation] fromView:nil];
+        NSPoint pt = [wineContentView convertPoint:[sender draggingLocation] fromView:nil];
         CGPoint cgpt = cgpoint_win_from_mac(NSPointToCGPoint(pt));
 
         macdrv_query* query = macdrv_create_query();
@@ -3389,7 +4190,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (BOOL) performDragOperation:(id <NSDraggingInfo>)sender
     {
         BOOL ret;
-        NSPoint pt = [[self contentView] convertPoint:[sender draggingLocation] fromView:nil];
+        NSPoint pt = [wineContentView convertPoint:[sender draggingLocation] fromView:nil];
         CGPoint cgpt = cgpoint_win_from_mac(NSPointToCGPoint(pt));
 
         macdrv_query* query = macdrv_create_query();
@@ -3625,13 +4426,72 @@ void macdrv_window_set_color_image(macdrv_window w, CGImageRef image, CGRect rec
     CGImageRetain(image);
 
     OnMainThreadAsync(^{
-        WineContentView *view = [window contentView];
+        WineContentView *view = [window wineContentView];
 
         [view setColorImage:image];
         [view setSurfaceRect:cgrect_mac_from_win(rect)];
         [view setNeedsDisplayInRect:NSRectFromCGRect(cgrect_mac_from_win(dirty))];
 
         CGImageRelease(image);
+    });
+}
+}
+
+
+/***********************************************************************
+ *              macdrv_window_attach_surface
+ *
+ * Gives the window a view whose layer is the presenter's, for a GDI window
+ * surface the presenter draws. The presenter handle stays the caller's
+ * until macdrv_window_detach_surface releases it.
+ */
+void macdrv_window_attach_surface(macdrv_window w, void *presenter)
+{
+@autoreleasepool
+{
+    WineWindow* window = (WineWindow*)w;
+
+    OnMainThreadAsync(^{
+        [[window wineContentView] attachSurfaceView:presenter];
+    });
+}
+}
+
+
+/***********************************************************************
+ *              macdrv_window_detach_surface
+ *
+ * Removes the surface view and releases the presenter, in that order, on
+ * the main thread: the view's layer is the presenter's.
+ */
+void macdrv_window_detach_surface(macdrv_window w, void *presenter)
+{
+@autoreleasepool
+{
+    WineWindow* window = (WineWindow*)w;
+
+    OnMainThreadAsync(^{
+        [[window wineContentView] detachSurfaceView:presenter];
+        sevo_presenter_detach(presenter);
+    });
+}
+}
+
+
+/***********************************************************************
+ *              macdrv_window_surface_drawn
+ *
+ * The presenter took the surface's first frame: the window has content
+ * and may be shown.
+ */
+void macdrv_window_surface_drawn(macdrv_window w)
+{
+@autoreleasepool
+{
+    WineWindow* window = (WineWindow*)w;
+
+    OnMainThreadAsync(^{
+        [window windowDidDrawContent];
     });
 }
 }
@@ -3649,7 +4509,7 @@ void macdrv_window_set_shape_image(macdrv_window w, CGImageRef image)
     CGImageRetain(image);
 
     OnMainThreadAsync(^{
-        WineContentView *view = [window contentView];
+        WineContentView *view = [window wineContentView];
 
         [view setShapeImage:image];
         [view setNeedsDisplay:true];
@@ -3891,7 +4751,7 @@ void macdrv_set_view_superview(macdrv_view v, macdrv_view s, macdrv_window w, ma
         WineContentView* next = (WineContentView*)n;
 
         if (!superview)
-            superview = [window contentView];
+            superview = [window wineContentView];
 
         if (superview == [view superview])
         {
@@ -3990,6 +4850,32 @@ void macdrv_release_metal_device(macdrv_metal_device d)
 }
 }
 
+#if defined(__x86_64__)
+/***********************************************************************
+ *              macdrv_get_view_d3dmetal_client_surface
+ *
+ * The client_surface a D3DMetal swapchain draws into, hung on the content
+ * view so WineMetalLayer can find it again from one of its drawables.
+ */
+void *macdrv_get_view_d3dmetal_client_surface(macdrv_view v)
+{
+    WineContentView* view = (WineContentView*)v;
+    if ([view isKindOfClass:[WineContentView class]])
+        return view->d3dmetal_client_surface;
+    return NULL;
+}
+
+/***********************************************************************
+ *              macdrv_set_view_d3dmetal_client_surface
+ */
+void macdrv_set_view_d3dmetal_client_surface(macdrv_view v, void *client_surface)
+{
+    WineContentView* view = (WineContentView*)v;
+    if ([view isKindOfClass:[WineContentView class]])
+        view->d3dmetal_client_surface = client_surface;
+}
+#endif
+
 macdrv_metal_view macdrv_view_create_metal_view(macdrv_view v, macdrv_metal_device d)
 {
     id<MTLDevice> device = (id<MTLDevice>)d;
@@ -4009,7 +4895,7 @@ macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v)
     __block CAMetalLayer* layer;
 
     OnMainThread(^{
-        layer = (CAMetalLayer*)view.layer;
+        layer = [view rendererLayer];
     });
 
     return (macdrv_metal_layer)layer;
@@ -4019,6 +4905,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
 {
     WineMetalView* view = (WineMetalView*)v;
     OnMainThread(^{
+        presenter_trace("metal view %p released", view);
         [view removeFromSuperview];
         [view release];
     });
@@ -4104,6 +4991,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     }
 
     offscreen_layer = [[CAMetalLayer alloc] init];
+    presenter_trace("offscreen swapchain for hwnd %p", newHwnd);
     if (!offscreen_layer)
     {
         macdrv_release_metal_device(device);
@@ -4127,6 +5015,7 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
                                                       options:[NSDictionary dictionary]] retain];
         [remote_context setLayer:offscreen_layer];
         context_id = [remote_context contextId];
+        if (context_id) register_remote_layer(context_id, offscreen_layer);
     });
 
     if (!remote_context || !context_id)
@@ -4150,8 +5039,10 @@ void macdrv_view_release_metal_view(macdrv_metal_view v)
     CAContext *context = remote_context;
     CAMetalLayer *layer = offscreen_layer;
     macdrv_metal_device dev = device;
+    CAContextID released_id = context_id;
 
     OnMainThreadAsync(^{
+        if (released_id) unregister_remote_layer(released_id);
         [context setLayer:nil];
         [context release];
         [layer release];
@@ -4191,7 +5082,7 @@ void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int conte
     WineWindow* window = (WineWindow*)w;
 
     OnMainThread(^{
-        NSView* content_view = [window contentView];
+        NSView* content_view = [window wineContentView];
 
         if ([content_view isKindOfClass:[WineContentView class]])
             [(WineContentView*)content_view addCALayerHostViewWithContextId:context_id];
@@ -4206,7 +5097,7 @@ void macdrv_window_release_ca_layer_host_view(macdrv_window w, unsigned int cont
     WineWindow* window = (WineWindow*)w;
 
     OnMainThread(^{
-        NSView* content_view = [window contentView];
+        NSView* content_view = [window wineContentView];
 
         if ([content_view isKindOfClass:[WineContentView class]])
             [(WineContentView*)content_view removeCALayerHostView:context_id];
@@ -4314,7 +5205,7 @@ bool macdrv_send_keydown_to_input_source(int keyc, unsigned int flags, int repea
             CFRelease(c);
 
             window.commandDone = FALSE;
-            ret = [[[window contentView] inputContext] handleEvent:event] && !window.commandDone;
+            ret = [[[window wineContentView] inputContext] handleEvent:event] && !window.commandDone;
         }
         else
             ret = false;
@@ -4334,6 +5225,6 @@ void macdrv_clear_ime_text(void)
                 window = [[WineApplicationController sharedController] frontWineWindow];
         }
         if (window)
-            [[window contentView] clearMarkedText];
+            [[window wineContentView] clearMarkedText];
     });
 }

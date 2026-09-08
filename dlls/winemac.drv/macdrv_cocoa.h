@@ -102,6 +102,8 @@ enum {
 typedef struct macdrv_opaque_window* macdrv_window;
 typedef struct macdrv_opaque_event_queue* macdrv_event_queue;
 typedef struct macdrv_opaque_view* macdrv_view;
+extern void *macdrv_get_view_d3dmetal_client_surface(macdrv_view v);
+extern void macdrv_set_view_d3dmetal_client_surface(macdrv_view v, void *client_surface);
 typedef struct macdrv_opaque_opengl_context* macdrv_opengl_context;
 typedef struct macdrv_opaque_metal_device* macdrv_metal_device;
 typedef struct macdrv_opaque_metal_view* macdrv_metal_view;
@@ -123,6 +125,32 @@ extern bool right_command_is_ctrl;
 extern bool allow_immovable_windows;
 extern bool use_confinement_cursor_clipping;
 extern bool cursor_clipping_locks_windows;
+/* Presentation-scaled windows: the user resizes the window, the program keeps
+   drawing at its own size, and Core Animation scales the frame to fit.
+   RESIZABLE_WINDOWS_FIXED takes only windows the program made non-resizable;
+   RESIZABLE_WINDOWS_ALL takes every titled window;
+   RESIZABLE_WINDOWS_WINDOW is FIXED plus the borderless windows that cover a
+   screen, which are shown in a titled, resizable window at a smaller size
+   while the program keeps believing it fills the screen. */
+enum { RESIZABLE_WINDOWS_OFF, RESIZABLE_WINDOWS_FIXED, RESIZABLE_WINDOWS_ALL, RESIZABLE_WINDOWS_WINDOW };
+/* Traces every presentation frame decision to stderr: SEVO_PRESENTATION_LOG
+   in the environment, or `Mac Driver\PresentationLog` in the registry, which
+   reaches a game the client spawned. */
+extern int presentation_log_on;
+/* The presenter: the driver takes the game's rendered frame and puts it on
+   screen itself, so it can be scaled and filtered on the way. `Mac Driver\
+   Presenter=Y`, or SEVO_PRESENTER=1 in the environment as the bottle default.
+   Off, the driver behaves as it does without the presenter at all. */
+extern int presenter_on;
+/* Traces the presenter's frames and the Metal view lifecycle to stderr:
+   `Mac Driver\PresenterLog=Y` or SEVO_PRESENTER_LOG=1. */
+extern int presenter_log_on;
+/* Raw mouse deltas while a game holds the cursor for mouse-look: `Mac Driver\
+   LinearMouse=Y`, or SEVO_LINEAR_MOUSE=1 in the environment as the bottle
+   default. The pointer-acceleration curve shapes what the cursor does, which
+   is right for a cursor and wrong for a camera. */
+extern int linear_mouse;
+extern int resizable_windows;
 extern bool use_precise_scrolling;
 extern int gl_surface_mode;
 extern CFDictionaryRef localized_strings;
@@ -303,6 +331,7 @@ enum {
     WINDOW_MINIMIZE_REQUESTED,
     WINDOW_RESIZE_ENDED,
     WINDOW_RESTORE_REQUESTED,
+    CLIENT_SURFACE_PRESENTED,
     NUM_EVENT_TYPES
 };
 
@@ -404,6 +433,9 @@ typedef struct macdrv_event {
             bool    keep_frame;
             CGRect  frame;
         }                                           window_restore_requested;
+        struct {
+            void   *client_surface;
+        }                                           client_surface_presented;
     };
 } macdrv_event;
 
@@ -509,6 +541,13 @@ extern void macdrv_set_cocoa_window_frame(macdrv_window w, const CGRect* new_fra
 extern void macdrv_get_cocoa_window_frame(macdrv_window w, CGRect* out_frame);
 extern void macdrv_set_cocoa_parent_window(macdrv_window w, macdrv_window parent);
 extern void macdrv_window_set_color_image(macdrv_window w, CGImageRef image, CGRect rect, CGRect dirty);
+/* A GDI window surface drawn by the presenter (sevo_presenter_attach_surface):
+   the window gets a view for the presenter's layer, and gives it back with
+   the presenter released. macdrv_window_surface_drawn marks the window drawn
+   at the surface's first frame, as a color image would. */
+extern void macdrv_window_attach_surface(macdrv_window w, void *presenter);
+extern void macdrv_window_detach_surface(macdrv_window w, void *presenter);
+extern void macdrv_window_surface_drawn(macdrv_window w);
 extern void macdrv_window_set_shape_image(macdrv_window w, CGImageRef image);
 extern void macdrv_set_window_shape(macdrv_window w, const CGRect *rects, int count);
 extern void macdrv_set_window_alpha(macdrv_window w, CGFloat alpha);

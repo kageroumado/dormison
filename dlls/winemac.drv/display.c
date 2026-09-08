@@ -35,6 +35,31 @@ WINE_DEFAULT_DEBUG_CHANNEL(display);
 
 #define NEXT_DEVMODEW(mode) ((DEVMODEW *)((char *)((mode) + 1) + (mode)->dmDriverExtra))
 
+#include <pthread.h>
+#include <sys/types.h>
+#include <sys/sysctl.h>
+
+static int translated_status;
+
+static void init_is_translated(void)
+{
+    int ret = 0;
+    size_t size = sizeof(ret);
+
+    if (sysctlbyname("sysctl.proc_translated", &ret, &size, NULL, 0) == -1)
+        translated_status = 0;
+    else
+        translated_status = ret;
+}
+
+static int is_translated(void)
+{
+    static pthread_once_t init_once = PTHREAD_ONCE_INIT;
+
+    pthread_once(&init_once, init_is_translated);
+    return translated_status;
+}
+
 struct display_mode_descriptor
 {
     DWORD width;
@@ -92,7 +117,10 @@ static int display_mode_bits_per_pixel(CGDisplayModeRef display_mode)
 static BOOL display_mode_is_supported(CGDisplayModeRef display_mode)
 {
     uint32_t io_flags = CGDisplayModeGetIOFlags(display_mode);
-    return (io_flags & kDisplayModeValidFlag) && (io_flags & kDisplayModeSafeFlag);
+    /* Under Rosetta, CoreGraphics leaves kDisplayModeSafeFlag clear on modes that are in
+     * fact usable, which hides most resolutions from the mode list. */
+    return (io_flags & kDisplayModeValidFlag) &&
+           ((io_flags & kDisplayModeSafeFlag) || is_translated());
 }
 
 

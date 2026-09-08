@@ -1115,6 +1115,13 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
 static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
 {
     struct thread_data *data = get_thread_data();
+#if defined(__APPLE__) && defined(__x86_64__)
+    /* TSD slots 11 and 12 (%gs:0x58 and %gs:0x60) mirror the TEB's ThreadLocalStoragePointer
+     * and the PEB for PE code, and they are libc's __PTK_LIBC_TTYNAME_KEY and
+     * __PTK_LIBC_LOCALTIME_KEY, whose registered destructor is free(). Cleared here so
+     * pthread_exit() does not hand the PEB to free(), which libmalloc aborts on. */
+    __asm__ volatile ("movq %0,%%gs:0x58\n\tmovq %0,%%gs:0x60" :: "r" ((ULONG_PTR)0) : "memory");
+#endif
     close( data->alert_fd );
     close( data->wait_fd[0] );
     close( data->wait_fd[1] );
@@ -1401,10 +1408,10 @@ NTSTATUS WINAPI NtCreateThread( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRI
 /***********************************************************************
  *              NtCreateThreadEx   (NTDLL.@)
  */
-NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
-                                  HANDLE process, PRTL_THREAD_START_ROUTINE start, void *param,
-                                  ULONG flags, ULONG_PTR zero_bits, SIZE_T stack_commit,
-                                  SIZE_T stack_reserve, PS_ATTRIBUTE_LIST *attr_list )
+NTSTATUS WINAPI GPT_IMPORT(NtCreateThreadEx)( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
+                                              HANDLE process, PRTL_THREAD_START_ROUTINE start, void *param,
+                                              ULONG flags, ULONG_PTR zero_bits, SIZE_T stack_commit,
+                                              SIZE_T stack_reserve, PS_ATTRIBUTE_LIST *attr_list )
 {
     static const ULONG supported_flags = THREAD_CREATE_FLAGS_CREATE_SUSPENDED | THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH |
                                          THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER | THREAD_CREATE_FLAGS_SKIP_LOADER_INIT |
@@ -1482,6 +1489,17 @@ done:
     if (attr_list) status = update_attr_list( attr_list, *handle, &teb->ClientId, teb );
     return status;
 }
+#if defined(__APPLE__) && defined(__x86_64__)
+NTSTATUS __attribute__((ms_abi)) msthunk_NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access,
+    OBJECT_ATTRIBUTES *attr, HANDLE process, PRTL_THREAD_START_ROUTINE start, void *param,
+    ULONG flags, ULONG_PTR zero_bits, SIZE_T stack_commit, SIZE_T stack_reserve,
+    PS_ATTRIBUTE_LIST *attr_list )
+{
+    return sysv_NtCreateThreadEx( handle, access, attr, process, start, param,
+                                  flags, zero_bits, stack_commit, stack_reserve, attr_list );
+}
+GPT_ABI_WRAPPER( NtCreateThreadEx );
+#endif
 
 
 /***********************************************************************
@@ -1536,6 +1554,19 @@ static DECLSPEC_NORETURN void exit_thread( int status )
 {
     static void *prev_data;
     struct thread_data *data;
+    struct thread_data *self = get_thread_data();
+
+    if (self && self->exiting)
+    {
+        /* Entered a second time on a thread pthread_exit() is already tearing down: a fault
+         * inside a TSD destructor reaches segv_handler with this thread's syscall frame still
+         * live, handle_syscall_fault() resumes PE at the syscall return, and RtlExitUserThread's
+         * loop calls NtTerminateThread again. Exchanging prev_data here would hand the thread
+         * its own thread_data, and virtual_free_thread_data() would release the stack it is
+         * running on; its server sockets are already closed. Finish the pthread exit. */
+        pthread_exit( UIntToPtr(status) );
+    }
+    if (self) self->exiting = 1;
 
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
 
@@ -1775,6 +1806,14 @@ NTSTATUS WINAPI NtTerminateThread( HANDLE handle, LONG exit_code )
 {
     unsigned int ret;
     BOOL self;
+
+    if (handle == GetCurrentThread())
+    {
+        /* A thread already inside exit_thread() has closed its server sockets, so the
+         * termination request must not be sent again. */
+        struct thread_data *td = get_thread_data();
+        if (td && td->exiting) exit_thread( exit_code );
+    }
 
     SERVER_START_REQ( terminate_thread )
     {

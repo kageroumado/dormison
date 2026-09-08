@@ -1782,3 +1782,6 @@
 @ cdecl wine_get_version()
 @ cdecl wine_get_build_id()
 @ cdecl wine_get_host_version(ptr ptr)
+
+# Reachable by out-of-tree PE modules (D3DMetal); the dispatcher itself stays private.
+@ stdcall __wine_unix_call(int64 long ptr) __wine_unix_call_exported

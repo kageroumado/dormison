@@ -26,6 +26,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <locale.h>
 #include <langinfo.h>
@@ -816,6 +817,120 @@ static void init_locale(void)
     user_ui_language = user_lcid;
 
     setlocale( LC_NUMERIC, "C" );  /* FIXME: oleaut32 depends on this */
+}
+
+
+/***********************************************************************
+ *              apply_env_file
+ *
+ * KEY=VALUE lines; a value overrides the one the process inherited, and
+ * KEY= with nothing after the sign removes the variable. Blank lines and
+ * lines starting with # are skipped.
+ */
+static void apply_env_file( const char *path )
+{
+    FILE *file;
+    char line[4096];
+
+    if (!(file = fopen( path, "r" ))) return;
+    while (fgets( line, sizeof(line), file ))
+    {
+        char *p = line, *eq, *end;
+
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '#' || *p == '\n') continue;
+        end = p + strlen( p );
+        while (end > p && (end[-1] == '\n' || end[-1] == '\r')) *--end = 0;
+        if (!(eq = strchr( p, '=' )) || eq == p) continue;
+        *eq++ = 0;
+        if (*eq) setenv( p, eq, 1 );
+        else unsetenv( p );
+    }
+    fclose( file );
+}
+
+
+/***********************************************************************
+ *              load_sevo_env
+ *
+ * Per-bottle and per-program environment, applied at process start:
+ * <prefix>/.sevo/bottle.env, then <prefix>/.sevo/apps/<exe>.env, <exe>
+ * being the program's basename in lower case. A value written to either
+ * file reaches the next program start, whichever process spawns it. Runs
+ * before the dll path, the locale and the debug channels are read, so
+ * WINEDLLPATH_PREPEND, LC_ALL and WINEDEBUG can live here. SEVO_ENV_FILES=0
+ * skips both files.
+ */
+/* The per-program file for a program given as a unix or Windows path, or NULL. */
+static char *sevo_program_file( const char *program )
+{
+    const char *exe = program;
+    char *path, *name, *p;
+
+    if (!program) return NULL;
+    if ((p = strrchr( exe, '/' ))) exe = p + 1;
+    if ((p = strrchr( exe, '\\' ))) exe = p + 1;
+    if (!*exe) return NULL;
+    name = strdup( exe );
+    for (p = name; *p; p++) *p = tolower( (unsigned char)*p );
+    asprintf( &path, "%s/.sevo/apps/%s.env", config_dir, name );
+    free( name );
+    return path;
+}
+
+
+/***********************************************************************
+ *              sevo_program_env
+ *
+ * One value out of a program's file. The loader reads SEVO_LOADER this way,
+ * before the process exists to have an environment.
+ */
+char *sevo_program_env( const char *program, const char *key )
+{
+    char *path = sevo_program_file( program ), *found = NULL;
+    size_t key_len = strlen( key );
+    char line[4096];
+    FILE *file;
+
+    if (!path) return NULL;
+    if ((file = fopen( path, "r" )))
+    {
+        while (fgets( line, sizeof(line), file ))
+        {
+            char *p = line, *end;
+
+            while (*p == ' ' || *p == '\t') p++;
+            if (strncmp( p, key, key_len ) || p[key_len] != '=') continue;
+            p += key_len + 1;
+            end = p + strlen( p );
+            while (end > p && (end[-1] == '\n' || end[-1] == '\r')) *--end = 0;
+            if (*p) found = strdup( p );
+            break;
+        }
+        fclose( file );
+    }
+    free( path );
+    return found;
+}
+
+
+void load_sevo_env(void)
+{
+    const char *skip = getenv( "SEVO_ENV_FILES" );
+    char *path;
+
+    if (skip && !strcmp( skip, "0" )) return;
+
+    asprintf( &path, "%s/.sevo/bottle.env", config_dir );
+    apply_env_file( path );
+    free( path );
+
+    if (main_argc < 2) return;
+    if ((path = sevo_program_file( main_argv[1] )))
+    {
+        apply_env_file( path );
+        free( path );
+    }
 }
 
 

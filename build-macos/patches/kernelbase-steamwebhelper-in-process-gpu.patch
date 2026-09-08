@@ -1,0 +1,58 @@
+Append --in-process-gpu to steamwebhelper.exe command lines.
+
+Steam boots its CEF UI host, steamwebhelper.exe, which spawns a separate GPU process.
+Under wine that GPU process crashes and CEF respawns it in a loop, stalling every cold
+boot until CEF gives up and falls back. --in-process-gpu keeps the GPU work inside the
+browser process, so there is no child to crash. The injection sits in
+CreateProcessInternalW after tidy_cmdline is final and before create_process_params()
+consumes it. The image name is matched at its end, case-insensitively, with a path
+separator required before it, so an argument that merely names the executable does not
+trigger it; the flag is skipped when already present.
+
+diff --git a/dlls/kernelbase/process.c b/dlls/kernelbase/process.c
+index 25b3f4fffb9..a471454d8f3 100644
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -502,6 +502,17 @@ done:
+     return ret;
+ }
+ 
++static BOOL is_steamwebhelper( const WCHAR *app_name )
++{
++    static const WCHAR exe[] = L"steamwebhelper.exe";
++    SIZE_T exe_len = ARRAY_SIZE(exe) - 1, len;
++
++    if (!app_name || (len = lstrlenW( app_name )) < exe_len) return FALSE;
++    if (wcsicmp( app_name + len - exe_len, exe )) return FALSE;
++    if (len == exe_len) return TRUE;
++    return app_name[len - exe_len - 1] == '\\' || app_name[len - exe_len - 1] == '/';
++}
++
+ /**********************************************************************
+  *           CreateProcessInternalW   (kernelbase.@)
+  */
+@@ -543,6 +554,24 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR
+         app_name = name;
+     }
+ 
++    /* Steam's CEF host crashes its GPU process under wine and then respawns it in a
++     * loop, costing ~11s of every boot. --in-process-gpu keeps the GPU work in the
++     * browser process so there is nothing to crash. */
++    if (is_steamwebhelper( app_name ) && !wcsstr( tidy_cmdline, L"--in-process-gpu" ))
++    {
++        static const WCHAR extra[] = L" --in-process-gpu";
++        SIZE_T len = lstrlenW( tidy_cmdline ) + ARRAY_SIZE(extra);
++        WCHAR *patched = RtlAllocateHeap( GetProcessHeap(), 0, len * sizeof(WCHAR) );
++
++        if (patched)
++        {
++            lstrcpyW( patched, tidy_cmdline );
++            lstrcatW( patched, extra );
++            if (tidy_cmdline != cmd_line) RtlFreeHeap( GetProcessHeap(), 0, tidy_cmdline );
++            tidy_cmdline = patched;
++        }
++    }
++
+     /* Warn if unsupported features are used */
+ 
+     if (flags & (IDLE_PRIORITY_CLASS | HIGH_PRIORITY_CLASS | REALTIME_PRIORITY_CLASS |

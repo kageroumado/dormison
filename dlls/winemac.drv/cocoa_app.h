@@ -86,6 +86,10 @@ enum {
     NSCursor*   cursor;
     BOOL        cursorIsCurrent;
     BOOL        cursorHidden;
+    /* A clip a game asked for while its window is shown in a window and the
+       cursor is visible: held until the cursor hides. */
+    CGRect      deferredClipRect;
+    BOOL        hasDeferredClip;
     BOOL        clientWantsCursorHidden;
 
     NSTimeInterval lastSetCursorPositionTime;
@@ -128,6 +132,13 @@ enum {
 
     - (void) flipRect:(NSRect*)rect;
     - (NSPoint) flippedMouseLocation:(NSPoint)point;
+
+    /* Presentation-scaled windows draw Wine's coordinates somewhere else on
+       screen; these move a point or rect between the two spaces, both in
+       top-left-origin screen points. */
+    - (CGPoint) screenPointFromWinePoint:(CGPoint)point;
+    - (CGRect) screenRectFromWineRect:(CGRect)rect;
+    - (CGPoint) winePointFromScreenPoint:(CGPoint)point;
 
     - (WineWindow*) frontWineWindow;
     - (void) adjustWindowLevels;

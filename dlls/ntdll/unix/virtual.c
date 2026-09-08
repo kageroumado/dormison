@@ -170,6 +170,16 @@ static struct wine_rb_tree views_tree;
 static pthread_mutex_t virtual_mutex;
 pthread_key_t thread_data_key = 0;
 
+/* Keeps thread_data readable while pthread_exit() runs the TSD destructors. macOS
+   _pthread_tsd_cleanup NULLs a key's slot before calling that slot's destructor, and
+   exit_thread's re-entry check and any ntdll code reached from a later destructor need
+   get_thread_data() to answer. A slot is NULLed only just before its own destructor
+   runs, so restoring it here means no other destructor sees this slot as NULL. */
+static void restore_thread_data( void *data )
+{
+    pthread_setspecific( thread_data_key, data );
+}
+
 static const UINT page_shift = 12;
 static const UINT_PTR page_mask = 0xfff;
 static const UINT_PTR granularity_mask = 0xffff;
@@ -4093,7 +4103,7 @@ TEB *virtual_alloc_first_teb(void)
     thread_data = virtual_alloc_thread_data();
     thread_data->teb = teb;
     list_add_head( &teb_list, &thread_data->entry );
-    pthread_key_create( &thread_data_key, NULL );
+    pthread_key_create( &thread_data_key, restore_thread_data );
     pthread_setspecific( thread_data_key, thread_data );
     return teb;
 }
@@ -4632,6 +4642,31 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
         WARN( "treating read fault in a readable page as a write fault, addr %p\n", addr );
         err = EXCEPTION_WRITE_FAULT;
     }
+
+    /* CW Hack 24945: Rosetta faults on a write to a page that is both
+       writable and executable once it has translated code from it; dropping
+       and restoring the executable bit makes it re-translate, and the write
+       then goes through. */
+    if (err == EXCEPTION_WRITE_FAULT &&
+        ((get_unix_prot( vprot ) & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC)))
+    {
+        WARN( "write fault on a writable executable page, re-translating, addr %p\n", addr );
+        mprotect_range( page, host_page_size, 0, VPROT_EXEC );
+        mprotect_range( page, host_page_size, VPROT_EXEC, 0 );
+        ret = STATUS_SUCCESS;
+        goto done;
+    }
+
+    /* CW Hack 25719: the same for an execute fault on a page that is
+       executable, which is Rosetta running a stale translation. */
+    if (err == EXCEPTION_EXECUTE_FAULT && (get_unix_prot( vprot ) & PROT_EXEC))
+    {
+        WARN( "execute fault on an executable page, re-translating, addr %p\n", addr );
+        mprotect_range( page, host_page_size, 0, VPROT_EXEC );
+        mprotect_range( page, host_page_size, VPROT_EXEC, 0 );
+        ret = STATUS_SUCCESS;
+        goto done;
+    }
 #endif
 
     if (!is_inside_signal_stack( data, stack ) && (vprot & VPROT_GUARD))
@@ -4668,6 +4703,9 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
                 ret = STATUS_SUCCESS;
         }
     }
+#ifdef __APPLE__
+done:
+#endif
     mutex_unlock( &virtual_mutex );
     rec->ExceptionCode = ret;
     return ret;
@@ -6861,6 +6899,42 @@ NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buf
 }
 
 
+#ifdef __APPLE__
+static BOOL is_apple_silicon(void)
+{
+    static int translated = -1;
+
+    if (translated < 0)
+    {
+        int ret = 0;
+        size_t size = sizeof(ret);
+        translated = sysctlbyname( "sysctl.proc_translated", &ret, &size, NULL, 0 ) == -1 ? 0 : ret;
+    }
+    return translated;
+}
+
+/* CW HACK 18947: a write into another process's code through
+   mach_vm_write() is invisible to Rosetta, which keeps executing the
+   translation it already has. Dropping and restoring the executable bit on
+   the written pages, from inside the target, makes it translate them again. */
+static void toggle_executable_pages_for_rosetta( HANDLE process, void *addr, SIZE_T size )
+{
+    MEMORY_BASIC_INFORMATION info;
+    SIZE_T ret;
+
+    if (!is_apple_silicon()) return;
+    if (NtQueryVirtualMemory( process, addr, MemoryBasicInformation, &info, sizeof(info), &ret )) return;
+    if (info.AllocationProtect & 0xf0)
+    {
+        DWORD origprot, noexec = info.AllocationProtect & ~0xf0;
+
+        if (!noexec) noexec = PAGE_NOACCESS;
+        NtProtectVirtualMemory( process, &addr, &size, noexec, &origprot );
+        NtProtectVirtualMemory( process, &addr, &size, origprot, &noexec );
+    }
+}
+#endif
+
 /***********************************************************************
  *             NtWriteVirtualMemory   (NTDLL.@)
  *             ZwWriteVirtualMemory   (NTDLL.@)
@@ -6881,6 +6955,9 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
             size = reply->written;
         }
         SERVER_END_REQ;
+#ifdef __APPLE__
+        toggle_executable_pages_for_rosetta( process, addr, size );
+#endif
     }
     else
     {

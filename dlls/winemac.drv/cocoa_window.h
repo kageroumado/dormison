@@ -20,9 +20,11 @@
 
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
+#include "macdrv_cocoa.h"
 
 
 @class WineEventQueue;
+@class WineContentView;
 
 
 @interface WineWindow : NSPanel <NSWindowDelegate>
@@ -84,6 +86,22 @@
     BOOL fakingClose;
 
     CAShapeLayer* contentViewMaskLayer;
+
+    /* Presentation scaling. The window's content view is a stage; Wine's own
+       content view sits in it, scaled to fit whenever the real frame and the
+       frame Wine believes in (wineFrame) differ in size. */
+    BOOL presentationScalable;
+    /* A borderless window covering a screen, shown in a titled window at a
+       smaller size (RESIZABLE_WINDOWS_WINDOW). Placed once, at the default
+       windowed frame; after that the real frame is the user's alone. */
+    BOOL presentationWindowed;
+    BOOL presentationPlaced;
+    struct macdrv_window_features presentationFeatures;
+    WineContentView* wineContentView;
+    /* The content rect Wine last asked for. wineFrame is derived from it for
+       the style mask of the moment, since a title bar arriving after the
+       window is made changes the frame of the same content. */
+    NSRect wineContentRect;
 }
 
 @property (retain, readonly, nonatomic) WineEventQueue* queue;
@@ -94,6 +112,15 @@
 @property (readonly, getter=isFullscreen, nonatomic) BOOL fullscreen;
 @property (readonly, getter=isFakingClose, nonatomic) BOOL fakingClose;
 @property (readonly, nonatomic) NSRect wine_fractionalFrame;
+
+/* Wine's own content view: what every surface, client view and layer host
+   lives in. The window's contentView is the stage around it. */
+@property (readonly, nonatomic) WineContentView* wineContentView;
+/* Whether the real content size differs from the size Wine draws at. */
+@property (readonly, nonatomic) BOOL presentationScaled;
+@property (readonly, nonatomic) BOOL presentationWindowed;
+/* Real points per point of Wine's content; 1 unless scaled. */
+@property (readonly, nonatomic) CGFloat presentationScale;
 
 /* Whether this window, when ordered in and not miniaturized, would appear to
    the user on-screen. That means it has a non-zero size and is not empty-
@@ -111,5 +138,12 @@
     - (void) updateForCursorClipping;
 
     - (void) setRetinaMode:(BOOL)mode;
+
+    - (void) layoutPresentation;
+    /* Both points in the top-left-origin screen space the controller's
+       mouse handlers work in. */
+    - (CGPoint) winePointFromScreenPoint:(CGPoint)point;
+    - (CGPoint) screenPointFromWinePoint:(CGPoint)point;
+    - (BOOL) wineContentContainsScreenPoint:(CGPoint)point;
 
 @end

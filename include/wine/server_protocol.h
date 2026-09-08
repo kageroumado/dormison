@@ -6067,6 +6067,8 @@ struct get_inproc_sync_fd_reply
     struct reply_header __header;
     int           type;
     unsigned int access;
+    unsigned int shm_idx;
+    char __pad_20[4];
 };
 
 
@@ -7232,6 +7234,6 @@ union generic_reply
     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 962
+#define SERVER_PROTOCOL_VERSION 963
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

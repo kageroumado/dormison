@@ -26,6 +26,8 @@
 
 #include "config.h"
 
+#include <strings.h>
+
 #include <Security/AuthSession.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
 
@@ -53,6 +55,14 @@ BOOL allow_software_rendering = FALSE;
 bool allow_immovable_windows = true;
 bool use_confinement_cursor_clipping = true;
 bool cursor_clipping_locks_windows = true;
+int resizable_windows = RESIZABLE_WINDOWS_OFF;
+int presentation_log_on = 0;
+int presenter_on = 0;
+int presenter_log_on = 0;
+static char upscaler_option[64] = "off";
+static char final_filter_option[16] = "lanczos";
+static char presenter_debug_option[16] = "";
+int linear_mouse = 0;
 bool use_precise_scrolling = true;
 int gl_surface_mode = GL_SURFACE_IN_FRONT_OPAQUE;
 bool retina_enabled = false;
@@ -62,6 +72,9 @@ BOOL force_backing_store = FALSE;
 pthread_key_t macdrv_thread_data_key = 0;
 UINT64 app_icon_callback = 0;
 UINT64 app_quit_request_callback = 0;
+UINT64 regcreateopenkeyexa_callback = 0;
+UINT64 regqueryvalueexa_callback = 0;
+UINT64 regsetvalueexa_callback = 0;
 
 CFDictionaryRef localized_strings;
 
@@ -272,6 +285,27 @@ static inline DWORD get_config_key(HKEY defkey, HKEY appkey, const char *name,
 }
 
 
+/* The option strings the presenter takes are ASCII names; a registry value
+   is narrowed to them, anything else in it dropped. */
+static void copy_option_string(char *dest, size_t size, const WCHAR *value)
+{
+    size_t i;
+    for (i = 0; i + 1 < size && value[i]; i++)
+        dest[i] = value[i] < 0x80 ? (char)value[i] : '?';
+    dest[i] = 0;
+}
+
+/* "all" for every titled window, "window" for the locked ones plus
+   fullscreen-style windows put in a window, "fixed" or any true value for
+   the windows the program locked, anything else off. */
+static int resizable_windows_from_option(char first)
+{
+    if (first == 'a' || first == 'A') return RESIZABLE_WINDOWS_ALL;
+    if (first == 'w' || first == 'W') return RESIZABLE_WINDOWS_WINDOW;
+    if (first == 'f' || first == 'F' || IS_OPTION_TRUE(first)) return RESIZABLE_WINDOWS_FIXED;
+    return RESIZABLE_WINDOWS_OFF;
+}
+
 /***********************************************************************
  *              setup_options
  *
@@ -383,6 +417,60 @@ static void setup_options(void)
 
     retina_on = retina_enabled;
 
+    /* The environment carries the bottle-wide default; the registry key,
+       per program or global, wins. */
+    {
+        const char *env = getenv("SEVO_RESIZABLE_WINDOWS");
+        if (env && *env) resizable_windows = resizable_windows_from_option(*env);
+    }
+    {
+        const char *env = getenv("SEVO_PRESENTER");
+        if (env && *env) presenter_on = IS_OPTION_TRUE(*env);
+    }
+    {
+        const char *env = getenv("SEVO_PRESENTATION_LOG");
+        if (env && *env) presentation_log_on = IS_OPTION_TRUE(*env);
+    }
+    {
+        const char *env = getenv("SEVO_UPSCALER");
+        if (env && *env) snprintf(upscaler_option, sizeof(upscaler_option), "%s", env);
+    }
+    {
+        const char *env = getenv("SEVO_FINAL_FILTER");
+        if (env && *env) snprintf(final_filter_option, sizeof(final_filter_option), "%s", env);
+    }
+    {
+        const char *env = getenv("SEVO_PRESENTER_LOG");
+        if (env && *env) presenter_log_on = IS_OPTION_TRUE(*env);
+    }
+    {
+        const char *env = getenv("SEVO_PRESENTER_DEBUG");
+        if (env && *env) snprintf(presenter_debug_option, sizeof(presenter_debug_option), "%s", env);
+    }
+    {
+        const char *env = getenv("SEVO_LINEAR_MOUSE");
+        if (env && *env) linear_mouse = IS_OPTION_TRUE(*env);
+    }
+    if (!get_config_key(hkey, appkey, "ResizableWindows", buffer, sizeof(buffer)))
+        resizable_windows = resizable_windows_from_option((char)buffer[0]);
+    if (!get_config_key(hkey, appkey, "PresentationLog", buffer, sizeof(buffer)))
+        presentation_log_on = IS_OPTION_TRUE(buffer[0]);
+    if (!get_config_key(hkey, appkey, "Presenter", buffer, sizeof(buffer)))
+        presenter_on = IS_OPTION_TRUE(buffer[0]);
+    if (!get_config_key(hkey, appkey, "Upscaler", buffer, sizeof(buffer)))
+        copy_option_string(upscaler_option, sizeof(upscaler_option), buffer);
+    if (!get_config_key(hkey, appkey, "FinalFilter", buffer, sizeof(buffer)))
+        copy_option_string(final_filter_option, sizeof(final_filter_option), buffer);
+    if (!get_config_key(hkey, appkey, "PresenterLog", buffer, sizeof(buffer)))
+        presenter_log_on = IS_OPTION_TRUE(buffer[0]);
+    if (!get_config_key(hkey, appkey, "PresenterDebug", buffer, sizeof(buffer)))
+        copy_option_string(presenter_debug_option, sizeof(presenter_debug_option), buffer);
+    /* An upscaler other than off is the presenter switched on; Presenter=Y
+       alone runs it with plain resampling. */
+    if (strcasecmp(upscaler_option, "off")) presenter_on = 1;
+    if (!get_config_key(hkey, appkey, "LinearMouse", buffer, sizeof(buffer)))
+        linear_mouse = IS_OPTION_TRUE(buffer[0]);
+
     if (appkey) NtClose(appkey);
     if (hkey) NtClose(hkey);
 }
@@ -435,6 +523,10 @@ static NTSTATUS macdrv_init(void *arg)
 
     app_icon_callback = params->app_icon_callback;
     app_quit_request_callback = params->app_quit_request_callback;
+    regcreateopenkeyexa_callback = params->regcreateopenkeyexa_callback;
+    regqueryvalueexa_callback = params->regqueryvalueexa_callback;
+    regsetvalueexa_callback = params->regsetvalueexa_callback;
+    d3dmetal_set_host_callbacks(params);
 
     status = SessionGetInfo(callerSecuritySession, NULL, &attributes);
     if (status != noErr || !(attributes & sessionHasGraphicAccess))
@@ -445,6 +537,14 @@ static NTSTATUS macdrv_init(void *arg)
     init_win_context();
     setup_options();
     load_strings(params->strings);
+
+    if (presenter_on)
+    {
+        presenter_on = sevo_presenter_init(upscaler_option, final_filter_option, getenv("SEVO_SHADER_DIR"),
+                                           presenter_log_on, presenter_debug_option);
+        TRACE("presenter: %s upscaler %s filter %s\n", presenter_on ? "on" : "off (no device)",
+              upscaler_option, final_filter_option);
+    }
 
     macdrv_err_on = ERR_ON(macdrv);
     if (macdrv_start_cocoa_app(NtGetTickCount()))
@@ -613,6 +713,8 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     macdrv_init,
     macdrv_quit_result,
+    macdrv_d3dmetal_monitor_enum,
+    macdrv_d3dmetal_kernel_call,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
@@ -626,12 +728,25 @@ static NTSTATUS wow64_init(void *arg)
         ULONG strings;
         UINT64 app_icon_callback;
         UINT64 app_quit_request_callback;
+        UINT64 regcreateopenkeyexa_callback;
+        UINT64 regqueryvalueexa_callback;
+        UINT64 regsetvalueexa_callback;
+        UINT64 d3dmetal_host_callbacks[d3dm_cb_count];
+        UINT64 d3dmetal_unix_call_dispatcher;
+        UINT64 d3dmetal_unixlib_handle;
     } *params32 = arg;
     struct init_params params;
 
     params.strings = UlongToPtr(params32->strings);
     params.app_icon_callback = params32->app_icon_callback;
     params.app_quit_request_callback = params32->app_quit_request_callback;
+    params.regcreateopenkeyexa_callback = params32->regcreateopenkeyexa_callback;
+    params.regqueryvalueexa_callback = params32->regqueryvalueexa_callback;
+    params.regsetvalueexa_callback = params32->regsetvalueexa_callback;
+    memcpy(params.d3dmetal_host_callbacks, params32->d3dmetal_host_callbacks,
+           sizeof(params.d3dmetal_host_callbacks));
+    params.d3dmetal_unix_call_dispatcher = params32->d3dmetal_unix_call_dispatcher;
+    params.d3dmetal_unixlib_handle = params32->d3dmetal_unixlib_handle;
     return macdrv_init(&params);
 }
 
@@ -639,6 +754,8 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
     wow64_init,
     macdrv_quit_result,
+    macdrv_d3dmetal_monitor_enum,
+    macdrv_d3dmetal_kernel_call,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count );

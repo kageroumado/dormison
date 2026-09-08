@@ -25,6 +25,8 @@
 #include "ntgdi.h"
 #include "macdrv_res.h"
 #include "shellapi.h"
+#include "winreg.h"
+#include "ddk/d3dkmthk.h"
 #include "unixlib.h"
 #include "wine/debug.h"
 
@@ -369,6 +371,336 @@ cleanup:
 }
 
 
+static NTSTATUS WINAPI macdrv_regcreateopenkeyexa(void *arg, ULONG size)
+{
+    struct regcreateopenkeyexa_params *params = arg;
+    LONG result;
+
+    if (params->create)
+    {
+        result = RegCreateKeyExA(UlongToHandle(params->hkey),
+                                 param_ptr(params->name),
+                                 params->reserved,
+                                 param_ptr(params->class),
+                                 params->options,
+                                 params->access,
+                                 param_ptr(params->security),
+                                 param_ptr(params->retkey),
+                                 param_ptr(params->disposition));
+    }
+    else
+    {
+        result = RegOpenKeyExA(UlongToHandle(params->hkey),
+                               param_ptr(params->name),
+                               params->options,
+                               params->access,
+                               param_ptr(params->retkey));
+    }
+    *(LONG *)param_ptr(params->result) = result;
+    return 0;
+}
+
+static NTSTATUS WINAPI macdrv_regqueryvalueexa(void *arg, ULONG size)
+{
+    struct regqueryvalueexa_params *params = arg;
+    LONG result;
+
+    result = RegQueryValueExA(UlongToHandle(params->hkey),
+                              param_ptr(params->name),
+                              param_ptr(params->reserved),
+                              param_ptr(params->type),
+                              param_ptr(params->data),
+                              param_ptr(params->count));
+    *(LONG *)param_ptr(params->result) = result;
+    return 0;
+}
+
+static NTSTATUS WINAPI macdrv_regsetvalueexa(void *arg, ULONG size)
+{
+    struct regsetvalueexa_params *params = arg;
+    LONG result;
+
+    result = RegSetValueExA(UlongToHandle(params->hkey),
+                            param_ptr(params->name),
+                            params->reserved,
+                            params->type,
+                            param_ptr(params->data),
+                            params->count);
+    *(LONG *)param_ptr(params->result) = result;
+    return 0;
+}
+
+
+#ifdef _WIN64
+
+/* MARK: - D3DMetal 4.0 host callbacks
+ *
+ * The toolkit calls these through KeUserDispatchCallback with the parameter
+ * blocks declared in unixlib.h, and reads each Win32 result through the
+ * pointer in the block's last field. Module and heap handles cross the
+ * boundary as 32-bit values (the toolkit's wrappers store them in a DWORD),
+ * so a 64-bit HMODULE is handed out as a small token from the table below
+ * and the process heap as token 1. */
+
+#define D3DMETAL_MODULE_TOKENS 64
+
+static HMODULE d3dmetal_modules[D3DMETAL_MODULE_TOKENS];
+
+static UINT32 d3dmetal_module_token(HMODULE module)
+{
+    unsigned int i, free_slot = D3DMETAL_MODULE_TOKENS;
+
+    if (!module) return 0;
+    for (i = 0; i < D3DMETAL_MODULE_TOKENS; i++)
+    {
+        if (d3dmetal_modules[i] == module) return i + 1;
+        if (!d3dmetal_modules[i] && free_slot == D3DMETAL_MODULE_TOKENS) free_slot = i;
+    }
+    if (free_slot == D3DMETAL_MODULE_TOKENS)
+    {
+        ERR("no token left for module %p\n", module);
+        return 0;
+    }
+    d3dmetal_modules[free_slot] = module;
+    return free_slot + 1;
+}
+
+static HMODULE d3dmetal_module_from_token(UINT32 token)
+{
+    if (!token || token > D3DMETAL_MODULE_TOKENS) return NULL;
+    return d3dmetal_modules[token - 1];
+}
+
+static NTSTATUS WINAPI d3dmetal_regdeletekeyvaluea(void *arg, ULONG size)
+{
+    struct d3dmetal_regdeletekeyvaluea_params *params = arg;
+    *(LONG *)param_ptr(params->result) = RegDeleteKeyValueA(UlongToHandle(params->hkey),
+                                                             param_ptr(params->subkey),
+                                                             param_ptr(params->value));
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_createthread(void *arg, ULONG size)
+{
+    struct d3dmetal_createthread_params *params = arg;
+    HANDLE thread = CreateThread(param_ptr(params->security), params->stack_size,
+                                 param_ptr(params->start), param_ptr(params->param),
+                                 params->flags, param_ptr(params->thread_id));
+    TRACE("start %p param %p flags %#x -> %p\n", param_ptr(params->start), param_ptr(params->param),
+          (unsigned int)params->flags, thread);
+    *(HANDLE *)param_ptr(params->result) = thread;
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_d3dkmtenumadapters2(void *arg, ULONG size)
+{
+    struct d3dmetal_d3dkmtenumadapters2_params *params = arg;
+    *(NTSTATUS *)param_ptr(params->result) = D3DKMTEnumAdapters2(param_ptr(params->desc));
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_getmodulehandlea(void *arg, ULONG size)
+{
+    struct d3dmetal_getmodulehandlea_params *params = arg;
+    UINT32 token = d3dmetal_module_token(GetModuleHandleA(param_ptr(params->name)));
+    TRACE("%s -> token %u\n", debugstr_a(param_ptr(params->name)), token);
+    *(UINT64 *)param_ptr(params->result) = token;
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_getprocaddress(void *arg, ULONG size)
+{
+    struct d3dmetal_getprocaddress_params *params = arg;
+    HMODULE module = d3dmetal_module_from_token(params->module);
+    void *proc = module ? GetProcAddress(module, param_ptr(params->name)) : NULL;
+    TRACE("token %u %s -> %p\n", params->module,
+          params->name > 0xffff ? debugstr_a(param_ptr(params->name)) : wine_dbg_sprintf("#%u", (unsigned int)params->name),
+          proc);
+    *(void **)param_ptr(params->result) = proc;
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_getsystemdirectoryw(void *arg, ULONG size)
+{
+    struct d3dmetal_getsystemdirectoryw_params *params = arg;
+    *(UINT32 *)param_ptr(params->result) = GetSystemDirectoryW(param_ptr(params->buffer), params->size);
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_getmodulefilenamea(void *arg, ULONG size)
+{
+    struct d3dmetal_getmodulefilenamea_params *params = arg;
+    HMODULE module = d3dmetal_module_from_token(params->module);
+    *(UINT32 *)param_ptr(params->result) = GetModuleFileNameA(module, param_ptr(params->buffer), params->size);
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_loadlibrarya(void *arg, ULONG size)
+{
+    struct d3dmetal_loadlibrarya_params *params = arg;
+    UINT32 token = d3dmetal_module_token(LoadLibraryA(param_ptr(params->name)));
+    TRACE("%s -> token %u\n", debugstr_a(param_ptr(params->name)), token);
+    *(UINT64 *)param_ptr(params->result) = token;
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_freelibrary(void *arg, ULONG size)
+{
+    struct d3dmetal_freelibrary_params *params = arg;
+    HMODULE module = d3dmetal_module_from_token(params->module);
+    BOOL ret = module ? FreeLibrary(module) : FALSE;
+    if (ret) d3dmetal_modules[params->module - 1] = NULL;
+    *(BOOL *)param_ptr(params->result) = ret;
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_loadlibraryexa(void *arg, ULONG size)
+{
+    struct d3dmetal_loadlibraryexa_params *params = arg;
+    UINT32 token = d3dmetal_module_token(LoadLibraryExA(param_ptr(params->name),
+                                                        UlongToHandle(params->file), params->flags));
+    TRACE("%s flags %#x -> token %u\n", debugstr_a(param_ptr(params->name)), (unsigned int)params->flags, token);
+    *(UINT64 *)param_ptr(params->result) = token;
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_heapfree(void *arg, ULONG size)
+{
+    struct d3dmetal_heapfree_params *params = arg;
+    HANDLE heap = params->heap == 1 ? GetProcessHeap() : UlongToHandle(params->heap);
+    *(BOOL *)param_ptr(params->result) = HeapFree(heap, params->flags, param_ptr(params->mem));
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_getprocessheap(void *arg, ULONG size)
+{
+    struct d3dmetal_getprocessheap_params *params = arg;
+    *(UINT64 *)param_ptr(params->result) = 1;
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_virtualalloc(void *arg, ULONG size)
+{
+    struct d3dmetal_virtualalloc_params *params = arg;
+    *(void **)param_ptr(params->result) = VirtualAlloc(param_ptr(params->addr), params->size,
+                                                        params->type, params->protect);
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_virtualfree(void *arg, ULONG size)
+{
+    struct d3dmetal_virtualfree_params *params = arg;
+    *(BOOL *)param_ptr(params->result) = VirtualFree(param_ptr(params->addr), params->size, params->type);
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_virtualprotect(void *arg, ULONG size)
+{
+    struct d3dmetal_virtualprotect_params *params = arg;
+    *(BOOL *)param_ptr(params->result) = VirtualProtect(param_ptr(params->addr), params->size,
+                                                         params->protect, param_ptr(params->old_protect));
+    return 0;
+}
+
+/* The MONITORENUMPROC pack_EnumDisplayMonitors hands to
+ * NtUserEnumDisplayMonitors. Its LPARAM carries the toolkit's own callback,
+ * which has to run on the unix side of a fresh syscall frame: it asks for
+ * monitor info through KeUserDispatchCallback, and a user-mode callback
+ * started from PE code that is itself inside one would place its arguments
+ * on the stack this function is running on. */
+static BOOL CALLBACK d3dmetal_monitor_enum_proc(HMONITOR monitor, HDC hdc, RECT *rect, LPARAM lparam)
+{
+    const struct d3dmetal_monitor_enum_lparam *outer = (const void *)lparam;
+    struct d3dmetal_monitor_enum_params params =
+    {
+        .monitor = (UINT_PTR)monitor,
+        .hdc = (UINT_PTR)hdc,
+        .rect = (UINT_PTR)rect,
+        .callback = outer->callback,
+        .lparam = outer->lparam,
+    };
+
+    TRACE("monitor %p hdc %p rect %p callback %#I64x lparam %#I64x\n", monitor, hdc, rect,
+          outer->callback, outer->lparam);
+    if (MACDRV_CALL(d3dmetal_monitor_enum, &params)) return FALSE;
+    TRACE("monitor %p -> %d\n", monitor, params.result);
+    return params.result;
+}
+
+static NTSTATUS WINAPI d3dmetal_getmonitorinfow(void *arg, ULONG size)
+{
+    struct d3dmetal_getmonitorinfow_params *params = arg;
+    *(BOOL *)param_ptr(params->result) = GetMonitorInfoW(param_ptr(params->monitor), param_ptr(params->info));
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_adjustwindowrectex(void *arg, ULONG size)
+{
+    struct d3dmetal_adjustwindowrectex_params *params = arg;
+    *(BOOL *)param_ptr(params->result) = AdjustWindowRectEx(param_ptr(params->rect), params->style,
+                                                             params->menu, params->ex_style);
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_getwindowlongptrw(void *arg, ULONG size)
+{
+    struct d3dmetal_getwindowlongptrw_params *params = arg;
+    *(LONG_PTR *)param_ptr(params->result) = GetWindowLongPtrW(param_ptr(params->hwnd), params->index);
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_getwindowrect(void *arg, ULONG size)
+{
+    struct d3dmetal_getwindowrect_params *params = arg;
+    *(BOOL *)param_ptr(params->result) = GetWindowRect(param_ptr(params->hwnd), param_ptr(params->rect));
+    return 0;
+}
+
+static NTSTATUS WINAPI d3dmetal_getsystemmetrics(void *arg, ULONG size)
+{
+    struct d3dmetal_getsystemmetrics_params *params = arg;
+    *(INT *)param_ptr(params->result) = GetSystemMetrics(params->index);
+    return 0;
+}
+
+static void fill_d3dmetal_host_callbacks(UINT64 *callbacks)
+{
+    callbacks[d3dm_cb_regqueryvalueexa] = (UINT_PTR)macdrv_regqueryvalueexa;
+    callbacks[d3dm_cb_regsetvalueexa] = (UINT_PTR)macdrv_regsetvalueexa;
+    callbacks[d3dm_cb_regcreateopenkeyexa] = (UINT_PTR)macdrv_regcreateopenkeyexa;
+    callbacks[d3dm_cb_regdeletekeyvaluea] = (UINT_PTR)d3dmetal_regdeletekeyvaluea;
+    callbacks[d3dm_cb_createthread] = (UINT_PTR)d3dmetal_createthread;
+    callbacks[d3dm_cb_d3dkmtenumadapters2] = (UINT_PTR)d3dmetal_d3dkmtenumadapters2;
+    callbacks[d3dm_cb_getmodulehandlea] = (UINT_PTR)d3dmetal_getmodulehandlea;
+    callbacks[d3dm_cb_getprocaddress] = (UINT_PTR)d3dmetal_getprocaddress;
+    callbacks[d3dm_cb_getsystemdirectoryw] = (UINT_PTR)d3dmetal_getsystemdirectoryw;
+    callbacks[d3dm_cb_getmodulefilenamea] = (UINT_PTR)d3dmetal_getmodulefilenamea;
+    callbacks[d3dm_cb_loadlibrarya] = (UINT_PTR)d3dmetal_loadlibrarya;
+    callbacks[d3dm_cb_freelibrary] = (UINT_PTR)d3dmetal_freelibrary;
+    callbacks[d3dm_cb_loadlibraryexa] = (UINT_PTR)d3dmetal_loadlibraryexa;
+    callbacks[d3dm_cb_heapfree] = (UINT_PTR)d3dmetal_heapfree;
+    callbacks[d3dm_cb_getprocessheap] = (UINT_PTR)d3dmetal_getprocessheap;
+    callbacks[d3dm_cb_virtualalloc] = (UINT_PTR)d3dmetal_virtualalloc;
+    callbacks[d3dm_cb_virtualfree] = (UINT_PTR)d3dmetal_virtualfree;
+    callbacks[d3dm_cb_virtualprotect] = (UINT_PTR)d3dmetal_virtualprotect;
+    callbacks[d3dm_cb_monitorenumproc] = (UINT_PTR)d3dmetal_monitor_enum_proc;
+    callbacks[d3dm_cb_getmonitorinfow] = (UINT_PTR)d3dmetal_getmonitorinfow;
+    callbacks[d3dm_cb_adjustwindowrectex] = (UINT_PTR)d3dmetal_adjustwindowrectex;
+    callbacks[d3dm_cb_getwindowlongptrw] = (UINT_PTR)d3dmetal_getwindowlongptrw;
+    callbacks[d3dm_cb_getwindowrect] = (UINT_PTR)d3dmetal_getwindowrect;
+    callbacks[d3dm_cb_getsystemmetrics] = (UINT_PTR)d3dmetal_getsystemmetrics;
+}
+
+#else
+
+static void fill_d3dmetal_host_callbacks(UINT64 *callbacks)
+{
+    memset(callbacks, 0, sizeof(*callbacks) * d3dm_cb_count);
+}
+
+#endif  /* _WIN64 */
+
+
 static BOOL process_attach(void)
 {
     struct init_params params;
@@ -399,6 +731,12 @@ static BOOL process_attach(void)
     params.strings = strings;
     params.app_icon_callback = (UINT_PTR)macdrv_app_icon;
     params.app_quit_request_callback = (UINT_PTR)macdrv_app_quit_request;
+    params.regcreateopenkeyexa_callback = (UINT_PTR)macdrv_regcreateopenkeyexa;
+    params.regsetvalueexa_callback = (UINT_PTR)macdrv_regsetvalueexa;
+    params.regqueryvalueexa_callback = (UINT_PTR)macdrv_regqueryvalueexa;
+    fill_d3dmetal_host_callbacks(params.d3dmetal_host_callbacks);
+    params.d3dmetal_unix_call_dispatcher = (UINT_PTR)__wine_unix_call_dispatcher;
+    params.d3dmetal_unixlib_handle = __wine_unixlib_handle;
 
     if (MACDRV_CALL(init, &params)) return FALSE;
 

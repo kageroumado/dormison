@@ -75,6 +75,7 @@ static const char *dbgstr_event(int type)
         "WINDOW_MINIMIZE_REQUESTED",
         "WINDOW_RESIZE_ENDED",
         "WINDOW_RESTORE_REQUESTED",
+        "CLIENT_SURFACE_PRESENTED",
     };
     C_ASSERT(ARRAYSIZE(event_names) == NUM_EVENT_TYPES);
 
@@ -477,6 +478,11 @@ void macdrv_handle_event(const macdrv_event *event)
     case WINDOW_RESTORE_REQUESTED:
         macdrv_window_restore_requested(hwnd, event);
         break;
+#if defined(__x86_64__)
+    case CLIENT_SURFACE_PRESENTED:
+        macdrv_client_surface_presented(event);
+        break;
+#endif
     default:
         TRACE("    ignoring\n");
         break;

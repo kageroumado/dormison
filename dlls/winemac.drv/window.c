@@ -1150,14 +1150,11 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format)
     struct macdrv_client_surface *surface;
 
     surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd, pixel_format);
+    if (!surface) return NULL;
     surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect));
     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
-
-    if (surface)
-    {
-        macdrv_client_surface_update(&surface->client);
-        macdrv_client_surface_present(&surface->client, 0);
-    }
+    macdrv_client_surface_update(&surface->client);
+    macdrv_client_surface_present(&surface->client, 0);
 
     return &surface->client;
 }
@@ -1274,6 +1271,9 @@ void macdrv_DestroyWindow(HWND hwnd)
     destroy_cocoa_window(data);
 
     CFDictionaryRemoveValue(win_datas, hwnd);
+#if defined(__x86_64__)
+    macdrv_release_d3dmetal_client_surfaces(data);
+#endif
     release_win_data(data);
     free(data);
 }

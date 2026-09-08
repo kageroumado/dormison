@@ -551,6 +551,77 @@ static NSString* WineLocalizedString(unsigned int stringID)
         return point;
     }
 
+    /* The presentation-scaled window a Wine point maps through: a visible
+       one whose Wine rectangle holds the point, the key window before any
+       other and a higher level before a lower, as winePointFromScreenPoint:
+       settles the reverse mapping. A hidden or minimized window keeps the
+       Wine rectangle and scale it last had, and a game's own windows share
+       one rectangle, so without the order a cursor warp or clip could map
+       through a window that is not on screen. */
+    - (WineWindow*) scaledWindowContainingWinePoint:(CGPoint)point
+    {
+        WineWindow* best = nil;
+
+        for (NSWindow* candidate in [NSApp windows])
+        {
+            WineWindow* window = (WineWindow*)candidate;
+
+            if (![window isKindOfClass:[WineWindow class]] || ![window isVisible] ||
+                ![window wineContentContainsScreenPoint:point])
+                continue;
+            if (!best || [window isKeyWindow] ||
+                (![best isKeyWindow] && [window level] > [best level]))
+                best = window;
+        }
+
+        return best;
+    }
+
+    - (CGPoint) screenPointFromWinePoint:(CGPoint)point
+    {
+        WineWindow* window = [self scaledWindowContainingWinePoint:point];
+        return window ? [window screenPointFromWinePoint:point] : point;
+    }
+
+    - (CGRect) screenRectFromWineRect:(CGRect)rect
+    {
+        CGPoint center = CGPointMake(CGRectGetMidX(rect), CGRectGetMidY(rect));
+        WineWindow* window = [self scaledWindowContainingWinePoint:center];
+        CGPoint origin, corner;
+
+        if (!window) return rect;
+        origin = [window screenPointFromWinePoint:rect.origin];
+        corner = [window screenPointFromWinePoint:CGPointMake(CGRectGetMaxX(rect), CGRectGetMaxY(rect))];
+        return CGRectMake(origin.x, origin.y, corner.x - origin.x, corner.y - origin.y);
+    }
+
+    /* A screen point maps through the presentation-scaled window under it,
+       found in this process's own window list. Asking the window server
+       which window is under a point costs a round trip per call, and
+       GetCursorPos is polled every frame by games and by Steam's overlay
+       thread: with WindowServer busy, that round trip was most of the
+       main thread's time. Two scaled windows overlapping at the point is
+       settled by the key window, then the higher level. */
+    - (CGPoint) winePointFromScreenPoint:(CGPoint)point
+    {
+        NSPoint cocoaPoint = [self flippedMouseLocation:NSPointFromCGPoint(point)];
+        WineWindow* best = nil;
+
+        for (NSWindow* candidate in [NSApp windows])
+        {
+            WineWindow* window = (WineWindow*)candidate;
+
+            if (![window isKindOfClass:[WineWindow class]] || ![window isVisible] ||
+                !window.presentationScaled || !NSMouseInRect(cocoaPoint, [window frame], NO))
+                continue;
+            if (!best || [window isKeyWindow] ||
+                (![best isKeyWindow] && [window level] > [best level]))
+                best = window;
+        }
+
+        return best ? [best winePointFromScreenPoint:point] : point;
+    }
+
     - (void) flipRect:(NSRect*)rect
     {
         // We don't use -primaryScreenHeight here so there's no chance of having
@@ -968,6 +1039,12 @@ static NSString* WineLocalizedString(unsigned int stringID)
         {
             clientWantsCursorHidden = TRUE;
             [self updateCursor:TRUE];
+            if (hasDeferredClip)
+            {
+                CGRect rect = deferredClipRect;
+                hasDeferredClip = FALSE;
+                [self startClippingCursor:rect];
+            }
         }
     }
 
@@ -977,6 +1054,13 @@ static NSString* WineLocalizedString(unsigned int stringID)
         {
             clientWantsCursorHidden = FALSE;
             [self updateCursor:FALSE];
+            if (self.clippingCursor && [self keyWindowIsPresentedInWindow])
+            {
+                CGRect rect = clipCursorHandler.cursorClipRect;
+                [self stopClippingCursor];
+                deferredClipRect = rect;
+                hasDeferredClip = TRUE;
+            }
         }
     }
 
@@ -1148,14 +1232,17 @@ static NSString* WineLocalizedString(unsigned int stringID)
         BOOL ret;
 
         if ([windowsBeingDragged count])
-            ret = FALSE;
-        else if (self.clippingCursor && [clipCursorHandler respondsToSelector:@selector(setCursorPosition:)])
+            return FALSE;
+
+        /* The clip decides where the cursor ends up, and the queued events
+           below are rewritten to that point. */
+        if (self.clippingCursor)
+            [clipCursorHandler clipCursorLocation:&pos];
+
+        if (self.clippingCursor && [clipCursorHandler respondsToSelector:@selector(setCursorPosition:)])
             ret = [clipCursorHandler setCursorPosition:pos];
         else
         {
-            if (self.clippingCursor)
-                [clipCursorHandler clipCursorLocation:&pos];
-
             // Annoyingly, CGWarpMouseCursorPosition() effectively disassociates
             // the mouse from the cursor position for 0.25 seconds.  This means
             // that mouse movement during that interval doesn't move the cursor
@@ -1210,6 +1297,13 @@ static NSString* WineLocalizedString(unsigned int stringID)
         }
     }
 
+    /* Whether the key window is a fullscreen-style window shown in a window. */
+    - (BOOL) keyWindowIsPresentedInWindow
+    {
+        NSWindow* key = [NSApp keyWindow];
+        return [key isKindOfClass:[WineWindow class]] && [(WineWindow*)key presentationWindowed];
+    }
+
     - (BOOL) startClippingCursor:(CGRect)rect
     {
         if (!clipCursorHandler) {
@@ -1218,6 +1312,20 @@ static NSString* WineLocalizedString(unsigned int stringID)
             else
                 clipCursorHandler = [[WineEventTapClipCursorHandler alloc] init];
         }
+
+        /* A game shown in a window clips the cursor to its client area the
+           moment it activates, and that area is the picture: the title bar
+           and the buttons beside it become unreachable. While the cursor is
+           visible the clip is held back; a hidden cursor — mouse look — gets
+           it, and a cursor shown again is let go. */
+        if (!clientWantsCursorHidden && [self keyWindowIsPresentedInWindow])
+        {
+            if (self.clippingCursor) [self stopClippingCursor];
+            deferredClipRect = rect;
+            hasDeferredClip = TRUE;
+            return TRUE;
+        }
+        hasDeferredClip = FALSE;
 
         if (self.clippingCursor && CGRectEqualToRect(rect, clipCursorHandler.cursorClipRect))
             return TRUE;
@@ -1234,6 +1342,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
     - (BOOL) stopClippingCursor
     {
+        hasDeferredClip = FALSE;
         if (!self.clippingCursor)
             return TRUE;
 
@@ -1251,6 +1360,46 @@ static NSString* WineLocalizedString(unsigned int stringID)
     {
         return clipCursorHandler.clippingCursor;
     }
+
+    /* A game holds the cursor for mouse-look: clipped so it cannot leave and
+       hidden because the camera is the pointer. */
+    - (BOOL) cursorHeldForMouseLook
+    {
+        return self.clippingCursor && clientWantsCursorHidden;
+    }
+
+    /* An NSEvent's delta is the hand's motion run through the system's
+       pointer-acceleration curve: the same sweep covered fast turns a camera
+       further than the same sweep covered slowly. The CGEvent also carries
+       the device's own displacement, which a camera wants. Synthetic events
+       — accessibility tools, remote play, a tablet — carry no such
+       displacement, so a zero pair means the event did not come from a
+       mouse and the delta stands. Returns TRUE when the pair is the
+       device's own displacement. */
+    - (BOOL) mouseDeltaOfEvent:(NSEvent*)anEvent x:(CGFloat*)dx y:(CGFloat*)dy
+    {
+        if (linear_mouse && [self cursorHeldForMouseLook])
+        {
+            CGEventRef cgevent = [anEvent CGEvent];
+            if (cgevent)
+            {
+                double rawX = CGEventGetDoubleValueField(cgevent, kCGEventUnacceleratedPointerMovementX);
+                double rawY = CGEventGetDoubleValueField(cgevent, kCGEventUnacceleratedPointerMovementY);
+
+                if (rawX || rawY)
+                {
+                    *dx = rawX;
+                    *dy = rawY;
+                    return TRUE;
+                }
+            }
+        }
+
+        *dx = [anEvent deltaX];
+        *dy = [anEvent deltaY];
+        return FALSE;
+    }
+
 
     - (BOOL) isKeyPressed:(uint16_t)keyCode
     {
@@ -1427,6 +1576,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
             {
                 if (self.clippingCursor)
                     [clipCursorHandler clipCursorLocation:&point];
+                point = [targetWindow winePointFromScreenPoint:point];
                 point = cgpoint_win_from_mac(point);
 
                 event = macdrv_create_event(MOUSE_MOVED_ABSOLUTE, targetWindow);
@@ -1438,12 +1588,21 @@ static NSString* WineLocalizedString(unsigned int stringID)
             }
             else
             {
-                double scale = retina_on ? 2 : 1;
+                double scale;
+                CGFloat moveX, moveY;
+                BOOL raw;
+
+                raw = [self mouseDeltaOfEvent:anEvent x:&moveX y:&moveY];
+
+                /* A scaled window's point is worth less than one of Wine's.
+                   Device displacement is already in the units a camera
+                   reads, whatever the window's size. */
+                scale = raw ? 1 : (retina_on ? 2 : 1) / [targetWindow presentationScale];
 
                 /* Add event delta to accumulated delta error */
                 /* deltaY is already flipped */
-                mouseMoveDeltaX += [anEvent deltaX];
-                mouseMoveDeltaY += [anEvent deltaY];
+                mouseMoveDeltaX += moveX;
+                mouseMoveDeltaY += moveY;
 
                 event = macdrv_create_event(MOUSE_MOVED_RELATIVE, targetWindow);
                 event->mouse_moved.x = mouseMoveDeltaX * scale;
@@ -1572,6 +1731,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
             {
                 macdrv_event* event;
 
+                pt = [window winePointFromScreenPoint:pt];
                 pt = cgpoint_win_from_mac(pt);
 
                 event = macdrv_create_event(MOUSE_BUTTON, window);
@@ -1655,6 +1815,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 double x, y;
                 BOOL continuous = FALSE;
 
+                pt = [window winePointFromScreenPoint:pt];
                 pt = cgpoint_win_from_mac(pt);
 
                 event = macdrv_create_event(MOUSE_SCROLL, window);
@@ -2538,9 +2699,10 @@ void macdrv_set_cursor(CFStringRef name, CFArrayRef frames)
 int macdrv_get_cursor_position(CGPoint *pos)
 {
     OnMainThread(^{
+        WineApplicationController* controller = [WineApplicationController sharedController];
         NSPoint location = [NSEvent mouseLocation];
-        location = [[WineApplicationController sharedController] flippedMouseLocation:location];
-        *pos = cgpoint_win_from_mac(NSPointToCGPoint(location));
+        location = [controller flippedMouseLocation:location];
+        *pos = cgpoint_win_from_mac([controller winePointFromScreenPoint:NSPointToCGPoint(location)]);
     });
 
     return TRUE;
@@ -2557,7 +2719,8 @@ int macdrv_set_cursor_position(CGPoint pos)
     __block int ret;
 
     OnMainThread(^{
-        ret = [[WineApplicationController sharedController] setCursorPosition:cgpoint_mac_from_win(pos)];
+        WineApplicationController* controller = [WineApplicationController sharedController];
+        ret = [controller setCursorPosition:[controller screenPointFromWinePoint:cgpoint_mac_from_win(pos)]];
     });
 
     return ret;
@@ -2580,7 +2743,7 @@ int macdrv_clip_cursor(CGRect r)
         CGRect rect = r;
 
         if (!CGRectIsInfinite(rect))
-            rect = cgrect_mac_from_win(rect);
+            rect = [controller screenRectFromWineRect:cgrect_mac_from_win(rect)];
 
         if (!CGRectIsInfinite(rect))
         {

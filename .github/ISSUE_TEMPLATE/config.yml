@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Sevoflurane, the app
+    url: https://github.com/kageroumado/sevoflurane/issues/new/choose
+    about: Steam will not start, a game does not run, a window or setting misbehaves. Start there; it collects the logs the engine needs too.

@@ -28,6 +28,7 @@
 #endif
 
 #include "macdrv_cocoa.h"
+#include "sevo_presenter.h"
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -45,6 +46,14 @@ extern BOOL force_backing_store;
 
 extern UINT64 app_icon_callback;
 extern UINT64 app_quit_request_callback;
+extern UINT64 regcreateopenkeyexa_callback;
+extern UINT64 regqueryvalueexa_callback;
+extern UINT64 regsetvalueexa_callback;
+
+/* d3dmetal.c */
+extern void d3dmetal_set_host_callbacks(const struct init_params *params);
+extern NTSTATUS macdrv_d3dmetal_monitor_enum(void *arg);
+extern NTSTATUS macdrv_d3dmetal_kernel_call(void *arg);
 
 extern const char* debugstr_cf(CFTypeRef t);
 
@@ -193,6 +202,7 @@ struct macdrv_win_data
     unsigned int        per_pixel_alpha : 1;    /* is window using per-pixel alpha? */
     unsigned int        minimized : 1;          /* is window minimized? */
     unsigned int        fullscreen : 1;         /* is the window visible rect fullscreen? (unrelated to native AppKit/Cocoa fullscreen) */
+    CFMutableArrayRef   d3dmetal_client_surfaces; /* client surfaces handed to D3DMetal, held until the window goes */
 };
 
 struct macdrv_client_surface
@@ -204,6 +214,9 @@ struct macdrv_client_surface
 
 extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
 extern BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface);
+
+extern void macdrv_release_d3dmetal_client_surfaces(struct macdrv_win_data *data);
+extern void macdrv_client_surface_presented(const macdrv_event *event);
 
 extern struct macdrv_win_data *get_win_data(HWND hwnd);
 extern void release_win_data(struct macdrv_win_data *data);

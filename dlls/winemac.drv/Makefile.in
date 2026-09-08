@@ -1,7 +1,7 @@
 MODULE    = winemac.drv
 UNIXLIB   = winemac.so
 IMPORTS   = uuid rpcrt4 user32 gdi32 win32u
-DELAYIMPORTS = ole32 shell32 imm32
+DELAYIMPORTS = advapi32 ole32 shell32 imm32
 UNIX_LIBS    = \
 	-lwin32u \
 	-framework AppKit \
@@ -10,9 +10,13 @@ UNIX_LIBS    = \
 	-framework Foundation \
 	-framework IOKit \
 	-framework Metal \
+	-weak_framework MetalFX \
 	-framework OpenGL \
 	-framework QuartzCore \
 	-framework Security \
+	$(srcdir)/swift/libwinemacswift.a \
+	-L/usr/lib/swift \
+	-lswiftCore \
 
 VER_FILEDESCRIPTION_STR = "Wine Mac driver"
 
@@ -28,6 +32,8 @@ SOURCES = \
 	cocoa_status_item.m \
 	cocoa_window.m \
 	display.c \
+	d3dmetal.c \
+	d3dmetal_objc.m \
 	dllmain.c \
 	event.c \
 	gdi.c \

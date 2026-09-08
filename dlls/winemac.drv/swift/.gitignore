@@ -1,0 +1,4 @@
+libwinemacswift.a
+*.swiftmodule
+*.swiftdoc
+*.abi.json

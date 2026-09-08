@@ -2774,6 +2774,13 @@ static void get_cpu_idle_cycle_times( ULONG64 *times )
  *
  * Note: year, day and month must be in unix format.
  */
+/* macOS libc's localtime() writes its struct tm through the pointer held in
+ * thread-specific slot 12, which on x86_64 is the %gs:0x60 PE code reads the
+ * PEB from, so it scribbles over the PEB's first 52 bytes. ctime() shares
+ * that buffer. The reentrant forms take the caller's storage and leave the
+ * slot alone. gmtime() does not use it. */
+#define CTIME_STR(t) ctime_r( &(t), (char[26]){0} )
+
 static int weekday_to_mday(int year, int day, int mon, int day_of_week)
 {
     struct tm date;
@@ -2799,12 +2806,12 @@ static int weekday_to_mday(int year, int day, int mon, int day_of_week)
     wday = 1; /* 1 - 1st, ...., 5 - last */
     while (wday < day)
     {
-        struct tm *tm;
+        struct tm *tm, tm_buf;
 
         date.tm_mday += 7;
         date.tm_isdst = -1;
         tmp = mktime(&date);
-        tm = localtime(&tmp);
+        tm = localtime_r(&tmp, &tm_buf);
         if (tm->tm_mon != mon)
             break;
         mday = tm->tm_mday;
@@ -2987,15 +2994,16 @@ static time_t find_dst_change(time_t start, time_t end, int *is_dst)
     struct tm *tm;
     ULONGLONG min = (sizeof(time_t) == sizeof(int)) ? (ULONG)start : start;
     ULONGLONG max = (sizeof(time_t) == sizeof(int)) ? (ULONG)end : end;
+    struct tm tm_buf;
     time_t pos;
 
-    tm = localtime(&start);
+    tm = localtime_r(&start, &tm_buf);
     *is_dst = !tm->tm_isdst;
-    TRACE("starting date isdst %d, %s", !*is_dst, ctime(&start));
+    TRACE("starting date isdst %d, %s", !*is_dst, CTIME_STR(start));
 
     for (pos = min; pos <= max; pos += 30 * 24 * 3600)
     {
-        tm = localtime(&pos);
+        tm = localtime_r(&pos, &tm_buf);
         if (tm->tm_isdst == *is_dst)
         {
             max = pos;
@@ -3006,7 +3014,7 @@ static time_t find_dst_change(time_t start, time_t end, int *is_dst)
     while (min <= max)
     {
         pos = (min + max) / 2;
-        tm = localtime(&pos);
+        tm = localtime_r(&pos, &tm_buf);
 
         if (tm->tm_isdst != *is_dst)
             min = pos + 1;
@@ -3108,6 +3116,7 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
     struct tm *tm, tm1, tm2;
     time_t year_start, year_end, tmp, dlt = 0, std = 0;
     int is_dst, bias;
+    struct tm tm_buf;
     BOOL inverted_dst;
 
     mutex_lock( &timezone_mutex );
@@ -3116,7 +3125,7 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
     tm = gmtime(&year_start);
     bias = (LONG)(mktime(tm) - year_start) / 60;
 
-    tm = localtime(&year_start);
+    tm = localtime_r(&year_start, &tm_buf);
     if (current_year == tm->tm_year && current_bias == bias)
     {
         *tzi = cached_tzi;
@@ -3141,7 +3150,7 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
     tm->tm_mday = 1;
     tm->tm_mon = tm->tm_hour = tm->tm_min = tm->tm_sec = tm->tm_wday = tm->tm_yday = 0;
     year_start = mktime(tm);
-    TRACE("year_start: %s", ctime(&year_start));
+    TRACE("year_start: %s", CTIME_STR(year_start));
 
     tm->tm_isdst = inverted_dst;
     tm->tm_mday = tm->tm_wday = tm->tm_yday = 0;
@@ -3149,7 +3158,7 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
     tm->tm_hour = 23;
     tm->tm_min = tm->tm_sec = 59;
     year_end = mktime(tm);
-    TRACE("year_end: %s", ctime(&year_end));
+    TRACE("year_end: %s", CTIME_STR(year_end));
 
     tmp = find_dst_change(year_start, year_end, &is_dst);
     if (inverted_dst) is_dst = !is_dst;
@@ -3165,8 +3174,8 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
     else
         std = tmp;
 
-    TRACE("std: %s", ctime(&std));
-    TRACE("dlt: %s", ctime(&dlt));
+    TRACE("std: %s", CTIME_STR(std));
+    TRACE("dlt: %s", CTIME_STR(dlt));
 
     if (dlt == std || !dlt || !std)
         TRACE("there is no daylight saving rules in this time zone\n");

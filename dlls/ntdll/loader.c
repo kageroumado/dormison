@@ -1399,6 +1399,9 @@ static BOOL alloc_tls_slot( LDR_DATA_TABLE_ENTRY *mod )
             if (!new) return FALSE;
             if (old) memcpy( new, old, old_module_count * sizeof(*new) );
             teb->ThreadLocalStoragePointer = new;
+#ifdef __x86_64__  /* macOS-specific hack */
+            if (teb->Instrumentation[0]) ((TEB *)teb->Instrumentation[0])->ThreadLocalStoragePointer = new;
+#endif
             TRACE( "thread %04lx tls block %p -> %p\n", HandleToULong(teb->ClientId.UniqueThread), old, new );
             /* FIXME: can't free old block here, should be freed at thread exit */
         }
@@ -1644,6 +1647,10 @@ static NTSTATUS alloc_thread_tls(void)
         TRACE( "slot %u: %u/%lu bytes at %p\n", i, size, dir->SizeOfZeroFill, pointers[i] );
     }
     NtCurrentTeb()->ThreadLocalStoragePointer = pointers;
+#ifdef __x86_64__  /* macOS-specific hack */
+    if (NtCurrentTeb()->Instrumentation[0])
+        ((TEB *)NtCurrentTeb()->Instrumentation[0])->ThreadLocalStoragePointer = pointers;
+#endif
     return STATUS_SUCCESS;
 }
 
@@ -3518,6 +3525,19 @@ NTSTATUS WINAPI __wine_ctrl_routine( void *arg )
 
 
 /***********************************************************************
+ *           __wine_unix_call    (NTDLL.@)
+ *
+ * PE-visible entry point for the unix call dispatcher, which is a private
+ * export. PE modules built outside the wine tree, D3DMetal's d3d11.dll and
+ * dxgi.dll among them, reach their unix halves through this.
+ */
+NTSTATUS WINAPI __wine_unix_call_exported( unixlib_handle_t handle, unsigned int code, void *args )
+{
+    return __wine_unix_call( handle, code, args );
+}
+
+
+/***********************************************************************
  *           __wine_unix_spawnvp
  */
 NTSTATUS WINAPI __wine_unix_spawnvp( char * const argv[], int wait )
@@ -4096,6 +4116,10 @@ void WINAPI LdrShutdownThread(void)
     if ((pointers = NtCurrentTeb()->ThreadLocalStoragePointer))
     {
         NtCurrentTeb()->ThreadLocalStoragePointer = NULL;
+#ifdef __x86_64__  /* macOS-specific hack */
+        if (NtCurrentTeb()->Instrumentation[0])
+            ((TEB *)NtCurrentTeb()->Instrumentation[0])->ThreadLocalStoragePointer = NULL;
+#endif
         for (i = 0; i < tls_module_count; i++) RtlFreeHeap( GetProcessHeap(), 0, pointers[i] );
         RtlFreeHeap( GetProcessHeap(), 0, pointers );
     }

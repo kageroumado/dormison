@@ -18,6 +18,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <stdatomic.h>
 #include <sys/types.h>
 #include <sys/event.h>
 #include <sys/time.h>
@@ -204,6 +205,25 @@ static const OSType WineHotKeySignature = 'Wine';
         }];
         [events removeObjectsAtIndexes:indexes];
 
+        /* One CLIENT_SURFACE_PRESENTED waits per client surface. The notice
+           carries the surface and nothing else, and its handler reads the
+           surface's state when it runs, so a second one behind it says
+           nothing new; a renderer outrunning its window's thread would only
+           grow the queue, which every post scans. */
+        if (event->event->type == CLIENT_SURFACE_PRESENTED)
+        {
+            for (MacDrvEvent* queued in events)
+            {
+                if (queued->event->type == CLIENT_SURFACE_PRESENTED &&
+                    queued->event->client_surface_presented.client_surface ==
+                    event->event->client_surface_presented.client_surface)
+                {
+                    [eventsLock unlock];
+                    return;
+                }
+            }
+        }
+
         if ((event->event->type == MOUSE_MOVED_RELATIVE ||
              event->event->type == MOUSE_MOVED_ABSOLUTE) &&
             event->event->deliver == INT_MAX &&
@@ -342,25 +362,33 @@ static const OSType WineHotKeySignature = 'Wine';
         return [self query:query timeout:timeout flags:0];
     }
 
+    /* pos is a screen point. Each queued click or scroll is rewritten in
+       its own window's Wine coordinates, the way a fresh one is posted. */
     - (void) resetMouseEventPositions:(CGPoint)pos
     {
         MacDrvEvent* event;
-
-        pos = cgpoint_win_from_mac(pos);
 
         [eventsLock lock];
 
         for (event in events)
         {
+            WineWindow* window = (WineWindow*)event->event->window;
+            CGPoint point;
+
+            if (event->event->type != MOUSE_BUTTON && event->event->type != MOUSE_SCROLL)
+                continue;
+
+            point = cgpoint_win_from_mac(window ? [window winePointFromScreenPoint:pos] : pos);
+
             if (event->event->type == MOUSE_BUTTON)
             {
-                event->event->mouse_button.x = pos.x;
-                event->event->mouse_button.y = pos.y;
+                event->event->mouse_button.x = point.x;
+                event->event->mouse_button.y = point.y;
             }
-            else if (event->event->type == MOUSE_SCROLL)
+            else
             {
-                event->event->mouse_scroll.x = pos.x;
-                event->event->mouse_scroll.y = pos.y;
+                event->event->mouse_scroll.x = point.x;
+                event->event->mouse_scroll.y = point.y;
             }
         }
 
@@ -492,7 +520,9 @@ void OnMainThread(dispatch_block_t block)
     NSMutableDictionary* threadDict = [[NSThread currentThread] threadDictionary];
     WineEventQueue* queue = threadDict[WineEventQueueThreadDictionaryKey];
     dispatch_semaphore_t semaphore = NULL;
-    __block BOOL finished;
+    /* Written on the main thread, read on the caller's: the release store
+       publishes the block's effects to the acquire loads below. */
+    __block atomic_bool finished;
 
     if (!queue)
     {
@@ -500,10 +530,10 @@ void OnMainThread(dispatch_block_t block)
         dispatch_retain(semaphore);
     }
 
-    finished = FALSE;
+    atomic_init(&finished, false);
     OnMainThreadAsync(^{
         block();
-        finished = TRUE;
+        atomic_store_explicit(&finished, true, memory_order_release);
         if (queue)
             [queue signalEventAvailable];
         else
@@ -515,20 +545,20 @@ void OnMainThread(dispatch_block_t block)
 
     if (queue)
     {
-        while (!finished)
+        while (!atomic_load_explicit(&finished, memory_order_acquire))
         {
             @autoreleasepool
             {
                 MacDrvEvent* macDrvEvent;
                 struct kevent kev;
 
-                while (!finished &&
+                while (!atomic_load_explicit(&finished, memory_order_acquire) &&
                        (macDrvEvent = [queue getEventMatchingMask:event_mask_for_type(QUERY_EVENT)]))
                 {
                     queue->event_handler(macDrvEvent->event);
                 }
 
-                if (!finished)
+                if (!atomic_load_explicit(&finished, memory_order_acquire))
                     kevent(queue->kq, NULL, 0, &kev, 1, NULL);
             }
         }

@@ -26,6 +26,7 @@
 
 #include <pthread.h>
 #include <assert.h>
+#include <stdlib.h>
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -1137,26 +1138,54 @@ static BOOL read_gpu_from_registry( struct gpu *gpu )
     return TRUE;
 }
 
+/* SEVO_GPU_VENDOR_ID, SEVO_GPU_DEVICE_ID, SEVO_GPU_NAME, SEVO_GPU_MEMORY_MB,
+ * SEVO_GPU_DRIVER_PROVIDER, SEVO_GPU_DRIVER_VERSION and SEVO_GPU_DRIVER_DATE
+ * name the card the guest sees; every value below prefers them. A game reads
+ * the GPU its translation layer reports together with the driver metadata
+ * in the registry, and checks the version string against its own floor, so
+ * both have to describe one card that ships. Without the variables a vendor
+ * the table knows gets a current driver of its own, and any other, an Apple
+ * GPU carrying no PCI vendor, reads as NVIDIA. */
+static const char *sevo_gpu_override( const char *name )
+{
+    const char *value = getenv( name );
+    if (value && *value) return value;
+    return NULL;
+}
+
+static UINT16 sevo_gpu_override_id( const char *name, UINT16 fallback )
+{
+    const char *value = sevo_gpu_override( name );
+    if (!value) return fallback;
+    return (UINT16)strtoul( value, NULL, 0 );
+}
+
 static const char* driver_vendor_to_version( UINT16 vendor )
 {
+    const char *override = sevo_gpu_override( "SEVO_GPU_DRIVER_VERSION" );
+    if (override) return override;
+
     /* The last seven digits are the driver number. */
     switch (vendor)
     {
     case 0x8086: /* Intel */    return "35.0.101.6314";
     case 0x1002: /* AMD */      return "35.0.21025.1024";
     case 0x10de: /* Nvidia */   return "35.0.15.6094";
-    default:                    return "35.0.10.1000";
+    default:                    return "35.0.15.6094";
     }
 }
 
 static const char* driver_vendor_to_name( UINT16 vendor )
 {
+    const char *override = sevo_gpu_override( "SEVO_GPU_DRIVER_PROVIDER" );
+    if (override) return override;
+
     switch (vendor)
     {
     case 0x8086: return "Intel Corporation";
     case 0x1002: return "Advanced Micro Devices, Inc.";
     case 0x10de: return "NVIDIA";
-    default:     return "";
+    default:     return "NVIDIA";
     }
 }
 
@@ -1502,6 +1531,7 @@ static BOOL write_gpu_to_registry( const struct gpu *gpu, const struct pci_id *p
                                    ULONGLONG memory_size )
 {
     unsigned int size, name_size = (wcslen( gpu->name ) + 1) * sizeof(WCHAR);
+    const char *driver_date;
     char buffer[4096], *tmp;
     WCHAR bufferW[512];
     HKEY subkey;
@@ -1639,7 +1669,10 @@ static BOOL write_gpu_to_registry( const struct gpu *gpu, const struct pci_id *p
     snprintf( buffer, sizeof(buffer), "Class\\%s\\%04X", guid_devclass_displayA, gpu->index );
     if (!(hkey = reg_create_ascii_key( control_key, buffer, 0, NULL ))) return FALSE;
 
-    set_reg_value( hkey, driver_dateW, REG_SZ, bufferW, format_date( bufferW, ft.QuadPart ));
+    if ((driver_date = sevo_gpu_override( "SEVO_GPU_DRIVER_DATE" )))
+        set_reg_value( hkey, driver_dateW, REG_SZ, bufferW, asciiz_to_unicode( bufferW, driver_date ));
+    else
+        set_reg_value( hkey, driver_dateW, REG_SZ, bufferW, format_date( bufferW, ft.QuadPart ));
     set_reg_value( hkey, driver_date_dataW, REG_BINARY, &ft, sizeof(ft) );
     set_reg_value( hkey, driver_descW, REG_SZ, gpu->name, name_size );
     set_reg_value( hkey, adapter_stringW, REG_SZ, gpu->name, name_size );
@@ -1740,6 +1773,8 @@ static void add_gpu( const char *name, const struct pci_id *pci_id, const GUID *
     char buffer[4096];
     KEY_VALUE_PARTIAL_INFORMATION *value = (void *)buffer;
     struct gpu_info *vulkan_gpu = NULL, *opengl_gpu = NULL;
+    struct pci_id sevo_pci_id;
+    const char *sevo_memory, *sevo_name;
     ULONGLONG memory = 0;
     struct gpu *gpu;
     unsigned int i;
@@ -1773,9 +1808,18 @@ static void add_gpu( const char *name, const struct pci_id *pci_id, const GUID *
     if (!pci_id->vendor && !pci_id->device && vulkan_gpu) pci_id = &vulkan_gpu->pci_id;
     if (!pci_id->vendor && !pci_id->device && opengl_gpu) pci_id = &opengl_gpu->pci_id;
 
+    if (sevo_gpu_override( "SEVO_GPU_VENDOR_ID" ) || sevo_gpu_override( "SEVO_GPU_DEVICE_ID" ))
+    {
+        sevo_pci_id = *pci_id;
+        sevo_pci_id.vendor = sevo_gpu_override_id( "SEVO_GPU_VENDOR_ID", pci_id->vendor );
+        sevo_pci_id.device = sevo_gpu_override_id( "SEVO_GPU_DEVICE_ID", pci_id->device );
+        pci_id = &sevo_pci_id;
+    }
+
     name = gpu_device_name( pci_id->vendor, pci_id->device, name );
     if (!strcmp( name, "Wine Adapter" ) && vulkan_gpu) name = vulkan_gpu->name;
     if (!strcmp( name, "Wine Adapter" ) && opengl_gpu) name = opengl_gpu->name;
+    if ((sevo_name = sevo_gpu_override( "SEVO_GPU_NAME" ))) name = sevo_name;
     RtlUTF8ToUnicodeN( gpu->name, sizeof(gpu->name) - sizeof(WCHAR), &len, name, strlen( name ) );
 
     snprintf( gpu->path, sizeof(gpu->path), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_%08X&REV_%02X\\%08X",
@@ -1819,6 +1863,8 @@ static void add_gpu( const char *name, const struct pci_id *pci_id, const GUID *
 
     NtClose( hkey );
 
+    if ((sevo_memory = sevo_gpu_override( "SEVO_GPU_MEMORY_MB" )))
+        memory = (ULONGLONG)strtoull( sevo_memory, NULL, 10 ) << 20;
     if (!memory && vulkan_gpu) memory = vulkan_gpu->memory;
     if (!memory && opengl_gpu) memory = opengl_gpu->memory;
     if (!memory) memory = 1024 * 1024 * 1024;

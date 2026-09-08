@@ -86,7 +86,11 @@
 #include "winioctl.h"
 #include "winternl.h"
 #include "unix_private.h"
+#include "msync.h"
 #include "wine/list.h"
+#ifdef __APPLE__
+# include <mach-o/dyld.h>
+#endif
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(module);
@@ -294,12 +298,25 @@ static WORD get_alt_machine( WORD machine )
 static void set_dll_path(void)
 {
     char *p, *path = getenv( "WINEDLLPATH" );
-    int i, count = 0;
+    char *prepend = getenv( "WINEDLLPATH_PREPEND" );
+    int i, count = 0, prepend_count = 0;
 
+    /* WINEDLLPATH_PREPEND is searched ahead of dll_dir, so a builtin placed
+       there wins over the tree copy; WINEDLLPATH follows dll_dir and can
+       never override one. A renderer (DXMT, DXVK, D3DMetal) is selected per
+       process this way. */
+    if (prepend) for (p = prepend, prepend_count = 1; *p; p++) if (*p == ':') prepend_count++;
     if (path) for (p = path, count = 1; *p; p++) if (*p == ':') count++;
 
-    dll_paths = malloc( (count + 2) * sizeof(*dll_paths) );
+    dll_paths = malloc( (prepend_count + count + 2) * sizeof(*dll_paths) );
     count = 0;
+
+    if (prepend)
+    {
+        prepend = strdup(prepend);
+        for (p = strtok( prepend, ":" ); p; p = strtok( NULL, ":" )) dll_paths[count++] = strdup( p );
+        free( prepend );
+    }
 
     if (!build_dir) dll_paths[count++] = dll_dir;
 
@@ -399,10 +416,11 @@ static void init_paths(void)
         wineloader = build_path( ntdll_dir, "wine" );
     }
 
-    set_dll_path();
-    set_system_dll_path();
     set_home_dir();
     set_config_dir();
+    load_sevo_env();
+    set_dll_path();
+    set_system_dll_path();
 }
 
 
@@ -458,10 +476,35 @@ static void preloader_exec( char **argv )
 static NTSTATUS loader_exec( char **argv, WORD machine )
 {
     static char noexec[] = "WINELOADERNOEXEC=1";
+    char *alternate, *bundled;
 
     putenv( noexec );
 
-    if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv );
+    if ((alternate = get_alternate_wineloader( machine )))
+    {
+        argv[1] = alternate;
+        preloader_exec( argv );
+    }
+
+    /* SEVO_LOADER in the program's env file names a copy of the loader
+     * inside a bundle of the game's own: macOS reads a process's name, icon
+     * and Game Mode eligibility from the bundle its executable lives in. The
+     * copy is outside the engine, so SEVO_LOADER_TREE tells it where ntdll
+     * is; ntdll finds everything else from its own path. Only for a program
+     * this machine runs directly; one that needs the other bitness has
+     * already left above. */
+    if (argv[2] && (bundled = sevo_program_env( argv[2], "SEVO_LOADER" )))
+    {
+        if (!access( bundled, X_OK ))
+        {
+            char *tree;
+
+            if (asprintf( &tree, "SEVO_LOADER_TREE=%s", ntdll_dir ) != -1) putenv( tree );
+            argv[1] = bundled;
+            preloader_exec( argv );
+        }
+        free( bundled );
+    }
 
     argv[1] = strdup( wineloader );
     preloader_exec( argv );
@@ -1365,6 +1408,272 @@ NTSTATUS load_unixlib_by_name( const UNICODE_STRING *nt_name, void **handle_ret 
 }
 
 
+#if defined(__APPLE__) && defined(__x86_64__)
+
+void *libd3dshared_load_addr = NULL;
+void *libd3dshared_code_end = NULL;
+static bool (*p_supports_non_native_code_regions)( void );
+
+/* The Win32Dispatch table D3DMetal 4.0 works from, 0x230 bytes: the toolkit's
+ * own ms_abi wrappers in the first 0x148, then the host callbacks region it
+ * keeps a pointer into (g_callbacks = table + 0x148) and reads at every call,
+ * so the region can be filled after Win32DispatchInit. winemac.drv fills it
+ * from its DllMain with the PE-side functions the toolkit reaches through
+ * KeUserDispatchCallback; before that each slot is NULL and
+ * KeUserDispatchCallback answers STATUS_ENTRYPOINT_NOT_FOUND. */
+#define WIN32_DISPATCH_TABLE_SIZE      0x230
+#define WIN32_DISPATCH_CALLBACKS_OFFSET 0x148
+static void *win32_dispatch_table;
+static void (*p_MonitorEnumCallbackHandler)( void * );
+
+/* Re-entry for the toolkit's native code, which the 3.0 PE stubs call
+ * directly and which therefore runs on the PE user stack with no syscall
+ * frame. Anything on that path that needs one — a user-mode callback, or a
+ * win32u entry point that makes one — is performed from inside a unix call
+ * into winemac.drv, entered through the same dispatcher PE code uses. */
+struct d3dmetal_kernel_call_params
+{
+    UINT64 func;
+    UINT64 args[6];
+    UINT64 result;
+};
+
+static NTSTATUS (__attribute__((ms_abi)) *p_pe_unix_call)( UINT64 handle, unsigned int code, void *args );
+static UINT64 d3dmetal_unixlib_handle;
+static unsigned int d3dmetal_kernel_call_code;
+
+DECLSPEC_EXPORT void __wine_d3dmetal_set_reentry( UINT64 dispatcher, UINT64 handle, unsigned int code )
+{
+    p_pe_unix_call = (void *)(UINT_PTR)dispatcher;
+    d3dmetal_unixlib_handle = handle;
+    d3dmetal_kernel_call_code = code;
+    TRACE( "dispatcher %p handle %#lx code %u\n", p_pe_unix_call, (unsigned long)handle, code );
+}
+
+static BOOL on_kernel_stack(void)
+{
+    struct thread_data *data = get_thread_data();
+    char *stack = data ? get_kernel_stack( data ) : NULL;
+    char *here = (char *)&data;
+    return stack && here >= stack && here < stack + kernel_stack_size;
+}
+
+static BOOL d3dmetal_reenter( void *func, UINT64 *result, UINT64 a0, UINT64 a1, UINT64 a2,
+                              UINT64 a3, UINT64 a4, UINT64 a5 )
+{
+    struct d3dmetal_kernel_call_params params = { (UINT_PTR)func, { a0, a1, a2, a3, a4, a5 }, 0 };
+    NTSTATUS status;
+
+    if (!p_pe_unix_call) return FALSE;
+    status = p_pe_unix_call( d3dmetal_unixlib_handle, d3dmetal_kernel_call_code, &params );
+    if (status)
+    {
+        WARN( "re-entry for %p failed, status %#x\n", func, status );
+        return FALSE;
+    }
+    *result = params.result;
+    return TRUE;
+}
+
+/* KeUserModeCallback, asked for from the toolkit's user-stack context. */
+NTSTATUS d3dmetal_user_callback_off_stack( ULONG id, const void *args, ULONG len, void **ret_ptr, ULONG *ret_len )
+{
+    UINT64 status;
+
+    if (!d3dmetal_reenter( (void *)KeUserModeCallback, &status, id, (UINT_PTR)args, len,
+                           (UINT_PTR)ret_ptr, (UINT_PTR)ret_len, 0 ))
+        return STATUS_STACK_OVERFLOW;
+    /* The returned data is in the frame the re-entry has just unwound. */
+    *ret_ptr = NULL;
+    *ret_len = 0;
+    return status;
+}
+
+DECLSPEC_EXPORT void __wine_d3dmetal_set_host_callbacks( const UINT64 *callbacks, unsigned int count )
+{
+    unsigned int max = (WIN32_DISPATCH_TABLE_SIZE - WIN32_DISPATCH_CALLBACKS_OFFSET) / sizeof(UINT64);
+
+    if (!win32_dispatch_table) return;
+    if (count > max) count = max;
+    memcpy( (char *)win32_dispatch_table + WIN32_DISPATCH_CALLBACKS_OFFSET, callbacks, count * sizeof(UINT64) );
+    TRACE( "%u host callbacks installed\n", count );
+}
+
+/* The toolkit's MonitorEnumCallbackHandler: calls the ms_abi callback in the
+ * block with the block's four values and stores the answer in it. Reached
+ * from winemac.drv's MONITORENUMPROC through a unix call, so that the
+ * callback runs inside a syscall frame of its own. */
+DECLSPEC_EXPORT void __wine_d3dmetal_monitor_enum( void *params )
+{
+    TRACE( "params %p handler %p\n", params, p_MonitorEnumCallbackHandler );
+    if (p_MonitorEnumCallbackHandler) p_MonitorEnumCallbackHandler( params );
+}
+
+static bool sonoma_or_later(void)
+{
+    char buf[64];
+    size_t size = sizeof(buf);
+    if (sysctlbyname( "kern.osrelease", buf, &size, NULL, 0 )) return false;
+    return atoi( buf ) >= 23;
+}
+
+/* Maps win32u.so with its symbols global before the dispatch table is filled.
+ *
+ * PatchWin32DispatchFunctions resolves every entry with dlsym(RTLD_DEFAULT),
+ * and seven of them are win32u exports: NtUserEnumDisplayMonitors,
+ * NtUserEnumDisplaySettings, NtUserChangeDisplaySettings, NtUserMoveWindow,
+ * NtUserSetWindowPos, NtUserSetWindowLongPtr, NtUserShowWindow. It runs
+ * inside load_ntdll(), before any PE module and so before win32u.so is in
+ * the process, and an unresolved entry sends D3DMetal to address 0 on the
+ * first CreateDXGIFactory. Wine's loader dlopens the same file when
+ * win32u.dll loads and gets this handle back. */
+static int (*p_win32u_EnumDisplayMonitors)( void *hdc, void *rect, void *proc, LONG_PTR lparam );
+static int (*p_win32u_EnumDisplaySettings)( void *device, unsigned int index, void *devmode, unsigned int flags );
+static void *(*p_win32u_GetDesktopWindow)( void );
+
+static void load_win32u_for_dispatch(void)
+{
+    char path[PATH_MAX];
+    Dl_info dli;
+    char *slash;
+    void *win32u;
+
+    /* Any function of this image will do: it is ntdll.so, and win32u.so is
+     * its neighbor in the Wine unix library directory. */
+    if (!dladdr( (void *)sonoma_or_later, &dli ) || !dli.dli_fname) return;
+    if (strlen( dli.dli_fname ) + sizeof("win32u.so") >= sizeof(path)) return;
+    strcpy( path, dli.dli_fname );
+    if (!(slash = strrchr( path, '/' ))) return;
+    strcpy( slash + 1, "win32u.so" );
+    if (!(win32u = dlopen( path, RTLD_LAZY | RTLD_GLOBAL )))
+    {
+        TRACE( "win32u.so for the dispatch table: %s\n", dlerror() );
+        return;
+    }
+    p_win32u_EnumDisplayMonitors = dlsym( win32u, "NtUserEnumDisplayMonitors" );
+    p_win32u_EnumDisplaySettings = dlsym( win32u, "NtUserEnumDisplaySettings" );
+    p_win32u_GetDesktopWindow = dlsym( win32u, "NtUserGetDesktopWindow" );
+}
+
+/* Shadows win32u's NtUserEnumDisplayMonitors for the toolkit, which resolves
+ * the name with dlsym(RTLD_DEFAULT) and so finds this image, loaded first.
+ *
+ * pack_EnumDisplayMonitors reads the host's MONITORENUMPROC out of the
+ * callbacks region before calling here, and winemac.drv fills that region
+ * from its DllMain, which a process without a window has not reached when
+ * the toolkit asks for the display topology (CreateDXGIFactory asks). An
+ * empty proc means the driver is unloaded: querying the primary display's
+ * settings takes the display-device lock, which loads the driver, and the
+ * slot holds the proc afterwards. */
+static BOOL enum_display_monitors_for_d3dmetal( HDC hdc, RECT *rect, MONITORENUMPROC proc, LPARAM lparam )
+{
+    /* A thread that has never touched a window has no desktop, and win32u
+     * reads the monitor list's freshness serial from the desktop: with none
+     * it answers "fresh" and an empty list. Asking for the desktop window
+     * attaches the thread, as any windowing call does first. */
+    if (p_win32u_GetDesktopWindow) p_win32u_GetDesktopWindow();
+    if (!proc)
+    {
+        void **slot = (void **)((char *)win32_dispatch_table + WIN32_DISPATCH_CALLBACKS_OFFSET + 0x90);
+        unsigned char devmode[512] = { 0 };
+
+        if (p_win32u_EnumDisplaySettings) p_win32u_EnumDisplaySettings( NULL, ~0u, devmode, 0 );
+        proc = *slot;
+        TRACE( "host MONITORENUMPROC after loading the display driver: %p\n", proc );
+        if (!proc) return FALSE;
+    }
+    return p_win32u_EnumDisplayMonitors( hdc, rect, (void *)proc, lparam );
+}
+
+DECLSPEC_EXPORT BOOL WINAPI NtUserEnumDisplayMonitors( HDC hdc, RECT *rect, MONITORENUMPROC proc, LPARAM lparam )
+{
+    UINT64 result;
+
+    TRACE( "hdc %p rect %p proc %p lparam %#lx\n", hdc, rect, proc, (long)lparam );
+    if (!p_win32u_EnumDisplayMonitors) return FALSE;
+    if (!win32_dispatch_table) return p_win32u_EnumDisplayMonitors( hdc, rect, (void *)proc, lparam );
+    if (on_kernel_stack()) return enum_display_monitors_for_d3dmetal( hdc, rect, proc, lparam );
+    if (!d3dmetal_reenter( (void *)enum_display_monitors_for_d3dmetal, &result, (UINT_PTR)hdc,
+                           (UINT_PTR)rect, (UINT_PTR)proc, lparam, 0, 0 ))
+        return FALSE;
+    return (BOOL)result;
+}
+
+static void init_win32_dispatch( void *handle )
+{
+    int (*p_Win32DispatchInit)( void * );
+    void (*p_PatchWin32DispatchFunctions)( void * );
+    void *table;
+
+    p_Win32DispatchInit = dlsym( handle, "_Z17Win32DispatchInitPv" );
+    p_PatchWin32DispatchFunctions = dlsym( handle, "_Z27PatchWin32DispatchFunctionsP13Win32Dispatch" );
+
+    if (!p_Win32DispatchInit || !p_PatchWin32DispatchFunctions)
+    {
+        TRACE( "libd3dshared has no Win32DispatchInit (3.0)\n" );
+        return;
+    }
+
+    load_win32u_for_dispatch();
+
+    table = calloc( 1, WIN32_DISPATCH_TABLE_SIZE );
+    if (!table) return;
+
+    p_PatchWin32DispatchFunctions( table );
+    p_Win32DispatchInit( table );
+    win32_dispatch_table = table;
+    p_MonitorEnumCallbackHandler = dlsym( handle, "MonitorEnumCallbackHandler" );
+
+    /* PatchWin32DispatchFunctions resolves NtSetEvent etc. via dlsym(RTLD_DEFAULT)
+     * and installs pack_* wrappers that convert ms_abi to SysV before calling them.
+     * The GPT_ABI_WRAPPER trampoline checks the return address against libd3dshared's
+     * code range, and the pack_* wrappers sit inside that range with arguments already
+     * in SysV order, so the trampoline would convert them twice. Nulling the range
+     * disables it. */
+    libd3dshared_load_addr = NULL;
+    libd3dshared_code_end = NULL;
+
+    TRACE( "Win32DispatchInit completed (D3DMetal 4.0b2+)\n" );
+}
+
+static void load_libd3dshared(void)
+{
+    char *path = getenv( "SEVO_LIBD3DSHARED_PATH" );
+    void *handle;
+    Dl_info dli;
+    unsigned long code_size;
+
+    p_supports_non_native_code_regions = NULL;
+
+    if (!path || !*path || !sonoma_or_later()) return;
+
+    handle = dlopen( path, RTLD_LOCAL );
+    if (handle)
+    {
+        p_supports_non_native_code_regions = dlsym( handle, "supports_non_native_code_regions" );
+
+        if (dladdr( (void *)p_supports_non_native_code_regions, &dli ))
+        {
+            getsegmentdata( dli.dli_fbase, "__TEXT", &code_size );
+            libd3dshared_load_addr = dli.dli_fbase;
+            libd3dshared_code_end = (char *)libd3dshared_load_addr + code_size;
+        }
+
+        TRACE( "Loaded libd3dshared.dylib at %p-%p, %s non-native code regions\n",
+               libd3dshared_load_addr, libd3dshared_code_end,
+               p_supports_non_native_code_regions ? (p_supports_non_native_code_regions() ? "supports" : "does not support") : "does not support" );
+
+        init_win32_dispatch( handle );
+    }
+    else
+    {
+        TRACE( "Loading libd3dshared.dylib from %s failed: %s\n", path, dlerror() );
+    }
+}
+
+#endif  /* __APPLE__ && __x86_64__ */
+
+
 /***************************************************************************
  *	get_machine_wow64_dir
  *
@@ -1705,6 +2014,10 @@ static void load_ntdll(void)
     SIZE_T size = 0;
     char *name = NULL;
 
+#if defined(__APPLE__) && defined(__x86_64__)
+    load_libd3dshared();
+#endif
+
     init_unicode_string( &str, path );
     InitializeObjectAttributes( &attr, &str, 0, 0, NULL );
 
@@ -1864,6 +2177,7 @@ static void start_main_thread(void)
 
     dbg_init();
     startup_info_size = server_init_process();
+    msync_init();
     virtual_map_user_shared_data();
     init_cpu_info();
     init_files();

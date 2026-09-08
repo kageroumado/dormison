@@ -168,6 +168,19 @@ static void *try_dlopen( const char *argv0 )
 }
 
 
+static void *try_tree( const char *dir )
+{
+    char *path;
+    void *handle;
+
+    if (!dir || !*dir) return NULL;
+    if (!(path = build_path( dir, "ntdll.so" ))) return NULL;
+    handle = dlopen( path, RTLD_NOW );
+    free( path );
+    return handle;
+}
+
+
 /**********************************************************************
  *           main
  */
@@ -177,7 +190,12 @@ int main( int argc, char *argv[] )
 
     init_reserved_areas();
 
-    if ((handle = try_dlopen( get_self_exe() )) ||
+    /* SEVO_LOADER_TREE names the directory holding ntdll.so. It is set when
+     * this loader is a copy inside a game's own bundle, which the Dock and
+     * Game Mode take the process's identity from; a copy there has no tree
+     * beside it. */
+    if ((handle = try_tree( getenv( "SEVO_LOADER_TREE" ) )) ||
+        (handle = try_dlopen( get_self_exe() )) ||
         (handle = try_dlopen( argv[0] )))
     {
         void (*init_func)(int, char **) = dlsym( handle, "__wine_main" );
