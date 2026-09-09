@@ -31,6 +31,7 @@
 #import "cocoa_window.h"
 #import "d3dmetal_objc.h"
 #include "sevo_presenter.h"
+#include "sevo_provenance.h"
 #import <Metal/Metal.h>
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
@@ -66,6 +67,7 @@
                     WineEventQueue *queue = [(WineWindow*)view.window queue];
                     [queue postEvent:event];
                     macdrv_release_event(event);
+                    sevo_provenance_note_drawable();
                 }
             }
         }

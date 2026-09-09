@@ -34,6 +34,7 @@
 #include "ntstatus.h"
 #include "macdrv.h"
 #include "shellapi.h"
+#include "sevo_provenance.h"
 #include "wine/server.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
@@ -545,6 +546,8 @@ static NTSTATUS macdrv_init(void *arg)
         TRACE("presenter: %s upscaler %s filter %s\n", presenter_on ? "on" : "off (no device)",
               upscaler_option, final_filter_option);
     }
+
+    sevo_provenance_init(presenter_on, upscaler_option);
 
     macdrv_err_on = ERR_ON(macdrv);
     if (macdrv_start_cocoa_app(NtGetTickCount()))

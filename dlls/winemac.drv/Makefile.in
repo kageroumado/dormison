@@ -42,6 +42,7 @@ SOURCES = \
 	macdrv_main.c \
 	mouse.c \
 	opengl.c \
+	sevo_provenance.c \
 	surface.c \
 	systray.c \
 	vulkan.c \

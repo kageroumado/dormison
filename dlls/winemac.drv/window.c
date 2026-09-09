@@ -35,6 +35,7 @@
 #undef LoadResource
 
 #include "macdrv.h"
+#include "sevo_provenance.h"
 #include "wine/server.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
@@ -1131,12 +1132,22 @@ static void macdrv_client_surface_present(struct client_surface *client, HDC hdc
     release_win_data(data);
 }
 
+/* Every frame a renderer finishes arrives here, from Vulkan, OpenGL and
+   D3DMetal alike: win32u's client_surface_present() is their one exit.
+   macdrv_CreateClientSurface calls the body directly, before there is a
+   frame to count. */
+static void macdrv_client_surface_present_frame(struct client_surface *client, HDC hdc)
+{
+    sevo_provenance_note_present(client);
+    macdrv_client_surface_present(client, hdc);
+}
+
 static const struct client_surface_funcs macdrv_client_surface_funcs =
 {
     .destroy = macdrv_client_surface_destroy,
     .detach = macdrv_client_surface_detach,
     .update = macdrv_client_surface_update,
-    .present = macdrv_client_surface_present,
+    .present = macdrv_client_surface_present_frame,
 };
 
 struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client)

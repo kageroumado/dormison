@@ -32,6 +32,7 @@
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "macdrv.h"
+#include "sevo_provenance.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(macdrv_d3dmtl);
 
@@ -113,6 +114,7 @@ void macdrv_release_d3dmetal_client_surfaces(struct macdrv_win_data *data)
 void macdrv_client_surface_presented(const macdrv_event *event)
 {
     TRACE("client_surface %p\n", event->client_surface_presented.client_surface);
+    sevo_provenance_note_presented_event();
     client_surface_present(event->client_surface_presented.client_surface);
 }
 
