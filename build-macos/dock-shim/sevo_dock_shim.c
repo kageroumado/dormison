@@ -44,6 +44,8 @@
 #include <pwd.h>
 #include <spawn.h>
 #include <stdint.h>
+#include <sys/event.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -859,10 +861,88 @@ done:
     free(port);
 }
 
+// MARK: - The owner watch
+
+// SEVO_OWNER_PID names the process that owns this bottle. Nothing inside the
+// prefix notices when it dies: the wineserver keeps the registry, the drives
+// and every game process alive, and a later launch silently adopts them. So
+// each bottle process watches the owner and takes the prefix down with it.
+
+// The engine's wineserver, beside the loader that started this process or
+// three levels up from the ntdll a game bundle was pointed at.
+static int wineserver_path(char *out, size_t len) {
+    const char *loader = getenv("WINELOADER");
+    const char *tree = getenv("SEVO_LOADER_TREE");
+    if (loader && *loader) {
+        const char *slash = strrchr(loader, '/');
+        if (slash) {
+            snprintf(out, len, "%.*s/wineserver", (int)(slash - loader), loader);
+            if (access(out, X_OK) == 0) return 1;
+        }
+    }
+    if (tree && *tree) {
+        char root[1024];
+        snprintf(root, sizeof(root), "%s", tree);
+        for (int up = 0; up < 3; up++) {
+            char *slash = strrchr(root, '/');
+            if (!slash) return 0;
+            *slash = '\0';
+        }
+        snprintf(out, len, "%s/bin/wineserver", root);
+        if (access(out, X_OK) == 0) return 1;
+    }
+    return 0;
+}
+
+static void *sevo_owner_watch(void *argument) {
+    pid_t owner = (pid_t)(intptr_t)argument;
+    int queue = kqueue();
+    if (queue < 0) return NULL;
+    struct kevent watch;
+    EV_SET(&watch, (uintptr_t)owner, EVFILT_PROC, EV_ADD | EV_ENABLE, NOTE_EXIT, 0, NULL);
+    if (kevent(queue, &watch, 1, NULL, 0, NULL) < 0) {
+        int failure = errno;
+        close(queue);
+        // ESRCH is the owner already gone, which is the event itself.
+        if (failure != ESRCH) return NULL;
+    }
+    else {
+        struct kevent fired;
+        int seen = kevent(queue, NULL, 0, &fired, 1, NULL);
+        close(queue);
+        if (seen != 1) return NULL;
+    }
+
+    fprintf(stderr, "sevo:shim owner %d exited — bringing the prefix down\n", (int)owner);
+    fflush(stderr);
+    char server[1024];
+    if (!wineserver_path(server, sizeof(server))) return NULL;
+    char *arguments[] = { server, "-k", NULL };
+    pid_t child;
+    if (posix_spawn(&child, server, NULL, NULL, arguments, *_NSGetEnviron()) == 0) {
+        waitpid(child, NULL, 0);
+    }
+    return NULL;
+}
+
+static void sevo_watch_owner(void) {
+    const char *owner = getenv("SEVO_OWNER_PID");
+    const char *prefix = getenv("WINEPREFIX");
+    if (!owner || !*owner || !prefix || !*prefix) return;
+    char *end = NULL;
+    long pid = strtol(owner, &end, 10);
+    if (end == owner || pid <= 0 || pid > INT32_MAX) return;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, sevo_owner_watch, (void *)(intptr_t)pid) == 0) {
+        pthread_detach(thread);
+    }
+}
+
 __attribute__((constructor)) static void sevo_shim_init(void) {
     // First: a game that runs natively reaches neither the rest of this file
     // nor wine.
     sevo_run_natively();
+    sevo_watch_owner();
     const char *mode = getenv("SEVO_SUPPRESS_WINDOWS");
     if (!mode || strcmp(mode, "1") != 0) return;
     _dyld_register_func_for_add_image(sevo_try_swizzle);
