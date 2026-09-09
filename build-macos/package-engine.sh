@@ -14,11 +14,11 @@ set -euo pipefail
 VERSION="$1"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
-ROOT="${DORMISON_BUILD:-$HOME/Developer/build/dormison}"
+ROOT="${DORMISON_BUILD:-$HOME/dormison-build}"
 STAGE="$ROOT/stage"
 ENGINES="$HOME/Library/Application Support/Sevoflurane/Engines"
 # The newest installed Dormison unless SEVO_LIVE_ENGINE names another.
-LIVE="${SEVO_LIVE_ENGINE:-$(ls -d "$ENGINES"/dormison-r* 2>/dev/null | sort -t r -k2 -n | tail -1)}"
+LIVE="${SEVO_LIVE_ENGINE:-$ENGINES/$(ls "$ENGINES" 2>/dev/null | grep -E '^dormison-r[0-9]+$' | sort -t- -k2.2 -n | tail -1)}"
 OUT="$ENGINES/$VERSION"
 
 [ -d "$STAGE/bin" ] || { echo "no staging tree at $STAGE"; exit 1; }

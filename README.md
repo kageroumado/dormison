@@ -1,93 +1,108 @@
-# dormison
+# Dormison
 
-The Wine engine inside [Sevoflurane](https://github.com/kageroumado/sevoflurane),
-the app that runs Steam and its Windows games as a Mac app.
+Dormison is the Wine engine used by [Sevoflurane](https://github.com/kageroumado/sevoflurane)
+to run Windows Steam games on macOS.
 
-This repository is [Wine](https://www.winehq.org) 11.16 with
-[wine-staging](https://github.com/wine-staging/wine-staging) 11.16 applied
-(tag `wine-staging-base`), plus the changes that turn it into the engine.
-`git diff wine-staging-base` shows all of them. The engine is built for
-x86_64 macOS and runs under Rosetta on Apple silicon. Sevoflurane downloads
-it as a tarball and runs the Windows Steam client and every game through it.
+Sevoflurane downloads the engine and manages its settings. Start with
+[Sevoflurane's setup instructions](https://github.com/kageroumado/sevoflurane#get-started)
+to use it. Dormison is built for x86_64 macOS and runs under Rosetta on
+Apple silicon.
 
 Like the app, it is named after an anesthetic.
 
-## Wine, CrossOver, Dormison
+## What it does
 
-| | Wine | CrossOver | Dormison |
-|---|---|---|---|
-| Price | Free | Paid, per seat | Free |
-| Who makes it | The Wine project | CodeWeavers, a company with a support team and per-game fixes | One developer, for Sevoflurane |
-| Support | Bugzilla and the forums | Support tickets and a compatibility database | GitHub issues and pull requests. It is a free project and makes no guarantees. |
-| License | LGPL | Proprietary, with Wine's LGPL parts published | LGPL, like Wine |
-| Direct3D 12 on macOS | vkd3d over MoltenVK | Apple's D3DMetal, integrated | Apple's D3DMetal, hosted by the engine and installed by the app |
-| Direct3D 9 to 11 | `wined3d` over OpenGL | D3DMetal, DXMT, DXVK | DXMT, DXVK, `wined3d`, per bottle or per game |
-| Synchronization | wineserver round trips | msync | msync |
-| 32-bit games under Rosetta | Thunk and signal bugs | Fixed | Fixed the same way |
-| The Steam client | Runs; its boot trips over Vulkan enumeration and the network wait | Runs | Runs, with the boot fixed |
-| Frames on screen | As the program draws them | As the program draws them, with a high-resolution mode per bottle | Through a presenter: Lanczos, MetalFX or a shader package (Anime4K, CuNNy), and a resizable window for programs that lock theirs |
-| Per-game settings without a restart | — | — | Env files read at process start |
-| Mouse | Accelerated pointer | Accelerated pointer | Raw deltas for a program that holds the cursor |
-| The Dock | Every process is "wine" | The bottle's icon | The game's name and icon per process |
-| Without Rosetta | No macOS build | An ARM64 preview, without D3DMetal yet | Runs under Rosetta |
-
-## What it adds to Wine
-
-| Area | Upstream Wine on macOS | This engine |
-|---|---|---|
-| Direct3D 12 | vkd3d over MoltenVK, incomplete | Hosts Apple's D3DMetal (the Game Porting Toolkit's Direct3D 12 layer): GS base kept on the thread's TSD with the TEB and PEB mirrored, the `__wine_unix_call` export, ms_abi wrappers for the syscalls the toolkit's native threads make, `win32u.so` mapped before the toolkit resolves its symbols, and the host-callback table D3DMetal 4.0 works from. Apple's libraries are installed by the app; only Apple distributes them. |
-| Direct3D 9 to 11 | `wined3d` over macOS OpenGL | The engine tarball carries [DXMT](https://github.com/3Shain/dxmt) (Direct3D 10/11 to Metal, 64- and 32-bit) and [DXVK](https://github.com/Gcenx/DXVK-macOS) over MoltenVK beside `wined3d`; the renderer is chosen per bottle or per program. |
-| Synchronization | Every wait is a wineserver round trip | msync, CrossOver's in-process synchronization on Mach semaphores (`WINEMSYNC=1`). |
-| 32-bit programs under Rosetta | The 32-to-64 thunk breaks on a signal; code written by another process or on executable pages runs stale; signal contexts lack an mxcsr | The thunk returns through `lretq`; written code is re-translated; a default mxcsr is supplied and four mistranslated instructions are handled. 32-bit Direct3D 11 games reach Metal through DXMT. |
-| Presentation | The frame is drawn as the program sizes it | A presenter puts the frame on screen through its own Metal layer and scales it on the way: Lanczos, MetalFX, or an mpv user-shader package (fragment and compute passes, so Anime4K and CuNNy run). A final filter resamples the last pass. GDI window surfaces go through the same path. `Upscaler`, `FinalFilter`, `PresenterLog` options; `SEVO_UPSCALER`, `SEVO_FINAL_FILTER`, `SEVO_SHADER_DIR` in the environment. |
-| Windows the program locked | A non-resizable window stays that size | `ResizableWindows` lets the user resize it, and lets a full-screen-style window run in a window, while the program keeps drawing at its own size. The aspect ratio is held; the cursor clip waits for the cursor to hide. |
-| Mouse | Accelerated pointer deltas | `LinearMouse` hands a program that holds the cursor the mouse's own displacement. |
-| Per-program settings | The environment is inherited from the parent | `<prefix>/.sevo/bottle.env` and `<prefix>/.sevo/apps/<exe>.env` are read at process start, so a setting reaches a game at its next launch while the Steam client keeps running. `WINEDLLPATH_PREPEND` puts a directory ahead of the built-in DLLs. |
-| GPU identity | A generic adapter and an invented driver version | The adapter, memory, driver version and provider a game sees come from the environment (`SEVO_GPU_*`); an unknown vendor reads as a current NVIDIA card. |
-| The Steam client's boot | Every CEF GPU process dies on Vulkan enumeration; the client waits for a network change; a display-mode switch crashes on Apple silicon | Vulkan portability enumeration, the network interface's first registration completed and its address change primed, the safe display-mode flag, a trimmed root-device list, a reentrant `localtime`. |
-| Processes on macOS | Every process shows as "wine" and may take a Dock icon | The dock shim (`libsevodockshim.dylib`) keeps Steam's infrastructure processes out of the Dock, names the game process after the game with Steam's title and a shaped Dock tile, runs NW.js games as native processes, and can start a game through a loader of its own. |
-| Steamworks outside the bottle | — | A stub (`sevo-steamstub.exe`) loads the game's `steam_api.dll` inside the bottle and answers achievements and stats over loopback for a game that runs natively. |
-
-Left out on purpose: X11, OpenGL, GStreamer, FFmpeg, SDL, CUPS and the
-other desktop integrations. The engine runs games under Steam.
-
-## DirectX 12, measured
-
-Microsoft's DirectX-Graphics-Samples were built on Windows with a frame-count
-exit and run on Dormison with D3DMetal 4.0 beta 2, then compared frame by frame
-with the same binaries on an RTX 4080 SUPER. Of 35 comparable samples, 23 draw
-the reference image.
-
-| Works | Does not |
+| Feature | What you can use |
 |---|---|
-| The HelloWorld set: window, triangle, texture, constant buffers, bundles, frame buffering | DirectX Raytracing, all four samples. The toolkit reports no raytracing tier. |
-| Execute indirect, multithreading, predication queries, reserved resources, residency, small resources, depth bounds, dynamic indexing, n-body gravity | Variable Rate Shading. No tier is reported and the sample gives up. |
-| Mesh shaders: meshlet render, cull, instancing | Mesh shaders: dynamic LOD draws the mesh as shards. |
-| Full screen, linked-GPU samples on one adapter | Cross-GPU copy. One adapter is exposed. |
-| | Pipeline state cache, generic programs, 11-on-12. They abort at the first Direct3D 12 call. |
-| | HDR and SM6 wave intrinsics. They stop on their own error dialog. |
+| Graphics | DXMT for Direct3D 10/11, DXVK over MoltenVK, D3DMetal from Apple's Game Porting Toolkit, or Wine's wined3d. Choose a renderer per bottle or game in Sevoflurane. |
+| Window scaling | Resize supported game windows while the game keeps drawing at its original resolution. Scale the picture with Lanczos, MetalFX Spatial, Anime4K or CuNNy. |
+| Input | Use raw mouse movement when a game holds the cursor for mouse-look. |
+| Game settings | Change per-game settings for the next launch while Steam stays open. |
+| Mac integration | Show a game's title and icon in the Dock, and run supported NW.js games with native macOS NW.js. |
 
-The toolkit reports feature level 12_2, resource binding tier 3, heap tier 2,
-enhanced barriers, wave operations and mesh shaders, the same as the RTX
-card. Shader Model is 6.6 against 6.8, root signature 1.1 against 1.2, tiled
-resources tier 2 against 4. Conservative rasterization, sampler feedback,
-double-precision shaders and raytracing are absent. The Agility SDK redirect
-games ship is never honored; the engine's own `d3d12.dll` answers every time.
+Compatibility depends on the game, Mac and graphics translator. See the
+[DirectX 12 testing notes](#directx-12-testing) for what the sample runs establish.
 
-## Building
+## Build or contribute
 
-`build-macos/README.md` is the build guide: toolchain, configure line, the
-driver's Swift half, and `package-engine.sh`, which assembles an engine
-directory with `engine-info.json`. `build-macos/` also holds the dock shim,
-the Steamworks stub, CrossOver's msync sources and the port that placed
-them, and patches that exist but are not applied.
+The [build guide](build-macos/README.md) covers the toolchain, configuration,
+packaging and releases. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to
+report a problem and verify a change.
 
-## Releases
+Each release has an `r<N>` tag and includes the engine tarball, checksum,
+Ed25519 signature, `engine-info.json` and the diff against
+`wine-staging-base`. Sevoflurane finds engines through its signed release
+manifest.
 
-Each engine release is a tag `r<N>` here and a GitHub release carrying the
-tarball, its checksum, its `engine-info.json` and the full diff against
-`wine-staging-base`. The app finds releases through the manifest published
-with [Sevoflurane's releases](https://github.com/kageroumado/sevoflurane/releases).
+## Technical details
+
+This repository is [Wine](https://www.winehq.org) 11.16 with
+[wine-staging](https://github.com/wine-staging/wine-staging) 11.16 applied
+(tag `wine-staging-base`), plus Dormison's changes.
+`git diff wine-staging-base` shows the complete diff.
+
+### Graphics and presentation
+
+The engine packages [DXMT](https://github.com/3Shain/dxmt) for 64-bit and
+32-bit Direct3D 10/11 programs, and [DXVK](https://github.com/Gcenx/DXVK-macOS)
+over MoltenVK. Sevoflurane can import D3DMetal from Apple's Game Porting
+Toolkit.
+
+D3DMetal support includes the `__wine_unix_call` export, Microsoft-ABI
+wrappers for toolkit callbacks, and the host-callback table used by
+D3DMetal 4.0. Wine keeps the GS base on Darwin thread storage, mirrors the
+TEB and PEB, and maps `win32u.so` before the toolkit resolves its symbols.
+
+The optional presenter scales Metal and GDI window surfaces. It supports
+Lanczos, MetalFX Spatial and compiled mpv shader packages, including
+fragment and compute passes used by Anime4K and CuNNy. A final filter
+resamples the output. Configure it with `Upscaler`, `FinalFilter` and
+`PresenterLog`, or `SEVO_UPSCALER`, `SEVO_FINAL_FILTER`,
+`SEVO_PRESENTER_LOG` and `SEVO_SHADER_DIR`.
+
+`ResizableWindows` preserves the game's rendering size and aspect ratio
+while allowing the presentation window to resize. `LinearMouse` supplies
+raw displacement when the program holds the cursor for mouse-look.
+
+### Processes and compatibility
+
+Dormison includes CrossOver's msync implementation, using Mach semaphores
+for in-process synchronization (`WINEMSYNC=1`). Rosetta workarounds cover
+32-to-64-bit transitions, written executable code and signal contexts.
+The transition uses `lretq`, and signal handling preserves the thread's
+MXCSR state.
+
+At process start, Wine reads `<prefix>/.sevo/bottle.env`, then
+`<prefix>/.sevo/apps/<exe>.env`, where `<exe>` is the executable's
+lowercase basename. Game settings therefore apply at the next launch.
+`WINEDLLPATH_PREPEND` adds a directory ahead of the built-in DLLs.
+
+`SEVO_GPU_*` variables set the adapter identity, memory and driver
+metadata reported to Windows programs. Without a driver override, an
+unknown vendor receives NVIDIA driver metadata.
+
+Steam startup fixes cover Vulkan portability enumeration, initial network
+notifications, display-mode switching, root-device enumeration and
+reentrant local-time conversion.
+
+The dock shim (`libsevodockshim.dylib`) hides Steam's infrastructure
+processes from the Dock and gives games their own titles and icons.
+For supported NW.js games, it starts the native runtime. The
+[Steamworks stub](build-macos/steam-stub/README.md) stays in Wine and
+serves achievements and stats to the native game over loopback.
+
+### DirectX 12 testing
+
+[Bispectral's sample results](https://github.com/kageroumado/bispectral/blob/main/dx12-samples/RESULTS.md)
+record Microsoft DirectX-Graphics-Samples runs and comparisons with an
+RTX 4080 SUPER. The archived run combines several invocations and lacks
+verified engine provenance. Its captures are unsynchronized, and its
+`match` classification records matching exit status and window behavior.
+
+Feature support also depends on the Mac and toolkit version. A sample
+completing its run establishes less than a full game playing correctly;
+use the individual results and their recorded limitations when assessing
+compatibility.
 
 ## License
 

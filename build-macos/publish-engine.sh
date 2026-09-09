@@ -54,7 +54,7 @@ done
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
-ROOT="${DORMISON_BUILD:-$HOME/Developer/build/dormison}"
+ROOT="${DORMISON_BUILD:-$HOME/dormison-build}"
 ENGINES="$HOME/Library/Application Support/Sevoflurane/Engines"
 NAME="dormison-$VERSION"
 [ -n "$ENGINE_DIR" ] || ENGINE_DIR="$ENGINES/$NAME"
@@ -88,9 +88,14 @@ gh release view "$VERSION" --repo "$ENGINE_REPO" >/dev/null 2>&1 && { echo "rele
 WINE_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["wine"])' "$ENGINE_DIR/engine-info.json")"
 
 # --- stage a copy: the installed engine stays what the app runs ---
+# cp reads with read(2). rsync maps each source file, and the kernel kills a
+# process that maps a signed Mach-O another process is running under Rosetta
+# (SIGKILL, "Code Signature Invalid") — Steam on this very engine, at every
+# publish.
 mkdir -p "$RELEASES/stage"
 echo "==> staging $ENGINE_DIR → $STAGE"
-rsync -a --delete "$ENGINE_DIR/" "$STAGE/"
+[ ! -e "$STAGE" ] || rm -rf "$STAGE"
+cp -Rp "$ENGINE_DIR" "$STAGE"
 
 # --- Developer ID: every Mach-O in the staged copy, timestamped ---
 is_macho() {
@@ -199,11 +204,13 @@ echo "==> tag $VERSION"
 git -C "$REPO" tag -s "$VERSION" -m "Engine $VERSION"
 git -C "$REPO" push origin "$VERSION"
 
+# Expanded as ${PRERELEASE[@]+"${PRERELEASE[@]}"}: an empty array is an unbound
+# variable to the bash 3.2 macOS ships, and set -u would stop the release here.
 PRERELEASE=()
 [ "$CHANNEL" = beta ] && PRERELEASE=(--prerelease)
 echo "==> release $VERSION on $ENGINE_REPO"
 gh release create "$VERSION" --repo "$ENGINE_REPO" --verify-tag --title "Engine $VERSION" \
-    --notes-file "$NOTES" "${PRERELEASE[@]}" \
+    --notes-file "$NOTES" ${PRERELEASE[@]+"${PRERELEASE[@]}"} \
     "$TARBALL" "$TARBALL.sha256" "$TARBALL.sig" "$RELEASES/$NAME-engine-info.json" "$RELEASES/$NAME.patch"
 
 # --- what GitHub holds is what was signed ---

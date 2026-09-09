@@ -5,14 +5,13 @@ This repository is Wine. The `main` branch is upstream wine-staging (tag
 Sevoflurane ships. `git diff wine-staging-base` is the whole change.
 
 The build happens **out of tree**, in `$DORMISON_BUILD` (default
-`~/Developer/build/dormison/`), so the repository stays code only:
+`$HOME/dormison-build/`), so the repository stays code only:
 
 ```
 $DORMISON_BUILD/
   wine-src -> <this repository>            (symlink)
   deps/         dependency headers and dylibs (Intel Homebrew bottles, extracted)
   deps-raw/     the bottles as downloaded
-  bottles/      the same, older set
   wine-staging/ the staging patch tree the base commit was made from
   build/        configure output and objects; incremental
   stage/        `make install-lib` output that package-engine.sh assembles from
@@ -41,7 +40,7 @@ backend, which is the one that matters on macOS anyway.
 ## Configure
 
 ```bash
-W=${DORMISON_BUILD:-~/Developer/build/dormison}
+W=${DORMISON_BUILD:-$HOME/dormison-build}
 cd $W/build && \
 CC='clang -arch x86_64 -std=gnu23 -m64' \
 CFLAGS='-g -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0' \
@@ -59,7 +58,7 @@ OBJC=gcc PATH="/opt/homebrew/opt/bison/bin:$PATH" \
   --without-pcsclite --with-mingw --prefix=$W/stage
 ```
 
-Every library comes from `deps/`, the x86_64 set MacPorts built. With
+Configure reads every dependency from `deps/`. With
 `pkg-config` or `brew` reachable, configure resolves FreeType to Homebrew's
 arm64 build and `sfnt2fon` fails to link for x86_64; the two `FREETYPE_*`
 variables and the disabled `pkg-config` keep configure on `deps/` whatever
@@ -84,6 +83,13 @@ make -C $W/wine-src/dlls/winemac.drv/swift
 than the staged `winemac.so`, which is the shape a forgotten rebuild takes.
 
 ## Build, stage, package
+
+Packaging needs a donor: an engine Sevoflurane has already installed (the
+newest `dormison-r*` under `~/Library/Application Support/Sevoflurane/Engines`,
+or the directory `SEVO_LIVE_ENGINE` names). The build produces wine; the
+dependency dylibs (an x86_64 set built with MacPorts), the renderer bundles,
+D3DMetal, gecko, mono and the dock shim are copied from the donor. A clone
+with no engine installed builds wine but cannot package one.
 
 ```bash
 make -C $W/wine-src/dlls/winemac.drv/swift   # before wine, see above
