@@ -868,11 +868,14 @@ done:
 // and every game process alive, and a later launch silently adopts them. So
 // each bottle process watches the owner and takes the prefix down with it.
 
-// The engine's wineserver, beside the loader that started this process or
-// three levels up from the ntdll a game bundle was pointed at.
+// The engine's wineserver: beside the loader that started this process,
+// three levels up from the ntdll a game bundle was pointed at, or under the
+// engine directory this dylib itself sits in, which is the only one of the
+// three that is always there.
 static int wineserver_path(char *out, size_t len) {
     const char *loader = getenv("WINELOADER");
     const char *tree = getenv("SEVO_LOADER_TREE");
+    Dl_info self;
     if (loader && *loader) {
         const char *slash = strrchr(loader, '/');
         if (slash) {
@@ -890,6 +893,14 @@ static int wineserver_path(char *out, size_t len) {
         }
         snprintf(out, len, "%s/bin/wineserver", root);
         if (access(out, X_OK) == 0) return 1;
+    }
+    if (dladdr((void *)wineserver_path, &self) && self.dli_fname) {
+        const char *slash = strrchr(self.dli_fname, '/');
+        if (slash) {
+            snprintf(out, len, "%.*s/wine/bin/wineserver",
+                     (int)(slash - self.dli_fname), self.dli_fname);
+            if (access(out, X_OK) == 0) return 1;
+        }
     }
     return 0;
 }
@@ -918,10 +929,17 @@ static void *sevo_owner_watch(void *argument) {
     char server[1024];
     if (!wineserver_path(server, sizeof(server))) return NULL;
     char *arguments[] = { server, "-k", NULL };
+    // The kill runs outside the bottle: with this dylib and the owner still
+    // in its environment it would arm a watch of its own on an owner that is
+    // already gone, and spawn another kill from that, without end.
+    static const char *drop[] = { "DYLD_INSERT_LIBRARIES=", "SEVO_OWNER_PID=" };
+    char **environment = filtered_environment(drop, 2, 0);
+    if (!environment) return NULL;
     pid_t child;
-    if (posix_spawn(&child, server, NULL, NULL, arguments, *_NSGetEnviron()) == 0) {
+    if (posix_spawn(&child, server, NULL, NULL, arguments, environment) == 0) {
         waitpid(child, NULL, 0);
     }
+    free(environment);
     return NULL;
 }
 
