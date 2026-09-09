@@ -242,6 +242,7 @@ extern NTSTATUS load_builtin( struct pe_mapping_info *pe_mapping, USHORT machine
 extern NTSTATUS load_unixlib_by_name( const UNICODE_STRING *nt_name, void **handle_ret );
 extern BOOL is_system_dir_path( const UNICODE_STRING *path, WORD *machine );
 extern char *sevo_program_env( const char *program, const char *key );
+extern BOOL sevo_env_files_enabled(void);
 extern NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine, void **module );
 extern NTSTATUS load_start_exe( UNICODE_STRING *nt_name, void **module );
 extern ULONG_PTR redirect_arm64ec_rva( void *module, ULONG_PTR rva, const IMAGE_ARM64EC_METADATA *metadata );

@@ -853,14 +853,26 @@ static void apply_env_file( const char *path )
 /***********************************************************************
  *              load_sevo_env
  *
- * Per-bottle and per-program environment, applied at process start:
- * <prefix>/.sevo/bottle.env, then <prefix>/.sevo/apps/<exe>.env, <exe>
- * being the program's basename in lower case. A value written to either
- * file reaches the next program start, whichever process spawns it. Runs
- * before the dll path, the locale and the debug channels are read, so
+ * Per-bottle and per-program environment, applied at process start in three
+ * passes, each overriding the one before: <prefix>/.sevo/bottle.env, then
+ * <prefix>/.sevo/debug.env, then <prefix>/.sevo/apps/<exe>.env, <exe> being
+ * the program's basename in lower case. A value written to any of them
+ * reaches the next program start, whichever process spawns it. debug.env is
+ * the app's debug mode: it is written when the mode turns on and deleted
+ * when it turns off, so the user's own bottle settings survive underneath it.
+ * Runs before the dll path, the locale and the debug channels are read, so
  * WINEDLLPATH_PREPEND, LC_ALL and WINEDEBUG can live here. SEVO_ENV_FILES=0
- * skips both files.
+ * skips all three files and the SEVO_LOADER exec in loader_exec with them.
  */
+
+/* Whether the .sevo env files are read at all. */
+BOOL sevo_env_files_enabled(void)
+{
+    const char *skip = getenv( "SEVO_ENV_FILES" );
+
+    return !(skip && !strcmp( skip, "0" ));
+}
+
 /* The per-program file for a program given as a unix or Windows path, or NULL. */
 static char *sevo_program_file( const char *program )
 {
@@ -887,12 +899,13 @@ static char *sevo_program_file( const char *program )
  */
 char *sevo_program_env( const char *program, const char *key )
 {
-    char *path = sevo_program_file( program ), *found = NULL;
     size_t key_len = strlen( key );
+    char *path, *found = NULL;
     char line[4096];
     FILE *file;
 
-    if (!path) return NULL;
+    if (!sevo_env_files_enabled()) return NULL;
+    if (!(path = sevo_program_file( program ))) return NULL;
     if ((file = fopen( path, "r" )))
     {
         while (fgets( line, sizeof(line), file ))
@@ -916,12 +929,15 @@ char *sevo_program_env( const char *program, const char *key )
 
 void load_sevo_env(void)
 {
-    const char *skip = getenv( "SEVO_ENV_FILES" );
     char *path;
 
-    if (skip && !strcmp( skip, "0" )) return;
+    if (!sevo_env_files_enabled()) return;
 
     asprintf( &path, "%s/.sevo/bottle.env", config_dir );
+    apply_env_file( path );
+    free( path );
+
+    asprintf( &path, "%s/.sevo/debug.env", config_dir );
     apply_env_file( path );
     free( path );
 

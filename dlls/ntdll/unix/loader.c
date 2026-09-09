@@ -453,6 +453,26 @@ char *get_alternate_wineloader( WORD machine )
 }
 
 
+/***********************************************************************
+ *           sevo_loader_note
+ *
+ * Which of the three loaders this exec takes, on stderr so it survives
+ * WINEDEBUG=-all. A tile in the Dock named "wine" and a `loader=engine`
+ * line for the same program are the same fact seen from two sides.
+ */
+static void sevo_loader_note( const char *program, const char *choice, const char *path )
+{
+    const char *exe = program ? program : "?";
+    const char *p;
+
+    if ((p = strrchr( exe, '/' ))) exe = p + 1;
+    if ((p = strrchr( exe, '\\' ))) exe = p + 1;
+    if (path) fprintf( stderr, "sevo:loader pid=%d exe=%s loader=%s=%s\n", getpid(), exe, choice, path );
+    else fprintf( stderr, "sevo:loader pid=%d exe=%s loader=%s\n", getpid(), exe, choice );
+    fflush( stderr );
+}
+
+
 static void preloader_exec( char **argv )
 {
 #ifdef HAVE_WINE_PRELOADER
@@ -482,8 +502,13 @@ static NTSTATUS loader_exec( char **argv, WORD machine )
 
     if ((alternate = get_alternate_wineloader( machine )))
     {
-        argv[1] = alternate;
-        preloader_exec( argv );
+        if (!access( alternate, X_OK ))
+        {
+            sevo_loader_note( argv[2], "alternate", NULL );
+            argv[1] = alternate;
+            preloader_exec( argv );
+        }
+        free( alternate );
     }
 
     /* SEVO_LOADER in the program's env file names a copy of the loader
@@ -500,12 +525,14 @@ static NTSTATUS loader_exec( char **argv, WORD machine )
             char *tree;
 
             if (asprintf( &tree, "SEVO_LOADER_TREE=%s", ntdll_dir ) != -1) putenv( tree );
+            sevo_loader_note( argv[2], "bundle", bundled );
             argv[1] = bundled;
             preloader_exec( argv );
         }
         free( bundled );
     }
 
+    sevo_loader_note( argv[2], "engine", NULL );
     argv[1] = strdup( wineloader );
     preloader_exec( argv );
     return STATUS_INVALID_IMAGE_FORMAT;
