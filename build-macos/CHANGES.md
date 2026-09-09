@@ -3,6 +3,68 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r5
+
+Provenance: after this release the wine log names, for every process it
+starts, which loader ran it, which engine and renderer answered, and whether
+a frame ever reached the screen. The lines go straight to stderr, so
+`WINEDEBUG=-all` does not silence them, and there are four per process.
+
+- `sevo:loader pid=<pid> exe=<name> loader=alternate|bundle=<path>|engine`
+  — one line per exec of a wine loader, from `loader_exec`. `engine` is the
+  engine's own `wine`; `bundle=` is the copy inside the game's launcher
+  bundle, which is what gives the process its name, icon and Game Mode
+  eligibility, so a Dock tile reading "wine" and a `loader=engine` line for
+  the same program are the same fact seen from two sides. `alternate` is the
+  other bitness. The alternate loader is now `access()`ed before the exec, so
+  a tree without it falls through by decision rather than by a failed
+  `execv`.
+- `sevo:run pid=<pid> exe=<name> appid=<id> engine=<name>` — at winemac.drv
+  init. `appid` is Steam's `SteamAppId`/`SteamGameId`, or `none` outside a
+  game; `engine` is the directory the running `winemac.so` was loaded from.
+- `sevo:gfx pid=<pid> renderer=… toolkit=… presenter=on|off upscaler=…
+  msync=…` and `sevo:gfx pid=<pid> d3d11=<sha8> d3d12=<sha8> dxgi=<sha8>` —
+  which renderer answered, and the identity of the DLLs it answered with.
+  Both come from `<engine>/renderer-hashes`, written by the app when it
+  stages a renderer (format in `build-macos/README.md` § Renderer
+  provenance); each field is `unknown` when the file or the key is missing.
+  The DLL hashes are the only honest answer, since every renderer spoofs the
+  same DXGI adapter string.
+- `sevo:gfx pid=<pid> first present +<N>ms surface=<ptr> layer=on-screen|
+  off-screen` — the first frame that reached the compositor, from the client
+  surface funcs table, so Vulkan, OpenGL and D3DMetal all count. Its absence
+  separates "the game never drew" from "the game drew and nothing
+  composited". `off-screen` means the presenter owns the layer.
+- `sevo:gfx pid=<pid> exit presents=<N>` — at process exit, through
+  `atexit`, so a process that is killed prints none.
+- `SEVO_GFX_LOG=1` adds `sevo:gfx pid=<pid> d3dmetal posted=<P>
+  executed=<E>` on the first presented frame and every 10 s after: the
+  `CLIENT_SURFACE_PRESENTED` notices D3DMetal's `nextDrawable` hook posted
+  against the ones the driver ran. They differ by the notices coalescing
+  drops; `posted` climbing while `executed` stands still is the present hook
+  firing into a window thread that is not running it.
+
+Other engine changes:
+
+- `<prefix>/.sevo/debug.env` is read between `bottle.env` and the
+  per-program file, with the same syntax. It is where the app's debug mode
+  puts the Wine channels and the renderer logging it turns on, so the
+  bottle's own settings survive underneath it and are back the moment the
+  file is deleted.
+- `SEVO_ENV_FILES=0` now also disables the `SEVO_LOADER` exec, so a harness
+  opting out of the env files is not silently rerouted through a game
+  bundle.
+- The dock shim watches `SEVO_OWNER_PID` — when the process that owns the
+  bottle exits, a `kqueue` `EVFILT_PROC` wakes the shim, it logs
+  `sevo:shim owner <pid> exited — bringing the prefix down` and runs
+  `wineserver -k`. Unset, nothing is watched; an owner already gone when the
+  watch opens counts as the event.
+- `build-macos/patches/dxmt-log-airconv-failure.patch` makes a failed
+  DXBC-to-AIR translation name its stage and its shader hash at ERR level.
+  DXMT is a binary payload, so the patch is carried rather than applied; the
+  payload in this release is the stock v0.80. Rebuild instructions are in
+  `build-macos/README.md`.
+
 ## r4
 
 - Presenter: a GDI flush ahead of the view's first layout is copied into a

@@ -1,0 +1,94 @@
+From: Sevoflurane <mail@kagerou.glass>
+Subject: [PATCH] Name the stage and the shader hash when DXBC to AIR translation fails
+
+A shader SM50Initialize refuses becomes E_FAIL with a null out-pointer from
+Create{Vertex,Pixel,Hull,Domain,Geometry,Compute}Shader. An application that
+ignores the HRESULT binds nothing, and the only later trace is one
+"Shader not found?" per dropped Dispatch, which names neither the shader nor
+the stage. Log both at the point of failure, at ERR level, so a black screen
+or a missing effect can be traced to the shader that failed to translate.
+
+Against dxmt v0.80 (589adb7).
+---
+diff --git a/src/d3d11/d3d11_pipeline_cache.cpp b/src/d3d11/d3d11_pipeline_cache.cpp
+index ec17d04..45ed4ae 100644
+--- a/src/d3d11/d3d11_pipeline_cache.cpp
++++ b/src/d3d11/d3d11_pipeline_cache.cpp
+@@ -218,7 +218,8 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+   dxmt::mutex mutex_cs_;
+ 
+   CachedSM50Shader *CreateShader(const void *pBytecode,
+-                                 uint32_t BytecodeLength) {
++                                 uint32_t BytecodeLength,
++                                 const char *stage) {
+     auto sha1 = Sha1HashState::compute(pBytecode, BytecodeLength);
+     {
+       std::shared_lock<std::shared_mutex> lock(mutex_shares);
+@@ -231,7 +232,12 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+     sm50_shader_t sm50;
+     MTL_SHADER_REFLECTION reflection;
+     if (SM50Initialize(pBytecode, BytecodeLength, &sm50, &reflection, &err)) {
+-      ERR("Failed to initialize shader: ", SM50GetErrorMessageString(err));
++      // The caller turns this into E_FAIL with a null out-pointer, and a
++      // D3D11 application that ignores the HRESULT then binds nothing: a
++      // compute dispatch is dropped, a draw call renders nothing. Name the
++      // stage and the hash so the shader can be found in a capture.
++      ERR("Failed to translate ", stage, " shader ", sha1.string(), ": ",
++          SM50GetErrorMessageString(err));
+       SM50FreeError(err);
+       return nullptr;
+     }
+@@ -254,7 +260,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+   virtual HRESULT AddVertexShader(const void *pBytecode,
+                                   uint32_t BytecodeLength,
+                                   ID3D11VertexShader **ppShader) override {
+-    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
++    auto managed_shader = CreateShader(pBytecode, BytecodeLength, "vertex");
+     if (!managed_shader) {
+       return E_FAIL;
+     }
+@@ -265,7 +271,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+ 
+   virtual HRESULT AddPixelShader(const void *pBytecode, uint32_t BytecodeLength,
+                                  ID3D11PixelShader **ppShader) override {
+-    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
++    auto managed_shader = CreateShader(pBytecode, BytecodeLength, "pixel");
+     if (!managed_shader) {
+       return E_FAIL;
+     }
+@@ -275,7 +281,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+ 
+   virtual HRESULT AddHullShader(const void *pBytecode, uint32_t BytecodeLength,
+                                 ID3D11HullShader **ppShader) override {
+-    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
++    auto managed_shader = CreateShader(pBytecode, BytecodeLength, "hull");
+     if (!managed_shader) {
+       return E_FAIL;
+     }
+@@ -286,7 +292,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+   virtual HRESULT AddDomainShader(const void *pBytecode,
+                                   uint32_t BytecodeLength,
+                                   ID3D11DomainShader **ppShader) override {
+-    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
++    auto managed_shader = CreateShader(pBytecode, BytecodeLength, "domain");
+     if (!managed_shader) {
+       return E_FAIL;
+     }
+@@ -298,7 +304,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+   virtual HRESULT AddGeometryShader(const void *pBytecode,
+                                     uint32_t BytecodeLength,
+                                     ID3D11GeometryShader **ppShader) override {
+-    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
++    auto managed_shader = CreateShader(pBytecode, BytecodeLength, "geometry");
+     if (!managed_shader) {
+       return E_FAIL;
+     }
+@@ -310,7 +316,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
+   virtual HRESULT AddComputeShader(const void *pBytecode,
+                                    uint32_t BytecodeLength,
+                                    ID3D11ComputeShader **ppShader) override {
+-    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
++    auto managed_shader = CreateShader(pBytecode, BytecodeLength, "compute");
+     if (!managed_shader) {
+       return E_FAIL;
+     }

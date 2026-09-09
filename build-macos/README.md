@@ -127,6 +127,54 @@ keeping the previous file beside the new one.
 sites in 11.16. It is already applied on `main`; it stays here for the next
 rebase, where the anchors will need checking.
 
+DXMT's `d3d11.dll` and `dxgi.dll` are a binary payload from the upstream
+release tarball, so a change to DXMT itself is a patch here plus a rebuilt
+payload, not an engine commit.
+`patches/dxmt-log-airconv-failure.patch` applies to dxmt **v0.80** and makes
+a failed DXBC-to-AIR translation name its stage and its shader hash at ERR
+level; without it the only trace is one `Shader not found?` per dropped
+Dispatch. Rebuilding the payload with it follows DXMT's own
+`docs/DEVELOPMENT.md`, whose prerequisites — an x86_64 LLVM 15 built from
+source, Xcode's Metal toolchain, mingw-w64 — are hours of setup on a machine
+that has none of them:
+
+```bash
+cd path/to/dxmt && git worktree add /tmp/dxmt-v080 v0.80
+cd /tmp/dxmt-v080
+git apply $DORMISON/build-macos/patches/dxmt-log-airconv-failure.patch
+# LLVM 15 for x86_64, per DXMT's docs/DEVELOPMENT.md § Setup LLVM
+meson setup --cross-file build-win64.txt -Dnative_llvm_path=./toolchains/llvm \
+  -Dwine_build_path=$DORMISON_BUILD/build build --buildtype release
+meson compile -C build
+cp build/src/d3d11/d3d11.dll "<engine>/dxmt/d3d11.dll"
+codesign -s - -f "<engine>/dxmt/d3d11.dll"
+```
+
+Record the rebuild in the engine's `engine-info.json` `dxmt` field so a
+payload that is no longer the stock v0.80 says so.
+
+## Renderer provenance
+
+winemac.drv prints which renderer answered for every process
+(`sevo:gfx … renderer=… d3d11=<sha8>`, see `CHANGES.md` § r5). The values
+come from `<engine>/renderer-hashes`, which the app writes when it stages a
+renderer into the engine tree: `key=value` lines, `#` comments, the keys
+`renderer` and `toolkit` plus one lower-case sha256 per staged DLL under its
+own base name.
+
+```
+# written by Sevoflurane at renderer staging
+renderer=dxmt
+toolkit=v0.80
+d3d11=1f0c…
+d3d12=…
+dxgi=…
+```
+
+A missing file or a missing key prints `unknown`; the renderer alone then
+falls back to what `WINEDLLOVERRIDES` implies, which separates DXVK from
+DXMT and leaves D3DMetal, wined3d and auto indistinguishable.
+
 ## Patches not on main
 
 `patches/` holds diffs that exist but are not applied.
