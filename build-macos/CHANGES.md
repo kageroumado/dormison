@@ -3,6 +3,44 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r6
+
+Discord: `sevo-discord-bridge.exe` sits in the engine directory and serves
+`\\.\pipe\discord-ipc-0` inside the bottle, relaying every byte to the Discord
+client's unix socket on macOS and back. A game that ships discord-rpc, the Game
+SDK or the Social SDK reaches Discord through it unchanged, with its own
+artwork, state and buttons, because the bridge parses nothing. The engine
+declares `discord-bridge` in `engine-info.json`'s `features`, which is what the
+app gates its switch on.
+
+- One bridge serves every program in the prefix: four free pipe instances at a
+  time, a thread per connected client, and no limit on how many are connected.
+  A game that finds them all taken gets `ERROR_PIPE_BUSY`, which is what
+  discord-rpc's `WaitNamedPipe` retry is for. A named mutex keeps a second copy
+  from starting.
+- The socket is reached with WinSock `AF_UNIX`, addressed as
+  `\\?\unix\var\folders\…\T\discord-ipc-N` with **backslash** separators.
+  `connect()` resolves `sun_path` through `wine_get_unix_file_name()`, a socket
+  node will not open, and the fallback that opens the parent directory instead
+  splits the name on a backslash — with forward slashes the call returns
+  `ERROR_CANT_ACCESS_FILE`. Indices 0 through 9 are tried by connecting, since
+  Discord leaves dead socket files behind and takes the next free index when it
+  restarts. `--dir` carries the directory, because a PE process sees Wine's
+  environment rather than the host's `TMPDIR`.
+- When no socket answers, the pipe client is disconnected at once, so a game
+  reads Discord as absent instead of hanging.
+- A relay that ends leaves the pipe connected, unblocks its own reader with
+  `CancelSynchronousIo` and flushes before closing. `FSCTL_PIPE_DISCONNECT`
+  drops unread data, and Discord's last frame before it hangs up is the CLOSE
+  that says why.
+- Half a minute in, the bridge calls
+  `NtSetInformationProcess(ProcessWineMakeProcessSystem)`, so it never holds a
+  prefix open on its own. The window matters: made a system process at startup,
+  it is the only thing in a fresh prefix and wineserver takes the bottle down
+  around it.
+- One line on stderr per connect and disconnect, tagged `sevo:discord`, so the
+  wine log shows which socket index answered.
+
 ## r5
 
 Provenance: after this release the wine log names, for every process it

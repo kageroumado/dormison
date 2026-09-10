@@ -138,6 +138,10 @@ codesign -s - -f "$OUT/libsevodockshim.dylib"
 make -s -C "$HERE/steam-stub"
 cp "$HERE/steam-stub/sevo-steamstub.exe" "$HERE/steam-stub/sevo-steamstub32.exe" "$OUT/"
 
+# --- the Discord relay a game in the bottle reaches the Mac client through ---
+make -s -C "$HERE/discord-bridge"
+cp "$HERE/discord-bridge/sevo-discord-bridge.exe" "$OUT/"
+
 # --- make our binaries resolve the bundled dylibs through @rpath ---
 echo "==> rewriting install names to @rpath"
 fix_rpath() {
@@ -169,7 +173,7 @@ cat > "$OUT/engine-info.json" <<EOF
   "d3dmetal": "Apple Game Porting Toolkit payloads installed by the app under d3dmetal/",
   "sync": "msync (WINEMSYNC=1)",
   "renderers": ["auto", "dxmt", "dxvk", "d3dmetal", "wined3d"],
-  "features": ["env-files"]
+  "features": ["env-files", "discord-bridge"]
 }
 EOF
 
