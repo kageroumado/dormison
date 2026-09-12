@@ -27,6 +27,7 @@
 
 #include <dlfcn.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,6 +89,38 @@ static void image_basename(char *buffer, size_t size)
     for (i = 0; i + 1 < size && name[i]; i++)
         buffer[i] = (name[i] < 0x20 || name[i] > 0x7e) ? '?' : (char)name[i];
     buffer[i] = 0;
+}
+
+/* One value out of the process's Windows environment, which lives in the PEB
+   as a UNICODE `NAME=VALUE` block ending in an empty entry. Steam puts
+   SteamAppId and SteamGameId there when it launches a game; the unix environ
+   the process inherited carries only what the app itself exported. */
+static int peb_environment_value(const char *name, char *buffer, size_t size)
+{
+    const RTL_USER_PROCESS_PARAMETERS *params = RtlGetCurrentPeb()->ProcessParameters;
+    size_t name_len = strlen(name);
+    const WCHAR *entry;
+    size_t i;
+
+    buffer[0] = 0;
+    if (!params || !params->Environment) return 0;
+    for (entry = params->Environment; *entry; entry += wcslen(entry) + 1)
+    {
+        for (i = 0; i < name_len; i++)
+        {
+            WCHAR c = entry[i];
+
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c != (WCHAR)tolower((unsigned char)name[i])) break;
+        }
+        if (i < name_len || entry[i] != '=') continue;
+        entry += name_len + 1;
+        for (i = 0; i + 1 < size && entry[i]; i++)
+            buffer[i] = (entry[i] < 0x20 || entry[i] > 0x7e) ? '?' : (char)entry[i];
+        buffer[i] = 0;
+        return buffer[0] != 0;
+    }
+    return 0;
 }
 
 /* The engine directory this winemac.so was loaded out of. A packaged engine
@@ -180,7 +213,7 @@ static void note_exit(void)
 
 void sevo_provenance_init(int presenter_on, const char *upscaler)
 {
-    char engine_dir[PATH_MAX], engine[NAME_MAX], exe[NAME_MAX];
+    char engine_dir[PATH_MAX], engine[NAME_MAX], exe[NAME_MAX], steam_appid[32];
     char renderer[64], toolkit[64], d3d11[80], d3d12[80], dxgi[80];
     const char *appid, *msync, *log;
 
@@ -194,7 +227,10 @@ void sevo_provenance_init(int presenter_on, const char *upscaler)
     image_basename(exe, sizeof(exe));
     engine_paths(engine_dir, sizeof(engine_dir), engine, sizeof(engine));
     if (!engine[0]) snprintf(engine, sizeof(engine), "unknown");
-    if (!(appid = getenv("SteamAppId")) && !(appid = getenv("SteamGameId"))) appid = "none";
+    if (peb_environment_value("SteamAppId", steam_appid, sizeof(steam_appid)) ||
+        peb_environment_value("SteamGameId", steam_appid, sizeof(steam_appid)))
+        appid = steam_appid;
+    else if (!(appid = getenv("SteamAppId")) && !(appid = getenv("SteamGameId"))) appid = "none";
     if (!(msync = getenv("WINEMSYNC"))) msync = "0";
 
     renderer_record(engine_dir, "renderer", renderer, sizeof(renderer));
