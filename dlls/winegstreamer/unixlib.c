@@ -25,8 +25,11 @@
 #include "config.h"
 
 #include <assert.h>
+#include <dlfcn.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #include <gst/gst.h>
 #include <gst/video/video.h>
@@ -256,6 +259,44 @@ static ULONG popcount(ULONG val)
 #endif
 }
 
+/* Point GStreamer at the plugins the engine is packaged with. A packaged engine
+   keeps them at <engine>/wine/lib/gstreamer-1.0, beside the dylibs this module
+   links, and this module at <engine>/wine/lib/wine/<arch>/winegstreamer.so. The
+   search path is replaced rather than extended: a plugin from a GStreamer the
+   host installed is built against that installation's libraries, and loading it
+   beside ours gives one process two copies of libgstreamer. Values already in
+   the environment win, so bottle.env can still redirect the search. */
+static void set_plugin_path(void)
+{
+    static const char marker[] = "/lib/wine/";
+    const char *self, *at, *found = NULL;
+    char path[PATH_MAX], *prefix;
+    Dl_info info;
+    size_t len;
+
+    if (!dladdr((void *)set_plugin_path, &info) || !(self = info.dli_fname)) return;
+    for (at = self; (at = strstr(at, marker)); at++) found = at;
+    if (!found) return;
+
+    len = (size_t)(found - self);
+    if (len + sizeof("/lib/gstreamer-1.0") > sizeof(path)) return;
+    memcpy(path, self, len);
+    snprintf(path + len, sizeof(path) - len, "/lib/gstreamer-1.0");
+    if (access(path, R_OK)) return;
+
+    setenv("GST_PLUGIN_SYSTEM_PATH", path, FALSE);
+    setenv("GST_PLUGIN_PATH", "", FALSE);
+
+    /* The registry caches which plugin supplies which element. Keeping it in the
+       prefix keys it to one engine, so switching engines rescans instead of
+       reading a cache that names plugins at paths the new engine does not have. */
+    if ((prefix = getenv("WINEPREFIX")) && *prefix)
+    {
+        snprintf(path, sizeof(path), "%s/.sevo/gstreamer-registry.x86_64.bin", prefix);
+        setenv("GST_REGISTRY", path, FALSE);
+    }
+}
+
 NTSTATUS wg_init_gstreamer(void *arg)
 {
     struct wg_init_gstreamer_params *params = arg;
@@ -274,6 +315,8 @@ NTSTATUS wg_init_gstreamer(void *arg)
     if (params->err_on)
         setenv("GST_DEBUG", "1", FALSE);
     setenv("GST_DEBUG_NO_COLOR", "1", FALSE);
+
+    set_plugin_path();
 
     /* GStreamer installs a temporary SEGV handler when it loads plugins
      * to initialize its registry calling exit(-1) when any fault is caught.

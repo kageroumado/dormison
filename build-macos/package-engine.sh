@@ -88,6 +88,61 @@ for d in gecko mono; do
     [ -d "$LIVE/wine/share/wine/$d" ] && cp -R "$LIVE/wine/share/wine/$d" "$OUT/wine/share/wine/$d"
 done
 
+# --- GStreamer, which Media Foundation reaches through winegstreamer.
+# The plugins named here are the ones a game's video and audio go through;
+# everything else they link is found by walking their load commands, so a
+# version that splits a library differently still packages completely.
+# Upstream ships universal binaries and the engine runs x86_64, so each file
+# is thinned on the way in. Install names are already @rpath-relative and the
+# plugins carry an @loader_path/.. rpath, which is why libraries land flat in
+# wine/lib and plugins one directory below it: nothing needs rewriting. ---
+GST="$ROOT/gstreamer"
+if [ -d "$GST/lib/gstreamer-1.0" ]; then
+    echo "==> GStreamer plugins and libraries"
+    GST_PLUGINS="coreelements typefindfunctions audioconvert audioresample \
+videoconvertscale videofilter app playback isomp4 audioparsers videoparsersbad \
+wavparse id3demux avi matroska vpx opus vorbis ogg flac mpg123 theora asf \
+applemedia deinterlace libav"
+    queue=""
+    for p in $GST_PLUGINS; do
+        f="$GST/lib/gstreamer-1.0/libgst$p.dylib"
+        [ -f "$f" ] || { echo "    missing plugin $p"; exit 1; }
+        queue="$queue $f"
+    done
+    seen=""
+    while [ -n "$queue" ]; do
+        next=""
+        for f in $queue; do
+            base="$(basename "$f")"
+            case " $seen " in *" $base "*) continue ;; esac
+            seen="$seen $base"
+            # A name the engine already carries stays the engine's: libz, libbz2,
+            # libintl and libMoltenVK are shared with wine itself, and a second
+            # copy under the same install name would be the one some modules got.
+            case "$f" in
+                */gstreamer-1.0/*) dest="$OUT/wine/lib/gstreamer-1.0" ;;
+                *) dest="$OUT/wine/lib" ;;
+            esac
+            mkdir -p "$dest"
+            if [ -e "$OUT/wine/lib/$base" ] && [ "$dest" = "$OUT/wine/lib" ]; then
+                echo "    $base: the engine's own copy is kept"
+            else
+                lipo "$f" -thin x86_64 -output "$dest/$base" 2>/dev/null || cp "$f" "$dest/$base"
+                codesign --force --sign - --timestamp=none "$dest/$base" 2>/dev/null || true
+            fi
+            for dep in $(otool -L "$f" | tail -n +2 | awk '{print $1}' | sed -n 's|^@rpath/||p'); do
+                case " $seen " in *" $dep "*) continue ;; esac
+                [ -f "$GST/lib/$dep" ] && next="$next $GST/lib/$dep"
+            done
+        done
+        queue="$next"
+    done
+    FEATURES='"env-files", "discord-bridge", "media"'
+else
+    echo "warning: no GStreamer at $GST — run build-macos/fetch-gstreamer.sh; video stays silent and black"
+    FEATURES='"env-files", "discord-bridge"'
+fi
+
 # --- pieces DXMT and D3DMetal contribute that a wine build does not produce ---
 # winemetal is DXMT's Metal backend, shipped as a matched .dll/.so pair; nvngx and nvapi64
 # likewise come from DXMT. The ICD manifest points the Vulkan loader at libMoltenVK.
@@ -173,7 +228,7 @@ cat > "$OUT/engine-info.json" <<EOF
   "d3dmetal": "Apple Game Porting Toolkit payloads installed by the app under d3dmetal/",
   "sync": "msync (WINEMSYNC=1)",
   "renderers": ["auto", "dxmt", "dxvk", "d3dmetal", "wined3d"],
-  "features": ["env-files", "discord-bridge"]
+  "features": [$FEATURES]
 }
 EOF
 

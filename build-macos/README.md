@@ -12,6 +12,7 @@ $DORMISON_BUILD/
   wine-src -> <this repository>            (symlink)
   deps/         dependency headers and dylibs (Intel Homebrew bottles, extracted)
   deps-raw/     the bottles as downloaded
+  gstreamer/    GStreamer, universal, from upstream's macOS packages
   wine-staging/ the staging patch tree the base commit was made from
   build/        configure output and objects; incremental
   stage/        `make install-lib` output that package-engine.sh assembles from
@@ -25,9 +26,9 @@ clang for the unix side, bison 3 ahead of the system one on `PATH`
 (`brew install mingw-w64 bison`), and the Intel dependency bottles in
 `deps/`.
 
-The dependencies need no x86_64 Homebrew. Only libinotify (`winebus.so`,
-`wineserver`) is linked at build time — ffmpeg and gstreamer would be, and
-the configure line below leaves them out; everything else — freetype, gnutls, MoltenVK,
+The dependencies need no x86_64 Homebrew. libinotify (`winebus.so`,
+`wineserver`) and GStreamer (`winegstreamer.so`) are linked at build time;
+everything else — freetype, gnutls, MoltenVK,
 the Vulkan loader, libpng, jpeg-turbo, mpg123, gettext and gnutls's own
 dependencies — is `dlopen`ed by soname at runtime, so configure needs only
 their headers plus an x86_64 dylib to read the soname from. Fetch the
@@ -48,10 +49,15 @@ CPPFLAGS="-I$W/deps/include" \
 LDFLAGS="-L$W/deps/lib -Wl,-rpath,@loader_path/../lib -Wl,-rpath,@loader_path/../../" \
 PKG_CONFIG=/usr/bin/false \
 FREETYPE_CFLAGS="-I$W/deps/include/freetype2" FREETYPE_LIBS="-L$W/deps/lib -lfreetype" \
+GSTREAMER_CFLAGS="$(PKG_CONFIG_LIBDIR=$W/gstreamer/lib/pkgconfig pkg-config --cflags \
+  gstreamer-1.0 gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-tag-1.0)" \
+GSTREAMER_LIBS="$(PKG_CONFIG_LIBDIR=$W/gstreamer/lib/pkgconfig pkg-config --libs \
+  gstreamer-1.0 gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-tag-1.0 | \
+  sed 's/-Wl,-rpath,[^ ]*//g')" \
 OBJC=gcc PATH="/opt/homebrew/opt/bison/bin:$PATH" \
 ../wine-src/configure --build=x86_64-apple-darwin$(uname -r) --host=x86_64-apple-darwin$(uname -r) \
   --enable-archs=i386,x86_64 --enable-win64 --disable-tests --without-x \
-  --without-gstreamer --without-ffmpeg --without-sdl --without-oss --without-alsa \
+  --with-gstreamer --without-ffmpeg --without-sdl --without-oss --without-alsa \
   --without-pulse --without-dbus --without-udev --without-usb --without-v4l2 \
   --without-gphoto --without-krb5 --without-netapi --without-fontconfig \
   --without-gssapi --without-opengl --without-capi --without-cups --without-pcap \
@@ -62,7 +68,17 @@ Configure reads every dependency from `deps/`. With
 `pkg-config` or `brew` reachable, configure resolves FreeType to Homebrew's
 arm64 build and `sfnt2fon` fails to link for x86_64; the two `FREETYPE_*`
 variables and the disabled `pkg-config` keep configure on `deps/` whatever
-the shell's PATH carries.
+the shell's PATH carries. GStreamer is the one dependency `deps/` does not
+hold: `build-macos/fetch-gstreamer.sh` puts upstream's universal packages in
+`gstreamer/`, and the two `GSTREAMER_*` variables read that tree through a
+`PKG_CONFIG_LIBDIR` scoped to the command substitution, so the disabled
+`pkg-config` inside configure still sees nothing else. The `sed` drops the
+`-Wl,-rpath` that the relocatable `.pc` files emit: it names this machine's
+build tree, and `winegstreamer.so` would carry that path for the life of the
+engine. The engine's own `@loader_path/../../` reaches the same libraries.
+Run the fetch script before configuring; without it configure builds no
+`winegstreamer` and games that play a video through Media Foundation get a
+black screen.
 
 ## The driver's Swift half
 

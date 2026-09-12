@@ -3,6 +3,58 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r7
+
+Media: the engine ships `winegstreamer` and the GStreamer it needs, so Media
+Foundation has a source and a decoder. Without them Wine's source resolver
+falls through every registered byte-stream handler to the GStreamer one, fails
+to create it, and returns `MF_E_UNSUPPORTED_BYTESTREAM_TYPE` — which is what a
+Unity game playing an intro video reports as a black screen. The engine
+declares `media` in `engine-info.json`'s `features`.
+
+- The plugin set is the one a game's video goes through: `isomp4` and
+  `matroska` for the container, `videoparsersbad` and `audioparsers` for the
+  elementary streams, `applemedia` for VideoToolbox, `libav` for the audio
+  codecs, and `vpx`, `opus`, `vorbis`, `flac`, `mpg123`, `theora`, `asf`, `avi`
+  and `wavparse` beside them. H.264 decodes on the GPU: `decodebin` picks
+  `vtdec_hw` on its own.
+- `libav` carries the AAC decoder. Upstream's `applemedia` exposes
+  VideoToolbox for video but no AudioToolbox decoder, and nothing else in the
+  tree decodes AAC, so an MP4 whose audio pad cannot link takes the whole
+  pipeline down with it.
+- Everything shipped is LGPL. The FFmpeg inside `libav` reports `LGPL version
+  2.1 or later` from `avutil_license`, `avcodec_license` and `avformat_license`,
+  built with `nonfree` and `version3` disabled and no GPL option; cerbero's
+  `recipes/ffmpeg.recipe` declares `License.LGPLv2_1Plus` to match. The GPL
+  plugins live in packages this build never merges — `a52dec` and `dtsdec` in
+  codecs-gpl, `x264` and `x265` in codecs-gpl-restricted, `dvdread` and
+  `resindvd` in dvd-gpl — and no packaged library links `liba52`, `libdca`,
+  `libx264`, `libx265` or `libdvdread`.
+- The libraries land flat in `wine/lib` and the plugins one directory below.
+  Upstream's install names are already `@rpath`-relative and its plugins carry
+  an `@loader_path/..` rpath, so the tree is relocatable as it arrives.
+  `libz`, `libbz2`, `libintl` and `libMoltenVK` stay the engine's own: they are
+  shared with wine itself, and a second file under the same install name would
+  be the one some modules resolved to.
+- `winegstreamer` finds its plugins from its own path rather than from the
+  environment, so a bottle needs no new variables and a GStreamer the host has
+  installed is not searched. A plugin built against another installation would
+  bring that installation's `libgstreamer` into the process beside ours.
+- The registry that caches which plugin supplies which element is written
+  under the prefix, so switching engines rescans rather than reading a cache
+  naming paths the new engine does not have.
+
+- Provenance: `sevo:run` carries the Steam app id. Steam puts
+  `SteamAppId` and `SteamGameId` in the child's **Windows** environment, which
+  lives in the PEB's process parameters; the unix environ a wine process
+  inherits never sees them, so every line read `appid=none`. The PEB block is
+  read first and the unix environment answers for the app's own `SEVO_*`
+  launches.
+- An unrecoverable stack overflow is followed by the addresses the spent stack
+  repeats and how often. A thread that recursed writes the same return address
+  once per frame, so the counts name the loop, and `WINEDEBUG=+loaddll` in the
+  same run names the module it sits in.
+
 ## r6
 
 Discord: `sevo-discord-bridge.exe` sits in the engine directory and serves
