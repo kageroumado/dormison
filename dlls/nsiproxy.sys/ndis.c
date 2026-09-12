@@ -62,6 +62,9 @@
 #ifdef HAVE_NET_IF_TYPES_H
 #include <net/if_types.h>
 #endif
+#ifdef __APPLE__
+#include <net/if_media.h>
+#endif
 
 #ifdef HAVE_LINUX_WIRELESS_H
 #include <linux/wireless.h>
@@ -373,6 +376,28 @@ static void ifinfo_fill_dynamic( struct if_entry *entry, struct nsi_ndis_ifinfo_
             if (fgetc( fp ) == '1') data->media_conn_state = MediaConnectStateConnected;
             else data->media_conn_state = MediaConnectStateDisconnected;
             fclose( fp );
+        }
+    }
+#elif defined(__APPLE__) && defined(SIOCGIFMEDIA)
+    {
+        /* macOS keeps an unplugged port, a Thunderbolt bridge member or an
+         * AirPlay interface IFF_UP|IFF_RUNNING and says "status: inactive"
+         * through the media request instead. Windows reports such an
+         * interface as media-disconnected and operationally down, and a
+         * client walking the adapter list (Steam's network device manager
+         * among them) treats an up-and-connected adapter without an address
+         * as a network still coming up. An interface with no media at all
+         * — the loopback, a tunnel — keeps the connected state it had. */
+        struct ifmediareq ifmr;
+
+        memset( &ifmr, 0, sizeof(ifmr) );
+        memcpy( ifmr.ifm_name, entry->if_unix_name, name_len + 1 );
+        data->media_conn_state = MediaConnectStateConnected;
+        if (!ioctl( fd, SIOCGIFMEDIA, &ifmr ) && (ifmr.ifm_status & IFM_AVALID) && !(ifmr.ifm_status & IFM_ACTIVE))
+        {
+            data->media_conn_state = MediaConnectStateDisconnected;
+            data->flags.not_media_conn = 1;
+            if (data->oper_status == IfOperStatusUp) data->oper_status = IfOperStatusDown;
         }
     }
 #else
