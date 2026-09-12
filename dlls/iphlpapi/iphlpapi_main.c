@@ -1017,6 +1017,31 @@ err:
     return err;
 }
 
+/* Windows' automatic interface metric, by link speed (the table in KB299540
+ * as it stands for Windows 10). A route whose metric the platform does not
+ * report — macOS keeps every route's hop count at zero — would otherwise
+ * leave the adapter's metric at the ~0 sentinel, which reads as "no route"
+ * to a program that ranks adapters by it. */
+static ULONG automatic_metric( ULONG64 speed )
+{
+    if (speed > 200000000000ull) return 5;
+    if (speed > 20000000000ull) return 10;
+    if (speed > 2000000000ull) return 15;
+    if (speed > 200000000ull) return 25;
+    if (speed > 20000000ull) return 35;
+    if (speed > 2000000ull) return 45;
+    if (speed > 200000ull) return 55;
+    return 65;
+}
+
+static BOOL gateway_listed( const IP_ADAPTER_GATEWAY_ADDRESS *first, const SOCKADDR_INET *addr, DWORD size )
+{
+    const IP_ADAPTER_GATEWAY_ADDRESS *gw;
+    for (gw = first; gw; gw = gw->Next)
+        if (gw->Address.iSockaddrLength == size && !memcmp( gw->Address.lpSockaddr, addr, size )) return TRUE;
+    return FALSE;
+}
+
 static DWORD gateway_and_prefix_addresses_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG family, ULONG flags )
 {
     struct nsi_ipv4_forward_key *key4;
@@ -1028,6 +1053,7 @@ static DWORD gateway_and_prefix_addresses_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG
     DWORD sockaddr_size = (family == AF_INET) ? sizeof(SOCKADDR_IN) : sizeof(SOCKADDR_IN6);
     SOCKADDR_INET sockaddr;
     NET_LUID *luid;
+    BOOL routed;
     void *key;
 
     err = NsiAllocateAndGetTable( 1, ip_module_id( family ), NSI_IP_FORWARD_TABLE, &key, key_size,
@@ -1044,12 +1070,14 @@ static DWORD gateway_and_prefix_addresses_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG
         for (prefix_next = &aa->FirstPrefix; *prefix_next; prefix_next = &(*prefix_next)->Next)
             ;
 
+        routed = FALSE;
         for (i = 0; i < count; i++)
         {
             key4 = (struct nsi_ipv4_forward_key *)key + i;
             key6 = (struct nsi_ipv6_forward_key *)key + i;
             luid = (family == AF_INET) ? &key4->luid : &key6->luid;
             if (luid->Value != aa->Luid.Value) continue;
+            routed = TRUE;
 
             if (rw[i].metric)
             {
@@ -1078,7 +1106,10 @@ static DWORD gateway_and_prefix_addresses_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG
                     }
                 }
 
-                if (sockaddr.si_family)
+                /* macOS clones a host route per destination it has talked
+                 * to, each with the same gateway; one gateway address per
+                 * adapter is what Windows lists. */
+                if (sockaddr.si_family && !gateway_listed( aa->FirstGatewayAddress, &sockaddr, sockaddr_size ))
                 {
                     gw = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*gw) + sockaddr_size );
                     if (!gw)
@@ -1136,6 +1167,12 @@ static DWORD gateway_and_prefix_addresses_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG
                     prefix_next = &prefix->Next;
                 }
             }
+        }
+
+        if (routed)
+        {
+            if (family == AF_INET && aa->Ipv4Metric == ~0u) aa->Ipv4Metric = automatic_metric( aa->TransmitLinkSpeed );
+            else if (family == AF_INET6 && aa->Ipv6Metric == ~0u) aa->Ipv6Metric = automatic_metric( aa->TransmitLinkSpeed );
         }
         aa = aa->Next;
     }
