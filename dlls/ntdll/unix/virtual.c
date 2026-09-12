@@ -4712,6 +4712,45 @@ done:
 }
 
 
+/* How many repeated addresses an exhausted stack is summarized by. */
+#define STACK_TRACE_SLOTS 6
+
+/***********************************************************************
+ *           note_stack_repeats
+ *
+ * The addresses a spent stack repeats, and how often. A thread that recursed
+ * leaves the same return address once per frame, so the counts name the loop
+ * and `WINEDEBUG=+loaddll` in the same run names the module it sits in. A
+ * thread that merely ran deep leaves nothing repeated.
+ */
+static void note_stack_repeats( const struct thread_stack_info *stack_info )
+{
+    ULONG_PTR value[STACK_TRACE_SLOTS] = { 0 };
+    UINT count[STACK_TRACE_SLOTS] = { 0 };
+    const ULONG_PTR *word, *end;
+    UINT i, min;
+
+    word = (const ULONG_PTR *)ROUND_ADDR( stack_info->limit, sizeof(ULONG_PTR) - 1 );
+    end = (const ULONG_PTR *)stack_info->end;
+    for ( ; word < end; word++)
+    {
+        ULONG_PTR addr = *word;
+
+        if (addr < 0x10000 || addr >= (ULONG_PTR)user_space_limit) continue;
+        if (addr >= (ULONG_PTR)stack_info->start && addr < (ULONG_PTR)stack_info->end) continue;
+        for (i = 0; i < STACK_TRACE_SLOTS; i++) if (count[i] && value[i] == addr) break;
+        if (i < STACK_TRACE_SLOTS) { count[i]++; continue; }
+        for (min = 0, i = 1; i < STACK_TRACE_SLOTS; i++) if (count[i] < count[min]) min = i;
+        if (count[min] && --count[min]) continue;
+        value[min] = addr;
+        count[min] = 1;
+    }
+
+    for (i = 0; i < STACK_TRACE_SLOTS; i++)
+        if (count[i] > 1) ERR( "stack overflow repeats addr %p %u times\n", (void *)value[i], count[i] );
+}
+
+
 /***********************************************************************
  *           virtual_setup_exception
  */
@@ -4741,6 +4780,7 @@ void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t
         UINT diff = stack_info.start + host_page_size - stack;
         ERR( "stack overflow %u bytes addr %p stack %p (%p-%p-%p)\n",
              diff, rec->ExceptionAddress, stack, stack_info.start, stack_info.limit, stack_info.end );
+        note_stack_repeats( &stack_info );
         abort_thread(1);
     }
     else if (stack < stack_info.limit)
