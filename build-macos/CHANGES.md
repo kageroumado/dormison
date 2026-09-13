@@ -3,6 +3,25 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r8
+
+- Provenance reports the renderer that actually drew, read from the modules
+  the process loaded: a D3D9 game in a bottle whose overrides only cover
+  d3d10core/d3d11 falls to wined3d on OpenGL, and its `sevo:gfx` line now says
+  `renderer=wined3d-gl` where it used to repeat the bottle's staged renderer.
+  The `sevo:gfx` header waits for the first present, where the module list can
+  name the back end; DXMT, DXVK and D3DMetal keep their names, since they
+  supply their own d3d DLLs and never load wined3d.
+- wined3d knows the GeForce RTX 5060–5090 and Radeon RX 7600/7800 XT/7900 XT
+  and RX 9070 XT device ids the app assigns a bottle from the Mac's chip, so a
+  `VideoPciDeviceID` override resolves to the card instead of logging
+  `Invalid GPU override 10de:2c05` and falling back to a default.
+- nsiproxy reports an interface whose media is inactive as down rather than
+  connected, so an unplugged port or Apple-internal adapter no longer sorts
+  ahead of the one carrying traffic. iphlpapi gives an adapter with routes the
+  interface metric Windows assigns for its link speed when the platform
+  reports none, and lists each gateway once.
+
 ## r7
 
 Media: the engine ships `winegstreamer` and the GStreamer it needs, so Media
