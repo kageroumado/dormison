@@ -22,12 +22,14 @@
 #ifndef __WINE_SEVO_PROVENANCE_H
 #define __WINE_SEVO_PROVENANCE_H
 
-/* The three `sevo:run`/`sevo:gfx` header lines, and the exit line that
-   follows them when the process leaves through exit(). */
+/* The `sevo:run` line at process start, and the `sevo:gfx` exit line when the
+   process leaves through exit(). The `sevo:gfx` renderer header waits for the
+   first present, where the loaded modules name the renderer that answered. */
 extern void sevo_provenance_init(int presenter_on, const char *upscaler);
 
 /* One presented frame, from the client surface funcs table. The first call
-   prints `first present`; every call counts. */
+   prints the `sevo:gfx` renderer header and `first present`; every call
+   counts. */
 extern void sevo_provenance_note_present(const void *surface);
 
 /* D3DMetal's own present hook: a CLIENT_SURFACE_PRESENTED posted from

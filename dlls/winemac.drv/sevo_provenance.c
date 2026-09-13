@@ -50,6 +50,18 @@ static int gfx_log_on;
 static int layer_off_screen;
 static unsigned long long start_ns;
 
+/* The configured renderer and its neighbours, read once at init. The header
+   line they fill is held back until a frame is drawn, when the module list
+   says which renderer actually answered. */
+static char cfg_renderer[64];
+static char cfg_toolkit[64];
+static char cfg_upscaler[64];
+static char cfg_msync[16];
+static char cfg_d3d11[80];
+static char cfg_d3d12[80];
+static char cfg_dxgi[80];
+static atomic_int header_printed;
+
 static atomic_ullong present_count;
 static atomic_ullong drawable_posted;
 static atomic_ullong presented_executed;
@@ -186,7 +198,7 @@ static void renderer_record(const char *engine_dir, const char *key, char *out, 
     fclose(file);
 }
 
-/* Which renderer answered, when the engine has no `renderer-hashes` yet. The
+/* The configured renderer, when the engine has no `renderer-hashes` yet. The
    overrides separate the two renderers that need them; D3DMetal, wined3d and
    auto all run on builtin resolution and are indistinguishable here. */
 static void renderer_from_overrides(char *out, size_t size)
@@ -198,6 +210,74 @@ static void renderer_from_overrides(char *out, size_t size)
     else if (strstr(overrides, "d3d10core,d3d11")) snprintf(out, size, "dxmt");
 }
 
+/* Whether a module of this base name is resident, walking the loader's
+   in-memory module list. The name is ASCII; the base names are UTF-16, so
+   compare code unit by code unit. Match the whole name so `d3d9.dll` does not
+   match `d3d9on12.dll`. */
+static int module_loaded(const char *name)
+{
+    const PEB_LDR_DATA *ldr = RtlGetCurrentPeb()->LdrData;
+    const LIST_ENTRY *head, *entry;
+    size_t i, len = strlen(name);
+
+    if (!ldr) return 0;
+    head = &ldr->InMemoryOrderModuleList;
+    for (entry = head->Flink; entry && entry != head; entry = entry->Flink)
+    {
+        const LDR_DATA_TABLE_ENTRY *mod =
+            CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+        const WCHAR *base = mod->BaseDllName.Buffer;
+
+        if (!base || mod->BaseDllName.Length != len * sizeof(WCHAR)) continue;
+        for (i = 0; i < len; i++)
+        {
+            WCHAR a = base[i];
+            char b = name[i];
+
+            if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+            if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+            if (a != (WCHAR)(unsigned char)b) break;
+        }
+        if (i == len) return 1;
+    }
+    return 0;
+}
+
+/* The renderer that actually answered, from the modules the process loaded.
+   D3DMetal, DXMT and DXVK each supply their own d3d DLLs and never load
+   Wine's wined3d; a title that fell to wined3d — a D3D9 game in a bottle whose
+   overrides only cover d3d10core/d3d11, say — is the one case the configured
+   name gets wrong. When wined3d is resident, name its display back end. */
+static void actual_renderer(char *out, size_t size)
+{
+    if (module_loaded("wined3d.dll"))
+    {
+        if (module_loaded("opengl32.dll")) snprintf(out, size, "wined3d-gl");
+        else if (module_loaded("winevulkan.dll") || module_loaded("vulkan-1.dll"))
+            snprintf(out, size, "wined3d-vulkan");
+        else snprintf(out, size, "wined3d");
+        return;
+    }
+    snprintf(out, size, "%s", cfg_renderer);
+}
+
+/* The `sevo:gfx` header, emitted once — at the first present, when the module
+   list can name the renderer that drew, or at exit for a process that never
+   presented a frame. */
+static void note_gfx_header(void)
+{
+    char renderer[64];
+    int expected = 0;
+
+    if (!atomic_compare_exchange_strong(&header_printed, &expected, 1)) return;
+    actual_renderer(renderer, sizeof(renderer));
+    note("renderer=%s toolkit=%s presenter=%s upscaler=%s msync=%s",
+         renderer, cfg_toolkit, layer_off_screen ? "on" : "off",
+         cfg_upscaler[0] ? cfg_upscaler : "off", cfg_msync);
+    note("d3d11=%.*s d3d12=%.*s dxgi=%.*s",
+         SEVO_HASH_CHARS, cfg_d3d11, SEVO_HASH_CHARS, cfg_d3d12, SEVO_HASH_CHARS, cfg_dxgi);
+}
+
 static void note_counters(void)
 {
     note("d3dmetal posted=%llu executed=%llu",
@@ -207,6 +287,7 @@ static void note_counters(void)
 
 static void note_exit(void)
 {
+    note_gfx_header();
     note("exit presents=%llu", (unsigned long long)atomic_load(&present_count));
     if (gfx_log_on) note_counters();
 }
@@ -214,7 +295,6 @@ static void note_exit(void)
 void sevo_provenance_init(int presenter_on, const char *upscaler)
 {
     char engine_dir[PATH_MAX], engine[NAME_MAX], exe[NAME_MAX], steam_appid[32];
-    char renderer[64], toolkit[64], d3d11[80], d3d12[80], dxgi[80];
     const char *appid, *msync, *log;
 
     if (provenance_on) return;
@@ -232,22 +312,19 @@ void sevo_provenance_init(int presenter_on, const char *upscaler)
         appid = steam_appid;
     else if (!(appid = getenv("SteamAppId")) && !(appid = getenv("SteamGameId"))) appid = "none";
     if (!(msync = getenv("WINEMSYNC"))) msync = "0";
+    snprintf(cfg_msync, sizeof(cfg_msync), "%s", msync);
+    snprintf(cfg_upscaler, sizeof(cfg_upscaler), "%s", upscaler && *upscaler ? upscaler : "off");
 
-    renderer_record(engine_dir, "renderer", renderer, sizeof(renderer));
-    if (!strcmp(renderer, "unknown")) renderer_from_overrides(renderer, sizeof(renderer));
-    renderer_record(engine_dir, "toolkit", toolkit, sizeof(toolkit));
-    renderer_record(engine_dir, "d3d11", d3d11, sizeof(d3d11));
-    renderer_record(engine_dir, "d3d12", d3d12, sizeof(d3d12));
-    renderer_record(engine_dir, "dxgi", dxgi, sizeof(dxgi));
+    renderer_record(engine_dir, "renderer", cfg_renderer, sizeof(cfg_renderer));
+    if (!strcmp(cfg_renderer, "unknown")) renderer_from_overrides(cfg_renderer, sizeof(cfg_renderer));
+    renderer_record(engine_dir, "toolkit", cfg_toolkit, sizeof(cfg_toolkit));
+    renderer_record(engine_dir, "d3d11", cfg_d3d11, sizeof(cfg_d3d11));
+    renderer_record(engine_dir, "d3d12", cfg_d3d12, sizeof(cfg_d3d12));
+    renderer_record(engine_dir, "dxgi", cfg_dxgi, sizeof(cfg_dxgi));
 
     fprintf(stderr, "sevo:run pid=%d exe=%s appid=%s engine=%s\n",
             getpid(), exe[0] ? exe : "unknown", appid, engine);
     fflush(stderr);
-    note("renderer=%s toolkit=%s presenter=%s upscaler=%s msync=%s",
-         renderer, toolkit, presenter_on ? "on" : "off",
-         upscaler && *upscaler ? upscaler : "off", msync);
-    note("d3d11=%.*s d3d12=%.*s dxgi=%.*s",
-         SEVO_HASH_CHARS, d3d11, SEVO_HASH_CHARS, d3d12, SEVO_HASH_CHARS, dxgi);
 
     atexit(note_exit);
 }
@@ -256,9 +333,12 @@ void sevo_provenance_note_present(const void *surface)
 {
     if (!provenance_on) return;
     if (atomic_fetch_add(&present_count, 1) == 0)
+    {
+        note_gfx_header();
         note("first present +%llums surface=%p layer=%s",
              (now_ns() - start_ns) / 1000000ULL, surface,
              layer_off_screen ? "off-screen" : "on-screen");
+    }
 }
 
 void sevo_provenance_note_drawable(void)
