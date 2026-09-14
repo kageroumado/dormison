@@ -3,6 +3,18 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r9
+
+- Provenance names the renderer of a 32-bit game correctly. The `sevo:gfx`
+  header reads the loaded module list to see whether a title fell to wined3d,
+  but the winemac unix half walked only the 64-bit loader list; a wow64 game
+  loads its d3d DLLs on the 32-bit list, so wined3d went unseen and the header
+  repeated the bottle's staged renderer (`renderer=d3dmetal` for a D3D9 game on
+  OpenGL). It now walks the wow64 process's own 32-bit loader list, which
+  shares this address space, and a 32-bit D3D9 game on wined3d reports
+  `renderer=wined3d-gl` as a 64-bit one already did. The header format is
+  unchanged.
+
 ## r8
 
 - Provenance reports the renderer that actually drew, read from the modules
