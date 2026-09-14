@@ -210,37 +210,93 @@ static void renderer_from_overrides(char *out, size_t size)
     else if (strstr(overrides, "d3d10core,d3d11")) snprintf(out, size, "dxmt");
 }
 
+/* The 32-bit loader entry, whose in-memory list a wow64 game's own d3d DLLs
+   live on. winternl.h ships PEB32 / PEB_LDR_DATA32 / LIST_ENTRY32 /
+   UNICODE_STRING32 but not this record; toolhelp.c defines its match. */
+typedef struct
+{
+    LIST_ENTRY32     InLoadOrderLinks;
+    LIST_ENTRY32     InMemoryOrderLinks;
+    LIST_ENTRY32     InInitializationOrderLinks;
+    ULONG            DllBase;
+    ULONG            EntryPoint;
+    ULONG            SizeOfImage;
+    UNICODE_STRING32 FullDllName;
+    UNICODE_STRING32 BaseDllName;
+} SEVO_LDR_ENTRY32;
+
+/* Case-insensitive match of a UTF-16 base name against an ASCII name, whole
+   name so `d3d9.dll` does not match `d3d9on12.dll`. */
+static int base_name_is(const WCHAR *base, USHORT byte_len, const char *name, size_t len)
+{
+    size_t i;
+
+    if (!base || byte_len != len * sizeof(WCHAR)) return 0;
+    for (i = 0; i < len; i++)
+    {
+        WCHAR a = base[i];
+        char b = name[i];
+
+        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+        if (a != (WCHAR)(unsigned char)b) return 0;
+    }
+    return 1;
+}
+
+/* Whether a module of this base name is resident on the wow64 process's 32-bit
+   loader list. The 32-bit PEB shares this address space, so its ULONG pointers
+   dereference directly. A 64-bit process has no WowTebOffset and answers 0. */
+static int module_loaded_wow32(const char *name)
+{
+    const TEB *teb = NtCurrentTeb();
+    const TEB32 *teb32;
+    const PEB32 *peb32;
+    const PEB_LDR_DATA32 *ldr;
+    ULONG head, cur;
+    size_t len = strlen(name);
+
+    if (!teb->WowTebOffset) return 0;
+    teb32 = (const TEB32 *)((const char *)teb + teb->WowTebOffset);
+    if (!(peb32 = (const PEB32 *)(ULONG_PTR)teb32->Peb)) return 0;
+    if (!(ldr = (const PEB_LDR_DATA32 *)(ULONG_PTR)peb32->LdrData)) return 0;
+
+    head = (ULONG)(ULONG_PTR)&ldr->InMemoryOrderModuleList;
+    for (cur = ((const LIST_ENTRY32 *)(ULONG_PTR)head)->Flink; cur && cur != head;
+         cur = ((const LIST_ENTRY32 *)(ULONG_PTR)cur)->Flink)
+    {
+        const SEVO_LDR_ENTRY32 *mod = (const SEVO_LDR_ENTRY32 *)
+            (ULONG_PTR)(cur - offsetof(SEVO_LDR_ENTRY32, InMemoryOrderLinks));
+
+        if (base_name_is((const WCHAR *)(ULONG_PTR)mod->BaseDllName.Buffer,
+                         mod->BaseDllName.Length, name, len))
+            return 1;
+    }
+    return 0;
+}
+
 /* Whether a module of this base name is resident, walking the loader's
-   in-memory module list. The name is ASCII; the base names are UTF-16, so
-   compare code unit by code unit. Match the whole name so `d3d9.dll` does not
-   match `d3d9on12.dll`. */
+   in-memory module list. A 32-bit game loads its d3d DLLs on the 32-bit
+   loader list, which the 64-bit list this code runs on does not carry. */
 static int module_loaded(const char *name)
 {
     const PEB_LDR_DATA *ldr = RtlGetCurrentPeb()->LdrData;
     const LIST_ENTRY *head, *entry;
-    size_t i, len = strlen(name);
+    size_t len = strlen(name);
 
-    if (!ldr) return 0;
-    head = &ldr->InMemoryOrderModuleList;
-    for (entry = head->Flink; entry && entry != head; entry = entry->Flink)
+    if (ldr)
     {
-        const LDR_DATA_TABLE_ENTRY *mod =
-            CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
-        const WCHAR *base = mod->BaseDllName.Buffer;
-
-        if (!base || mod->BaseDllName.Length != len * sizeof(WCHAR)) continue;
-        for (i = 0; i < len; i++)
+        head = &ldr->InMemoryOrderModuleList;
+        for (entry = head->Flink; entry && entry != head; entry = entry->Flink)
         {
-            WCHAR a = base[i];
-            char b = name[i];
+            const LDR_DATA_TABLE_ENTRY *mod =
+                CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
 
-            if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
-            if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
-            if (a != (WCHAR)(unsigned char)b) break;
+            if (base_name_is(mod->BaseDllName.Buffer, mod->BaseDllName.Length, name, len))
+                return 1;
         }
-        if (i == len) return 1;
     }
-    return 0;
+    return module_loaded_wow32(name);
 }
 
 /* The renderer that actually answered, from the modules the process loaded.
