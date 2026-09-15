@@ -78,7 +78,7 @@ MAKE_FUNCPTR(SDL_JoystickInstanceID);
 MAKE_FUNCPTR(SDL_JoystickName);
 MAKE_FUNCPTR(SDL_JoystickNumAxes);
 MAKE_FUNCPTR(SDL_JoystickOpen);
-MAKE_FUNCPTR(SDL_WaitEventTimeout);
+MAKE_FUNCPTR(SDL_PollEvent);
 MAKE_FUNCPTR(SDL_JoystickNumButtons);
 MAKE_FUNCPTR(SDL_JoystickNumBalls);
 MAKE_FUNCPTR(SDL_JoystickNumHats);
@@ -1102,7 +1102,7 @@ NTSTATUS sdl_bus_init(void *args)
     LOAD_FUNCPTR(SDL_JoystickName);
     LOAD_FUNCPTR(SDL_JoystickNumAxes);
     LOAD_FUNCPTR(SDL_JoystickOpen);
-    LOAD_FUNCPTR(SDL_WaitEventTimeout);
+    LOAD_FUNCPTR(SDL_PollEvent);
     LOAD_FUNCPTR(SDL_JoystickNumButtons);
     LOAD_FUNCPTR(SDL_JoystickNumBalls);
     LOAD_FUNCPTR(SDL_JoystickNumHats);
@@ -1191,17 +1191,35 @@ failed:
 NTSTATUS sdl_bus_wait(void *args)
 {
     struct bus_event *result = args;
+    static unsigned int idle_ms;
     SDL_Event event;
 
     /* cleanup previously returned event */
     bus_event_cleanup(result);
 
+    /* SDL_WaitEventTimeout() with no video subsystem sleeps 1 ms between
+     * pumps, which keeps winedevice.exe at ~1000 wakeups/s while idle. Drain
+     * what SDL has queued and sleep SDL_BUS_POLL_MS between empty polls
+     * instead: SDL_PollEvent() pumps the joystick backends itself, and a
+     * Bluetooth pad reports at about 125 Hz. Effects are still checked every
+     * 10 ms of idle, as before. */
+#define SDL_BUS_POLL_MS 4
     do
     {
         if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;
-        if (pSDL_WaitEventTimeout(&event, 10) != 0) process_device_event(&event);
-        else check_all_devices_effects_state();
+        event.type = 0;
+        if (pSDL_PollEvent(&event)) process_device_event(&event);
+        else
+        {
+            usleep(SDL_BUS_POLL_MS * 1000);
+            if ((idle_ms += SDL_BUS_POLL_MS) >= 10)
+            {
+                idle_ms = 0;
+                check_all_devices_effects_state();
+            }
+        }
     } while (event.type != quit_event);
+#undef SDL_BUS_POLL_MS
 
     TRACE("SDL main loop exiting\n");
     bus_event_queue_destroy(&event_queue);
