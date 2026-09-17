@@ -259,18 +259,62 @@ static ULONG popcount(ULONG val)
 #endif
 }
 
-/* Point GStreamer at the plugins the engine is packaged with. A packaged engine
-   keeps them at <engine>/wine/lib/gstreamer-1.0, beside the dylibs this module
-   links, and this module at <engine>/wine/lib/wine/<arch>/winegstreamer.so. The
-   search path is replaced rather than extended: a plugin from a GStreamer the
-   host installed is built against that installation's libraries, and loading it
-   beside ours gives one process two copies of libgstreamer. Values already in
-   the environment win, so bottle.env can still redirect the search. */
+static void set_registry_path(const char *module_path)
+{
+    static const char * const variables[] =
+    {
+        "GST_PLUGIN_SYSTEM_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0",
+        "GST_PLUGIN_PATH", "GST_PLUGIN_PATH_1_0"
+    };
+    char resolved[PATH_MAX];
+    gchar *directory, *registry, *cache_root;
+    GChecksum *checksum;
+    const char *value;
+    unsigned int i;
+
+    if (getenv("GST_REGISTRY") || getenv("GST_REGISTRY_1_0")) return;
+    if (!realpath(module_path, resolved)) return;
+
+    checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    g_checksum_update(checksum, (const guchar *)resolved, strlen(resolved) + 1);
+    for (i = 0; i < ARRAY_SIZE(variables); ++i)
+    {
+        value = getenv(variables[i]);
+        /* An unset versioned path inherits its unversioned counterpart;
+           an empty one explicitly disables that search path. */
+        g_checksum_update(checksum, (const guchar *)(value ? "set" : "unset"), value ? 4 : 6);
+        if (value) g_checksum_update(checksum, (const guchar *)value, strlen(value) + 1);
+    }
+
+#ifdef __APPLE__
+    value = getenv("XDG_CACHE_HOME");
+    cache_root = value && *value ? g_strdup(g_get_user_cache_dir())
+            : g_build_filename(g_get_home_dir(), "Library", "Caches", NULL);
+#else
+    cache_root = g_strdup(g_get_user_cache_dir());
+#endif
+    directory = g_build_filename(cache_root, "dormison", "gstreamer-1.0",
+            g_checksum_get_string(checksum), NULL);
+    g_free(cache_root);
+    g_checksum_free(checksum);
+    if (!g_mkdir_with_parents(directory, 0700))
+    {
+        registry = g_build_filename(directory, "registry.bin", NULL);
+        setenv("GST_REGISTRY", registry, FALSE);
+        g_free(registry);
+    }
+    g_free(directory);
+}
+
+/* Packaged plugins live at <engine>/wine/lib/gstreamer-1.0, beside the dylibs
+   this module links, and this module at <engine>/wine/lib/wine/<arch>/winegstreamer.so.
+   A host-installed plugin may link a second, incompatible copy of GStreamer,
+   so defaults search only the engine's plugins. Explicit environment values win. */
 static void set_plugin_path(void)
 {
     static const char marker[] = "/lib/wine/";
     const char *self, *at, *found = NULL;
-    char path[PATH_MAX], *prefix;
+    char path[PATH_MAX];
     Dl_info info;
     size_t len;
 
@@ -287,14 +331,10 @@ static void set_plugin_path(void)
     setenv("GST_PLUGIN_SYSTEM_PATH", path, FALSE);
     setenv("GST_PLUGIN_PATH", "", FALSE);
 
-    /* The registry caches which plugin supplies which element. Keeping it in the
-       prefix keys it to one engine, so switching engines rescans instead of
-       reading a cache that names plugins at paths the new engine does not have. */
-    if ((prefix = getenv("WINEPREFIX")) && *prefix)
-    {
-        snprintf(path, sizeof(path), "%s/.sevo/gstreamer-registry.x86_64.bin", prefix);
-        setenv("GST_REGISTRY", path, FALSE);
-    }
+    /* Bottles using the same engine and plugin search paths share one scan.
+       The module's canonical path separates engine versions and architectures;
+       GStreamer validates plugin timestamps and sizes when reading the registry. */
+    set_registry_path(self);
 }
 
 NTSTATUS wg_init_gstreamer(void *arg)
