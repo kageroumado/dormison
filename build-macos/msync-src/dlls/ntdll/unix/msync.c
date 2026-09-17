@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -215,10 +216,30 @@ static int *shm_tid_map;
 
 static const mach_msg_bits_t msgh_bits_send = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
 
+static inline void drop_waiter_interest( struct event *obj )
+{
+    int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
+    if (refs < 0)
+        __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
+}
+
+/* Every object of a registration, the alert object included, holds one unit
+ * of interest from the increment in server_register_wait until this drop. */
+static inline void drop_wait_interest( void **objs_shm, void *alert_obj_shm, int count )
+{
+    int i;
+
+    for (i = 0; i < count; i++)
+        drop_waiter_interest( (struct event *)objs_shm[i] );
+
+    if (alert_obj_shm)
+        drop_waiter_interest( (struct event *)alert_obj_shm );
+}
+
 static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, const int *objs,
                                 void **objs_shm, int alert_obj, void *alert_obj_shm, int count )
 {
-    int i, is_mutex;
+    int i, is_mutex, total = count;
     mach_msg_return_t mr;
     __thread static mach_register_message_t message;
 
@@ -239,18 +260,22 @@ static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, cons
     {
         struct event *obj = (struct event *)alert_obj_shm;
 
-        message.shm_idx[count++] = alert_obj;
+        message.shm_idx[total++] = alert_obj;
         __atomic_add_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
     }
 
     message.header.msgh_size = sizeof(mach_msg_header_t) +
-                               count * sizeof(unsigned int);
+                               total * sizeof(unsigned int);
 
     mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
                      0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
 
     if (mr != MACH_MSG_SUCCESS)
+    {
         ERR("Failed to send server register wait: %#x\n", mr);
+        /* The server never saw this registration, so there is nothing to remove. */
+        drop_wait_interest( objs_shm, alert_obj ? alert_obj_shm : NULL, count );
+    }
 
     return mr;
 }
@@ -266,25 +291,13 @@ static inline void server_remove_wait( unsigned int msgh_id, const int *objs, vo
     message.header.msgh_bits = msgh_bits_send;
     message.header.msgh_id = msgh_id;
 
-    for (i = 0; i < count; i++)
-    {
-        struct event *obj = (struct event *)objs_shm[i];
+    drop_wait_interest( objs_shm, alert_obj ? alert_obj_shm : NULL, count );
 
-        int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
-        if (refs < 0)
-            __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
+    for (i = 0; i < count; i++)
         message.shm_idx[i] = objs[i];
-    }
 
     if (alert_obj)
-    {
-        struct event *obj = (struct event *)alert_obj_shm;
-
-        int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
-        if (refs < 0)
-            __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
         message.shm_idx[count++] = alert_obj;
-    }
 
     message.shm_idx[0] |= (1 << 29);
 
@@ -377,15 +390,9 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
     {
         if (check_shm_contention( objs_shm, alert_obj_shm, count, tid ))
         {
-            int i;
-            for (i = 0; i < count; i++)
-            {
-                struct event *obj = (struct event *)objs_shm[i];
-
-                int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
-                if (refs < 0)
-                    __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
-            }
+            /* The registration is already submitted: the removal makes the
+             * server drop its nodes, and the interest counts drop with it. */
+            server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
             return STATUS_PENDING;
         }
     }
@@ -969,10 +976,12 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
 
         while (1)
         {
-            BOOL abandoned;
+            /* Bit i is set once this attempt consumed objs[i]; a mutex
+             * consumed from the abandoned state also sets was_abandoned. */
+            uint64_t taken, was_abandoned;
 
 tryagain:
-            abandoned = FALSE;
+            taken = was_abandoned = 0;
 
             /* First step: try to wait on each object in sequence. */
 
@@ -981,11 +990,13 @@ tryagain:
                 if (((struct mutex *)objs_shm[i])->msync_type == MSYNC_MUTEX)
                 {
                     struct mutex *mutex = (struct mutex *)objs_shm[i];
+                    int tid;
 
                     if (mutex->tid == current_tid)
                         continue;
 
-                    while (__atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST ))
+                    /* An abandoned mutex (~0) is available to whoever grabs it. */
+                    while ((tid = __atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST )) && tid != ~0)
                     {
                         status = do_single_wait( objs[i], objs_shm[i], alert_obj, alert_obj_shm, timeout ? &end : NULL, current_tid );
                         if (status != STATUS_PENDING)
@@ -1046,8 +1057,9 @@ tryagain:
                         goto tooslow;
                     if (__sync_val_compare_and_swap( &mutex->tid, tid, current_tid ) != tid)
                         goto tooslow;
+                    taken |= (uint64_t)1 << i;
                     if (tid == ~0)
-                        abandoned = TRUE;
+                        was_abandoned |= (uint64_t)1 << i;
                     break;
                 }
                 case MSYNC_SEMAPHORE:
@@ -1063,6 +1075,7 @@ tryagain:
                     }
                     if (!current)
                         goto tooslow;
+                    taken |= (uint64_t)1 << i;
                     break;
                 }
                 case MSYNC_AUTO_EVENT:
@@ -1071,6 +1084,7 @@ tryagain:
                     struct event *event = (struct event *)objs_shm[i];
                     if (!__sync_val_compare_and_swap( &event->signaled, 1, 0 ))
                         goto tooslow;
+                    taken |= (uint64_t)1 << i;
                     break;
                 }
                 default:
@@ -1091,22 +1105,25 @@ tryagain:
                 }
             }
 
-            if (abandoned) return STATUS_ABANDONED;
+            if (was_abandoned) return STATUS_ABANDONED;
 
             return STATUS_SUCCESS;
 
 tooslow:
+            /* Put back only what this attempt consumed, in the state it was
+             * found, and wake the waiters the consumption hid it from. */
             for (--i; i >= 0; i--)
             {
+                if (!(taken & ((uint64_t)1 << i)))
+                    continue;
+
                 switch (((struct event *)objs_shm[i])->msync_type)
                 {
                 case MSYNC_MUTEX:
                 {
                     struct mutex *mutex = (struct mutex *)objs_shm[i];
-                    /* HACK: This won't do the right thing with abandoned
-                     * mutexes, but fixing it is probably more trouble than
-                     * it's worth. */
-                    __atomic_store_n( &mutex->tid, 0, __ATOMIC_SEQ_CST );
+                    int restored = (was_abandoned & ((uint64_t)1 << i)) ? ~0 : 0;
+                    __atomic_store_n( &mutex->tid, restored, __ATOMIC_SEQ_CST );
                     break;
                 }
                 case MSYNC_SEMAPHORE:
@@ -1122,10 +1139,8 @@ tooslow:
                     __atomic_store_n( &event->signaled, 1, __ATOMIC_SEQ_CST );
                     break;
                 }
-                default:
-                    /* doesn't need to be put back */
-                    break;
                 }
+                signal_all( objs_shm[i], objs[i] );
             }
         } /* while (1) */
     } /* else (wait-all) */
