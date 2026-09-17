@@ -613,6 +613,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->machine         = native_machine;
     process->page_size       = get_page_size();
     process->unix_pid        = -1;
+    process->translated      = -1;
     process->exit_code       = STILL_ACTIVE;
     process->running_threads = 0;
     process->user_threads    = 0;

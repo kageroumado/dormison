@@ -74,14 +74,20 @@ static mach_port_t get_process_port( struct process *process )
     return process->trace_data;
 }
 
-static int is_process_translated( const struct process *process )
+/* Whether the process runs under Rosetta. A process never changes, so the
+   kernel is asked once; thread context and memory calls come at GC and
+   debugger rates and must not pay a sysctl each. */
+static int is_process_translated( struct process *process )
 {
     int query[] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, process->unix_pid };
     struct kinfo_proc info;
     size_t size = sizeof(info);
 
-    return !sysctl( query, ARRAY_SIZE(query), &info, &size, NULL, 0 ) &&
-           size == sizeof(info) && (info.kp_proc.p_flag & P_TRANSLATED);
+    if (process->translated >= 0) return process->translated;
+    if (process->unix_pid == -1) return 0;
+    process->translated = !sysctl( query, ARRAY_SIZE(query), &info, &size, NULL, 0 ) &&
+                          size == sizeof(info) && !!(info.kp_proc.p_flag & P_TRANSLATED);
+    return process->translated;
 }
 
 extern kern_return_t bootstrap_register2( mach_port_t bp, name_t service_name, mach_port_t sp, uint64_t flags );

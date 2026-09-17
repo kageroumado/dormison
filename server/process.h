@@ -52,6 +52,7 @@ struct process
     unsigned short       machine;         /* client machine type */
     unsigned int         page_size;       /* client page size */
     int                  unix_pid;        /* Unix pid for final SIGKILL */
+    int                  translated;      /* runs under Rosetta: -1 until asked, then 0 or 1 */
     int                  exit_code;       /* process exit code */
     int                  running_threads; /* number of threads running in this process */
     int                  user_threads;    /* number of user threads running in this process */
