@@ -47,6 +47,7 @@
 #include <mach/thread_act.h>
 #include <mach/mach_vm.h>
 #include <servers/bootstrap.h>
+#include <sys/proc.h>
 
 static mach_port_t server_mach_port;
 
@@ -73,23 +74,14 @@ static mach_port_t get_process_port( struct process *process )
     return process->trace_data;
 }
 
-static int is_rosetta( void )
+static int is_process_translated( const struct process *process )
 {
-    static int rosetta_status, did_check = 0;
-    if (!did_check)
-    {
-        /* returns 0 for native process or on error, 1 for translated */
-        int ret = 0;
-        size_t size = sizeof(ret);
-        if (sysctlbyname( "sysctl.proc_translated", &ret, &size, NULL, 0 ) == -1)
-            rosetta_status = 0;
-        else
-            rosetta_status = ret;
+    int query[] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, process->unix_pid };
+    struct kinfo_proc info;
+    size_t size = sizeof(info);
 
-        did_check = 1;
-    }
-
-    return rosetta_status;
+    return !sysctl( query, ARRAY_SIZE(query), &info, &size, NULL, 0 ) &&
+           size == sizeof(info) && (info.kp_proc.p_flag & P_TRANSLATED);
 }
 
 extern kern_return_t bootstrap_register2( mach_port_t bp, name_t service_name, mach_port_t sp, uint64_t flags );
@@ -184,17 +176,17 @@ void get_thread_context( struct thread *thread, struct context_data *context, un
     mach_port_t port, process_port = get_process_port( thread->process );
     kern_return_t ret;
     unsigned long dr[8];
+#endif
 
-    /* all other regs are handled on the client side */
-    assert( flags == SERVER_CTX_DEBUG_REGISTERS );
-
-    if (is_rosetta())
+    if (is_process_translated( thread->process ))
     {
-        /* getting debug registers of a translated process is not supported cross-process, return all zeroes */
         memset( &context->debug, 0, sizeof(context->debug) );
         context->flags |= SERVER_CTX_DEBUG_REGISTERS;
         return;
     }
+#if defined(__i386__) || defined(__x86_64__)
+    /* all other regs are handled on the client side */
+    assert( flags == SERVER_CTX_DEBUG_REGISTERS );
 
     if (thread->unix_pid == -1 || !process_port ||
         mach_port_extract_right( process_port, thread->unix_tid,
@@ -270,18 +262,16 @@ void set_thread_context( struct thread *thread, const struct context_data *conte
     mach_port_t port, process_port = get_process_port( thread->process );
     unsigned long dr[8];
     kern_return_t ret;
+#endif
 
-    /* all other regs are handled on the client side */
-    assert( flags == SERVER_CTX_DEBUG_REGISTERS );
-
-    if (is_rosetta())
+    if (is_process_translated( thread->process ))
     {
-        /* Setting debug registers of a translated process is not supported cross-process
-         * (and even in-process, setting debug registers never has the desired effect).
-         */
         set_error( STATUS_UNSUCCESSFUL );
         return;
     }
+#if defined(__i386__) || defined(__x86_64__)
+    /* all other regs are handled on the client side */
+    assert( flags == SERVER_CTX_DEBUG_REGISTERS );
 
     if (thread->unix_pid == -1 || !process_port ||
         mach_port_extract_right( process_port, thread->unix_tid,
@@ -481,7 +471,7 @@ int write_process_memory( struct process *process, client_ptr_t ptr, data_size_t
          * For now we will just have to ignore failures due to the wrong
          * protection here.
          */
-        if (!is_rosetta() && !(info.protection & VM_PROT_WRITE))
+        if (!is_process_translated( process ) && !(info.protection & VM_PROT_WRITE))
         {
             ret = KERN_PROTECTION_FAILURE;
             goto out;
@@ -509,7 +499,7 @@ int write_process_memory( struct process *process, client_ptr_t ptr, data_size_t
             }
 
             /* FIXME: See the above Rosetta remark. */
-            if (!is_rosetta() && !(info.protection & VM_PROT_WRITE))
+            if (!is_process_translated( process ) && !(info.protection & VM_PROT_WRITE))
             {
                 ret = KERN_PROTECTION_FAILURE;
                 break;

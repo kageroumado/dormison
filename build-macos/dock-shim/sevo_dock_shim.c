@@ -30,8 +30,8 @@
 // this dylib's constructor runs, so a name read in the constructor is the
 // unix loader's path and matches nothing.
 //
-// Built x86_64 (the whole bottle runs under Rosetta); the app injects it
-// with DYLD_INSERT_LIBRARIES.
+// The universal dylib reaches native infrastructure and translated games
+// through DYLD_INSERT_LIBRARIES.
 #include <ApplicationServices/ApplicationServices.h>
 #include <crt_externs.h>
 #include <ctype.h>
@@ -120,11 +120,13 @@ static void chronicle(const char *verb, id window) {
                 ns_title, sel_registerName("UTF8String"));
             if (!title) title = "";
         }
-        // `-frame` returns a 32-byte struct, which the x86_64 ABI passes
-        // through a hidden pointer. Never send it with plain objc_msgSend:
-        // that corrupts the caller's stack and crashes the process.
+#if defined(__x86_64__)
+        // The x86_64 ABI returns CGRect through a hidden pointer.
         ((void (*)(CGRect *, id, SEL))objc_msgSend_stret)(
             &frame, window, sel_registerName("frame"));
+#else
+        frame = ((CGRect (*)(id, SEL))objc_msgSend)(window, sel_registerName("frame"));
+#endif
     }
     struct timeval now;
     gettimeofday(&now, NULL);

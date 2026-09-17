@@ -185,7 +185,7 @@ fi
 
 # --- the dock shim, from this repository's source: it is the engine's face ---
 echo "==> building the dock shim"
-clang -arch x86_64 -O2 -Wall -dynamiclib -framework ApplicationServices \
+clang -arch arm64 -arch x86_64 -O2 -Wall -dynamiclib -framework ApplicationServices \
     -o "$OUT/libsevodockshim.dylib" "$HERE/dock-shim/sevo_dock_shim.c"
 codesign -s - -f "$OUT/libsevodockshim.dylib"
 
