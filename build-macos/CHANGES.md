@@ -3,6 +3,23 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r11
+
+- wineserver is native arm64. The server runs no guest code, so it is the one process
+  in the engine that need not be translated: `build-native-server.sh` builds it in its
+  own arm64 tree with `DORMISON_X86_64_GUEST`, under which the server reports the x86
+  machines a prefix supports and decides per process, once, whether a client runs under
+  Rosetta; libinotify is universal for it and `package-engine.sh` ships both. On this
+  Mac it measures at parity with the translated server (syncprof p99 1.01×, server CPU
+  0.96×; Subnautica 2 at the same 21 fps; Steam's login in the same second), so its case
+  is one fewer Rosetta process, not speed. `engine-info.json` carries `"server"`.
+- winebus is built with SDL again: the IOHID backend alone
+  never delivers an Xbox Wireless Controller over Bluetooth (045E:02E0) to a game, and the
+  SDL backend does. The SDL bus polls instead of waiting, which takes an idle
+  winedevice.exe from ~2.8 % CPU and ~310 wakeups/s to ~0.8 % and ~75/s on her M4 Max.
+- `build-macos/configure.sh` is the README's configure block as a script, so a tree
+  cannot be configured with a different flag set by accident.
+
 ## r10
 
 - A window whose game draws through OpenGL (Direct3D 9 on wined3d, so Unity 4
