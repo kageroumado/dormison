@@ -817,6 +817,14 @@ static NSView* wine_content_view_of(NSWindow* window)
         if (!hadContext)
             [self invalidateHasGLDescendant];
         [(WineWindow*)[self window] updateForGLSubviews];
+
+        /* A drawable ends the window's initial transparency when it attaches,
+           as the Metal view does, and the window is black until the first
+           frame, which is what Windows shows. A game that preloads before its
+           first present otherwise has no visible window for as long as that
+           takes. */
+        [[(WineWindow*)[self window] wineContentView] layer].backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+        [(WineWindow*)[self window] windowDidDrawContent];
     }
 
     - (void) removeGLContext:(WineOpenGLContext*)context
@@ -4492,6 +4500,21 @@ void macdrv_window_surface_drawn(macdrv_window w)
 
     OnMainThreadAsync(^{
         [window windowDidDrawContent];
+    });
+}
+}
+
+/* A drawable's first presented frame ends its window's initial transparency.
+   Resolving the parent on the main thread follows view moves and destruction. */
+void macdrv_view_drawn(macdrv_view v)
+{
+@autoreleasepool
+{
+    NSView* view = (NSView*)v;
+
+    OnMainThreadAsync(^{
+        if ([view.window isKindOfClass:[WineWindow class]])
+            [(WineWindow*)view.window windowDidDrawContent];
     });
 }
 }

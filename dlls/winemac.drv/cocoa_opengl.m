@@ -41,7 +41,7 @@
 
 @implementation WineOpenGLContext
 @dynamic view;
-@synthesize latentView, needsUpdate, needsReattach;
+@synthesize latentView, needsUpdate, needsReattach, needsDrawNotification;
 
     - (void) dealloc
     {
@@ -137,6 +137,7 @@
     - (void) setView:(NSView*)newView
     {
         NSView* oldView = [self view];
+        self.needsDrawNotification = YES;
         if ([NSThread isMainThread])
             [super setView:newView];
         else OnMainThread(^{
@@ -301,6 +302,7 @@ void macdrv_update_opengl_context(macdrv_opengl_context c)
 
     if (context.needsUpdate)
     {
+        context.needsDrawNotification = YES;
         BOOL reattach = context.needsReattach;
         context.needsUpdate = FALSE;
         context.needsReattach = FALSE;
@@ -342,5 +344,10 @@ void macdrv_flush_opengl_context(macdrv_opengl_context c)
 
     macdrv_update_opengl_context(c);
     [context flushBuffer];
+    if (context.needsDrawNotification && context.view)
+    {
+        context.needsDrawNotification = NO;
+        macdrv_view_drawn((macdrv_view)context.view);
+    }
 }
 }

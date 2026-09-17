@@ -26,11 +26,13 @@
     NSView* latentView;
     BOOL needsUpdate;
     BOOL needsReattach;
+    BOOL needsDrawNotification;
 
     GLint backing_size[2];
 }
 
 @property BOOL needsUpdate;
 @property BOOL needsReattach;
+@property BOOL needsDrawNotification;
 
 @end

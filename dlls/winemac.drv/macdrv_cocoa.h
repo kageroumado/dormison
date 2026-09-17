@@ -548,6 +548,7 @@ extern void macdrv_window_set_color_image(macdrv_window w, CGImageRef image, CGR
 extern void macdrv_window_attach_surface(macdrv_window w, void *presenter);
 extern void macdrv_window_detach_surface(macdrv_window w, void *presenter);
 extern void macdrv_window_surface_drawn(macdrv_window w);
+extern void macdrv_view_drawn(macdrv_view v);
 extern void macdrv_window_set_shape_image(macdrv_window w, CGImageRef image);
 extern void macdrv_set_window_shape(macdrv_window w, const CGRect *rects, int count);
 extern void macdrv_set_window_alpha(macdrv_window w, CGFloat alpha);
