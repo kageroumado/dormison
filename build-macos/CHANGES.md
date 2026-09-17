@@ -3,6 +3,37 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r10
+
+- A window whose game draws through OpenGL (Direct3D 9 on wined3d, so Unity 4
+  and most older titles) is opaque and black from the moment its drawable
+  attaches, and its title bar is drawn like any other window's. The Mac driver
+  kept a window fully transparent until its first surface draw, and an OpenGL
+  swap never counted as one: HuniePop preloads its audio for 150 s before its
+  first present and had no visible window for all of it, then a see-through
+  title bar afterwards. The first flush now ends the transparency the way a
+  surface draw does, and a drawable attaching to a shown window ends it at once
+  with a black fill, which is what Windows shows before a first frame.
+- Steam's `WaitingForNetwork` wait is gone. `GetAdaptersAddresses` returned every
+  host interface (32 here), and Steam's login controller asks its device manager
+  for at most ten, so a connected adapter that hashed past the tenth was never
+  seen and the login timed out after 20 s. Adapters are now selected by the
+  requested address family from the protocols attached to the interface
+  (`SIOCGIFPROTOLIST`), which keeps down and unconfigured interfaces the way
+  Windows does and drops the Apple-internal ones that never carry IP. The call
+  is 2.7× faster (1.8 ms against 4.9 ms for Steam's flags), each adapter's DNS
+  query advertises its real buffer capacity, and the synthetic first
+  `NotifyAddrChange` completion r2 introduced for this wait is removed.
+- Bottles on the same engine share one GStreamer plugin registry, keyed by the
+  engine's module path and the effective plugin search paths, so the second
+  bottle opens Media Foundation in 6 ms rather than rescanning; a plugin change
+  still triggers a rescan, and an explicit `GST_REGISTRY` still wins.
+- msync's registration accounting is what the tree already ran: a failed
+  registration drops its interest, an abandoned mutex found on a wait-all
+  attempt is put back abandoned, and a put-back wakes the waiters the attempt
+  hid it from. The `msync-src` copies carry the same fixes so a rebase does
+  not lose them.
+
 ## r9
 
 - Provenance names the renderer of a 32-bit game correctly. The `sevo:gfx`
