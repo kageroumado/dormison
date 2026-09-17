@@ -50,6 +50,10 @@ Bluetooth (`045E:02E0`) to a game, and the SDL backend does.
 
 ## Configure
 
+`build-macos/configure.sh` runs exactly this block against `$DORMISON_BUILD`; use it
+rather than retyping the flags, since a tree configured with a different set rebuilds
+everything and can differ in what it links.
+
 ```bash
 W=${DORMISON_BUILD:-$HOME/dormison-build}
 cd $W/build && \
@@ -255,3 +259,22 @@ git rebase --onto wine-staging-base-11.17 wine-staging-base main
 
 Resolve the conflicts, reconfigure, build, test the result, and publish
 with `publish-engine.sh`.
+
+## The native server
+
+wineserver runs no guest code, so it is the one process in the engine that need not
+be translated; served natively it takes the Rosetta round trip out of every wait,
+handle and APC a game makes (`bispectral/native-server/RESULTS.md`: p99 0.52×, wall
+0.77×, server CPU 0.71× on syncprof). `build-native-server.sh` configures a second,
+arm64 tree for `server/` under `$DORMISON_BUILD/server-native` with
+`-DDORMISON_X86_64_GUEST`, which makes `server/registry.c` report the x86 machines,
+and builds a universal libinotify beside it; `server/mach.c` decides per process
+whether a client is translated. `package-engine.sh` takes that server and that
+libinotify when the tree exists, and `engine-info.json` says `"server": "arm64"`.
+
+```bash
+build-macos/build-native-server.sh            # once per source change; --reconfigure after a rebase
+```
+
+The x86_64 build's own wineserver stays in `stage/` untouched, so an engine packaged
+without the native tree is the translated one as before.

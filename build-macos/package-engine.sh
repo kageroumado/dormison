@@ -43,6 +43,7 @@ mkdir -p "$OUT/wine/lib/wine" "$OUT/wine/share"
 
 # --- wine proper, from our build ---
 cp -R "$STAGE/bin" "$OUT/wine/bin"
+
 for a in x86_64-unix x86_64-windows i386-windows; do
     [ -d "$STAGE/lib/wine/$a" ] && cp -R "$STAGE/lib/wine/$a" "$OUT/wine/lib/wine/$a"
 done
@@ -60,6 +61,24 @@ done
 # --- dependency dylibs, from the live engine (built by MacPorts, not rebuilt here) ---
 find "$LIVE/wine/lib" -maxdepth 1 -name '*.dylib' -exec cp -a {} "$OUT/wine/lib/" \;
 cp -R "$LIVE/wine/lib/external" "$OUT/wine/lib/external"
+
+# --- the server, native when build-native-server.sh has built it: it runs no
+# guest code, so it is the one process that need not be translated. Its
+# libinotify is the universal build, which winebus.so shares. ---
+NATIVE_SERVER="$ROOT/server-native/build/server/wineserver"
+if [ -f "$NATIVE_SERVER" ]; then
+    echo "==> native arm64 wineserver"
+    cp "$NATIVE_SERVER" "$OUT/wine/bin/wineserver"
+    cp "$ROOT/server-native/deps/lib/libinotify.0.dylib" "$OUT/wine/lib/libinotify.0.dylib"
+    install_name_tool -id "@rpath/libinotify.0.dylib" "$OUT/wine/lib/libinotify.0.dylib"
+    otool -L "$OUT/wine/bin/wineserver" | awk '/libinotify/ {print $1}' | while read -r dep; do
+        install_name_tool -change "$dep" "@rpath/libinotify.0.dylib" "$OUT/wine/bin/wineserver"
+    done
+    lipo -info "$OUT/wine/lib/libinotify.0.dylib" | sed 's/^/    /'
+    SERVER_ARCH=arm64
+else
+    SERVER_ARCH=x86_64
+fi
 
 # --- every library configure recorded by name: this build dlopens exactly that
 # file (win32u opens SONAME_LIBVULKAN, for one), so a name the live engine
@@ -227,6 +246,7 @@ cat > "$OUT/engine-info.json" <<EOF
   "dxvk": "https://github.com/Gcenx/DXVK-macOS/releases/download/v1.10.3-20230507-repack/dxvk-macOS-async-v1.10.3-20230507-repack-builtin.tar.gz",
   "d3dmetal": "Apple Game Porting Toolkit payloads installed by the app under d3dmetal/",
   "sync": "msync (WINEMSYNC=1)",
+  "server": "$SERVER_ARCH",
   "renderers": ["auto", "dxmt", "dxvk", "d3dmetal", "wined3d"],
   "features": [$FEATURES]
 }
