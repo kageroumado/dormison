@@ -83,10 +83,3 @@ struct nsi_get_notification_params
     NPI_MODULEID module;
     UINT32 table;
 };
-
-struct nsi_interface_state_params
-{
-    NPI_MODULEID module;
-    /* output parameters */
-    BOOL up;
-};

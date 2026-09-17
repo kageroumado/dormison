@@ -988,14 +988,12 @@ static DWORD unicast_addresses_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG family, UL
             {
                 SOCKADDR_IN *in = (SOCKADDR_IN *)addr->Address.lpSockaddr;
                 in->sin_addr = key4->addr;
-                aa->Ipv4Enabled = TRUE;
             }
             else
             {
                 SOCKADDR_IN6 *in6 = (SOCKADDR_IN6 *)addr->Address.lpSockaddr;
                 in6->sin6_addr = key6->addr;
                 in6->sin6_scope_id = dyn[i].scope_id;
-                aa->Ipv6Enabled = TRUE;
             }
             addr->PrefixOrigin = rw[i].prefix_origin;
             addr->SuffixOrigin = rw[i].suffix_origin;
@@ -1224,6 +1222,7 @@ static DWORD dns_info_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG family, ULONG flags
         if (!(flags & GAA_FLAG_SKIP_DNS_SERVER))
         {
             servers = (DNS_ADDR_ARRAY *)buf;
+            size = sizeof(buf);
             for (attempt = 0; attempt < 5; attempt++)
             {
                 err = DnsQueryConfig( query, 0, name, NULL, servers, &size );
@@ -1283,6 +1282,29 @@ static DWORD dns_info_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG family, ULONG flags
     return ERROR_SUCCESS;
 }
 
+static DWORD adapter_family_flags( IP_ADAPTER_ADDRESSES *aa, ULONG family, ULONG flags )
+{
+    struct nsi_ip_interface_key *keys;
+    IP_ADAPTER_ADDRESSES *adapter;
+    DWORD err, count, i;
+
+    err = NsiAllocateAndGetTable( 1, ip_module_id( family ), NSI_IP_INTERFACE_TABLE,
+                                 (void **)&keys, sizeof(*keys), NULL, 0, NULL, 0, NULL, 0, &count, 0 );
+    if (err) return err;
+    for (adapter = aa; adapter; adapter = adapter->Next)
+    {
+        for (i = 0; i < count; i++)
+        {
+            if (adapter->Luid.Value != keys[i].luid.Value) continue;
+            if (family == AF_INET) adapter->Ipv4Enabled = TRUE;
+            else adapter->Ipv6Enabled = TRUE;
+            break;
+        }
+    }
+    NsiFreeTable( keys, NULL, NULL, NULL );
+    return ERROR_SUCCESS;
+}
+
 static DWORD adapters_addresses_alloc( ULONG family, ULONG flags, IP_ADAPTER_ADDRESSES **info, ULONG *count )
 {
     IP_ADAPTER_ADDRESSES *aa = NULL;
@@ -1290,8 +1312,7 @@ static DWORD adapters_addresses_alloc( ULONG family, ULONG flags, IP_ADAPTER_ADD
     struct nsi_ndis_ifinfo_rw *rw;
     struct nsi_ndis_ifinfo_dynamic *dyn;
     struct nsi_ndis_ifinfo_static *stat;
-    DWORD err, i, needed;
-    GUID guid;
+    DWORD err, i, needed, used;
     char *str_ptr;
 
     err = NsiAllocateAndGetTable( 1, &NPI_MS_NDIS_MODULEID, NSI_NDIS_IFINFO_TABLE, (void **)&luids, sizeof(*luids),
@@ -1321,8 +1342,7 @@ static DWORD adapters_addresses_alloc( ULONG family, ULONG flags, IP_ADAPTER_ADD
         aa[i].Length = sizeof(*aa);
         aa[i].IfIndex = stat[i].if_index;
         if (i < *count - 1) aa[i].Next = aa + i + 1;
-        ConvertInterfaceLuidToGuid( luids + i, &guid );
-        ConvertGuidToStringA( &guid, str_ptr, CHARS_IN_GUID );
+        ConvertGuidToStringA( &stat[i].if_guid, str_ptr, CHARS_IN_GUID );
         aa[i].AdapterName = str_ptr;
         str_ptr += (CHARS_IN_GUID + 1) & ~1;
         if_counted_string_copy( (WCHAR *)str_ptr, ARRAY_SIZE(stat[i].descr.String), &stat[i].descr );
@@ -1342,6 +1362,26 @@ static DWORD adapters_addresses_alloc( ULONG family, ULONG flags, IP_ADAPTER_ADD
         aa[i].Luid = luids[i];
         aa[i].NetworkGuid = rw[i].network_guid;
         aa[i].ConnectionType = stat[i].conn_type;
+    }
+
+    err = call_families( adapter_family_flags, aa, AF_UNSPEC, flags );
+    if (err) goto err;
+
+    if (!(flags & GAA_FLAG_INCLUDE_ALL_INTERFACES))
+    {
+        for (i = 0, used = 0; i < *count; i++)
+        {
+            if ((family == AF_INET6 || !aa[i].Ipv4Enabled) &&
+                (family == AF_INET || !aa[i].Ipv6Enabled)) continue;
+            aa[used++] = aa[i];
+        }
+        *count = used;
+        if (!used)
+        {
+            err = ERROR_NO_DATA;
+            goto err;
+        }
+        for (i = 0; i < used; i++) aa[i].Next = i + 1 < used ? aa + i + 1 : NULL;
     }
 
     if (!(flags & GAA_FLAG_SKIP_UNICAST))

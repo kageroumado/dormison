@@ -2149,6 +2149,98 @@ static void test_GetAdaptersAddresses(void)
     free(ptr);
 }
 
+static IP_ADAPTER_ADDRESSES *get_family_adapters( ULONG family, ULONG flags )
+{
+    IP_ADAPTER_ADDRESSES *adapters;
+    ULONG size = 15000, ret;
+
+    adapters = malloc( size );
+    while ((ret = GetAdaptersAddresses( family, flags, NULL, adapters, &size )) == ERROR_BUFFER_OVERFLOW)
+        adapters = realloc( adapters, size );
+    ok( !ret || ret == ERROR_NO_DATA, "family %lu flags %#lx: got %lu\n", family, flags, ret );
+    if (!ret) return adapters;
+    free( adapters );
+    return NULL;
+}
+
+static void test_GetAdaptersAddresses_families(void)
+{
+    static const ULONG families[] = { AF_INET, AF_INET6, AF_UNSPEC };
+    ULONG flags = GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST;
+    IP_ADAPTER_ADDRESSES *all, *filtered, *skipped, *all_skipped, *aa, *match, *all_families;
+    MIB_IPINTERFACE_TABLE *interfaces;
+    unsigned int i, j;
+    DWORD ret;
+    BOOL enabled;
+
+    all_families = get_family_adapters( AF_UNSPEC, flags | GAA_FLAG_INCLUDE_ALL_INTERFACES );
+
+    for (i = 0; i < ARRAY_SIZE(families); i++)
+    {
+        winetest_push_context( "family %lu", families[i] );
+        all = get_family_adapters( families[i], flags | GAA_FLAG_INCLUDE_ALL_INTERFACES );
+        filtered = get_family_adapters( families[i], flags );
+        skipped = get_family_adapters( families[i], flags | GAA_FLAG_SKIP_UNICAST );
+        all_skipped = get_family_adapters( families[i], flags | GAA_FLAG_INCLUDE_ALL_INTERFACES |
+                                                               GAA_FLAG_SKIP_UNICAST );
+
+        for (aa = all; aa; aa = aa->Next)
+        {
+            if (aa->Length < sizeof(*aa)) continue;
+            enabled = (families[i] != AF_INET6 && aa->Ipv4Enabled) ||
+                      (families[i] != AF_INET && aa->Ipv6Enabled);
+            for (match = all_families; match && match->Luid.Value != aa->Luid.Value; match = match->Next) ;
+            ok( !!match, "adapter %s missing from AF_UNSPEC\n", aa->AdapterName );
+            if (match)
+                ok( match->Ipv4Enabled == aa->Ipv4Enabled && match->Ipv6Enabled == aa->Ipv6Enabled,
+                    "adapter %s: address family changed enabled flags\n", aa->AdapterName );
+            for (match = filtered; match && match->Luid.Value != aa->Luid.Value; match = match->Next) ;
+            ok( !!match == enabled, "adapter %s: enabled %u, present %u\n",
+                aa->AdapterName, enabled, !!match );
+            for (match = skipped; match && match->Luid.Value != aa->Luid.Value; match = match->Next) ;
+            ok( !!match == enabled, "adapter %s: enabled %u, present with SKIP_UNICAST %u\n",
+                aa->AdapterName, enabled, !!match );
+            if (match)
+            {
+                ok( !match->FirstUnicastAddress, "adapter %s has unicast addresses\n", aa->AdapterName );
+                ok( match->Ipv4Enabled == aa->Ipv4Enabled && match->Ipv6Enabled == aa->Ipv6Enabled,
+                    "adapter %s: SKIP_UNICAST changed enabled flags\n", aa->AdapterName );
+            }
+            for (match = all_skipped; match && match->Luid.Value != aa->Luid.Value; match = match->Next) ;
+            ok( !!match, "adapter %s missing with INCLUDE_ALL_INTERFACES | SKIP_UNICAST\n", aa->AdapterName );
+            if (match)
+            {
+                ok( !match->FirstUnicastAddress, "adapter %s has unicast addresses\n", aa->AdapterName );
+                ok( match->Ipv4Enabled == aa->Ipv4Enabled && match->Ipv6Enabled == aa->Ipv6Enabled,
+                    "adapter %s: INCLUDE_ALL_INTERFACES | SKIP_UNICAST changed enabled flags\n", aa->AdapterName );
+            }
+        }
+
+        if (pGetIpInterfaceTable)
+        {
+            ret = pGetIpInterfaceTable( families[i], &interfaces );
+            ok( !ret, "GetIpInterfaceTable returned %lu\n", ret );
+            if (!ret)
+            {
+                for (j = 0; j < interfaces->NumEntries; j++)
+                {
+                    for (match = filtered; match && match->Luid.Value != interfaces->Table[j].InterfaceLuid.Value;
+                         match = match->Next) ;
+                    ok( !!match, "IP interface %lu missing from adapters\n", interfaces->Table[j].InterfaceIndex );
+                }
+                FreeMibTable( interfaces );
+            }
+        }
+
+        free( all );
+        free( filtered );
+        free( skipped );
+        free( all_skipped );
+        winetest_pop_context();
+    }
+    free( all_families );
+}
+
 static DWORD get_extended_tcp_table( ULONG family, TCP_TABLE_CLASS class, void **table )
 {
     DWORD ret, size = 0;
@@ -4172,6 +4264,7 @@ START_TEST(iphlpapi)
 
     testWin2KFunctions();
     test_GetAdaptersAddresses();
+    test_GetAdaptersAddresses_families();
     test_GetExtendedTcpTable();
     test_GetExtendedTcpTable_owner(AF_INET);
     test_GetExtendedTcpTable_owner(AF_INET6);

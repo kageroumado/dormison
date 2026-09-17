@@ -69,7 +69,6 @@ enum unix_calls
     nsi_get_all_parameters_ex,
     nsi_get_parameter_ex,
     nsi_get_notification,
-    nsi_interface_state,
 };
 
 static NTSTATUS nsiproxy_enumerate_all( IRP *irp )
@@ -373,60 +372,6 @@ static void WINAPI change_notification_cancel( DEVICE_OBJECT *device, IRP *irp )
     IoCompleteRequest( irp, IO_NO_INCREMENT );
 }
 
-/* The unix side reports address changes that happen after it starts
- * listening, so a process that registers on a host whose interface is
- * already up would wait forever. The first registration each process makes
- * for a family whose interface is up completes at once, and the process
- * reads the state it was waiting for. Its next registration queues like any
- * other. */
-struct primed_registration
-{
-    ULONG pid;
-    NPI_MODULEID module;
-    UINT table;
-};
-
-static struct primed_registration primed[64];
-static unsigned int primed_count;
-
-static BOOL interface_up_for_requestor( IRP *irp, const NPI_MODULEID *module, UINT table )
-{
-    struct nsi_interface_state_params params = { .module = *module };
-    ULONG pid;
-    unsigned int i;
-
-    if (table != NSI_IP_UNICAST_TABLE) return FALSE;
-    if (!irp->Tail.Overlay.Thread) return FALSE;
-    pid = IoGetRequestorProcessId( irp );
-
-    EnterCriticalSection( &nsiproxy_cs );
-    for (i = 0; i < primed_count; i++)
-    {
-        if (primed[i].pid != pid || primed[i].table != table) continue;
-        if (!NmrIsEqualNpiModuleId( &primed[i].module, module )) continue;
-        LeaveCriticalSection( &nsiproxy_cs );
-        return FALSE;
-    }
-    LeaveCriticalSection( &nsiproxy_cs );
-
-    if (nsiproxy_call( nsi_interface_state, &params ) || !params.up) return FALSE;
-
-    EnterCriticalSection( &nsiproxy_cs );
-    if (primed_count == ARRAY_SIZE(primed))
-    {
-        memmove( primed, primed + 1, sizeof(primed) - sizeof(*primed) );
-        primed_count--;
-    }
-    primed[primed_count].pid = pid;
-    primed[primed_count].module = *module;
-    primed[primed_count].table = table;
-    primed_count++;
-    LeaveCriticalSection( &nsiproxy_cs );
-
-    TRACE( "process %#lx: an interface is already up, completing its first registration.\n", pid );
-    return TRUE;
-}
-
 static NTSTATUS nsiproxy_change_notification( IRP *irp )
 {
     IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation( irp );
@@ -437,7 +382,6 @@ static NTSTATUS nsiproxy_change_notification( IRP *irp )
     TRACE( "irp %p.\n", irp );
 
     if (in_len < sizeof(*in)) return STATUS_INVALID_PARAMETER;
-    if (interface_up_for_requestor( irp, &in->module, in->table )) return STATUS_SUCCESS;
     if (!(data = calloc( 1, sizeof(*data) ))) return STATUS_NO_MEMORY;
     /* FIXME: validate module and table. */
 

@@ -26,6 +26,8 @@
 #include <stdarg.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 #ifdef HAVE_NET_ROUTE_H
 #include <net/route.h>
@@ -813,6 +815,39 @@ static NTSTATUS ipv6_ipstats_get_all_parameters( const void *key, UINT key_size,
 #endif
 }
 
+#ifdef __APPLE__
+/* The attached protocol list includes interfaces waiting for an IP address. */
+struct if_protolistreq
+{
+    char name[IFNAMSIZ];
+    unsigned int count;
+    unsigned int reserved;
+    unsigned int *list;
+};
+#define SIOCGIFPROTOLIST _IOWR('i', 196, struct if_protolistreq)
+
+static int interface_has_family( int fd, const char *name, UINT family )
+{
+    unsigned int protocols[32], *list = protocols, i;
+    struct if_protolistreq req = {0};
+    int ret = -1;
+
+    if (fd < 0) return -1;
+    lstrcpynA( req.name, name, sizeof(req.name) );
+    if (ioctl( fd, SIOCGIFPROTOLIST, &req )) return -1;
+    if (req.count > ARRAY_SIZE(protocols) && !(list = malloc( req.count * sizeof(*list) ))) return -1;
+    req.list = list;
+    if (!ioctl( fd, SIOCGIFPROTOLIST, &req ))
+    {
+        ret = 0;
+        for (i = 0; i < req.count; i++)
+            if (list[i] == family) ret = 1;
+    }
+    if (list != protocols) free( list );
+    return ret;
+}
+#endif
+
 static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_data, UINT key_size,
                                    void *rw_data, UINT rw_size, void *dynamic_data, UINT dynamic_size,
                                    void *static_data, UINT static_size, UINT_PTR *count )
@@ -827,19 +862,44 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
     struct ipv6_addr_scope *addr_scopes = NULL;
     unsigned int addr_scopes_size = 0;
     struct nsi_ip_interface_rw *rw = rw_data;
-    struct ifaddrs *addrs, *entry, *entry2;
+    struct ifaddrs *addrs, *entry, *entry2, *address;
     UINT num = 0, scope_id = 0xffffffff;
+#ifdef __APPLE__
+    int family_socket, enabled;
+#endif
     NET_LUID luid;
 
     if (getifaddrs( &addrs )) return STATUS_NO_MORE_ENTRIES;
-
+#ifdef __APPLE__
+    family_socket = socket( AF_INET, SOCK_DGRAM, 0 );
+    if (fam == AF_INET6 && rw) addr_scopes = get_ipv6_addr_scope_table( &addr_scopes_size );
+#else
     if (fam == AF_INET6) addr_scopes = get_ipv6_addr_scope_table( &addr_scopes_size );
+#endif
 
     rw = rw_data;
     for (entry = addrs; entry; entry = entry->ifa_next)
     {
-        if (!entry->ifa_addr || entry->ifa_addr->sa_family != fam) continue;
+        if (!entry->ifa_addr) continue;
         if (unix_name && strcmp( entry->ifa_name, unix_name )) continue;
+#ifdef __APPLE__
+        if (entry->ifa_addr->sa_family != AF_LINK) continue;
+        enabled = interface_has_family( family_socket, entry->ifa_name, fam );
+        if (!enabled) continue;
+        address = NULL;
+        for (entry2 = (rw || enabled < 0) ? addrs : NULL; entry2; entry2 = entry2->ifa_next)
+        {
+            if (!entry2->ifa_addr || entry2->ifa_addr->sa_family != fam ||
+                strcmp( entry2->ifa_name, entry->ifa_name )) continue;
+            address = entry2;
+            if (fam == AF_INET) break;
+            scope_id = find_ipv6_addr_scope( (IN6_ADDR *)&((struct sockaddr_in6 *)entry2->ifa_addr)->sin6_addr,
+                                            addr_scopes, addr_scopes_size );
+            if (scope_id == 0x1000 /* loopback */ || scope_id == 0x2000 /* link_local */) break;
+        }
+        if (enabled < 0 && !address) continue;
+#else
+        if (entry->ifa_addr->sa_family != fam) continue;
         if (fam == AF_INET6)
         {
             scope_id = find_ipv6_addr_scope( (IN6_ADDR*)&((struct sockaddr_in6 *)entry->ifa_addr)->sin6_addr, addr_scopes,
@@ -868,8 +928,10 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
             }
             if (entry2 != entry) continue;
         }
+        address = entry;
+#endif
         if (!convert_unix_name_to_luid( entry->ifa_name, &luid )) continue;
-        if (!nsi_get_all_parameters( &NPI_MS_NDIS_MODULEID, NSI_NDIS_IFINFO_TABLE, &luid, sizeof(luid),
+        if ((rw || dyn) && !nsi_get_all_parameters( &NPI_MS_NDIS_MODULEID, NSI_NDIS_IFINFO_TABLE, &luid, sizeof(luid),
                                      NULL, 0, &iface_dynamic, sizeof(iface_dynamic),
                                      &iface_static, sizeof(iface_static) ))
         {
@@ -883,8 +945,8 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
             if (stat) memset( stat, 0, sizeof(*stat) );
 
             base_reachable_time = 0;
-            if (iface_static.type == MIB_IF_TYPE_LOOPBACK) dad_transmits = 0;
-            else                                           dad_transmits = (fam == AF_INET6) ? 1 : 3;
+            dad_transmits = (fam == AF_INET6) ? 1 : 3;
+            if (rw && iface_static.type == MIB_IF_TYPE_LOOPBACK) dad_transmits = 0;
 #if __linux__
             if (rw || dyn)
             {
@@ -906,11 +968,12 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
             if (rw)
             {
                 site_prefix_len = 64;
-                if (fam == AF_INET6 && iface_static.type != MIB_IF_TYPE_LOOPBACK)
+                if (fam == AF_INET6 && iface_static.type != MIB_IF_TYPE_LOOPBACK &&
+                    address && address->ifa_netmask)
                 {
                     /* For some reason prefix length reported on ipv4 is 64 for ipv4 addresses on Windows and
                      * prefix len is 64 for loopback device. */
-                    site_prefix_len = mask_v6_to_prefix( &((struct sockaddr_in6 *)entry->ifa_netmask)->sin6_addr );
+                    site_prefix_len = mask_v6_to_prefix( &((struct sockaddr_in6 *)address->ifa_netmask)->sin6_addr );
                 }
                 memset( rw, 0, sizeof(*rw) );
                 rw->mtu = iface_dynamic.mtu;
@@ -932,6 +995,9 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
         }
         if (!count)
         {
+#ifdef __APPLE__
+            if (family_socket >= 0) close( family_socket );
+#endif
             freeifaddrs( addrs );
             free( addr_scopes );
             return STATUS_SUCCESS;
@@ -942,6 +1008,9 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
         if (dyn) ++dyn;
         if (stat) ++stat;
     }
+#ifdef __APPLE__
+    if (family_socket >= 0) close( family_socket );
+#endif
     freeifaddrs( addrs );
     free( addr_scopes );
 
