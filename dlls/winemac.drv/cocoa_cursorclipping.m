@@ -19,6 +19,10 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <dlfcn.h>
+#include <stdarg.h>
+#include <stdio.h>
+
 #import "cocoa_app.h"
 #import "cocoa_cursorclipping.h"
 #import "cocoa_window.h"
@@ -491,6 +495,146 @@ static void scale_rect_for_retina_mode(BOOL mode, CGRect *cursorClipRect)
 
         clippingCursor = FALSE;
 
+        return TRUE;
+    }
+
+    - (void) clipCursorLocation:(CGPoint*)location
+    {
+        clip_cursor_location(cursorClipRect, location);
+    }
+
+    - (void) setRetinaMode:(BOOL)mode
+    {
+        scale_rect_for_retina_mode(mode, &cursorClipRect);
+    }
+
+@end
+
+
+/* Clipping through the window server's cursor restriction shape:
+ *
+ * A confinement rect holds the pointer inside a window while the app is
+ * frontmost, which is enough on one display and not enough on two: the
+ * pointer leaves the game's display at the shared edge and the camera stops
+ * turning. SkyLight's own restriction shape is applied by the compositor,
+ * ahead of every app, and is the layer that can hold it.
+ *
+ * `SLSSetWindowCursorRestrictionShape(uint32_t window, CGSRegionRef shape)`
+ * takes no connection id — it reaches the main connection itself — and is a
+ * MIG simpleroutine, so it never receives the server's status: **the value it
+ * returns is uninitialized and means nothing.** A caller that branches on it
+ * reports success for a bogus window id as readily as for a real one. What
+ * decides whether anything happens is on the server side: the window must be
+ * alive, visible and owned by this connection, the connection must be the
+ * foreground one, and the shape is intersected with the window's own clip
+ * shape — which is also the ClipCursor semantics a game asks for.
+ *
+ * Signatures, their evidence, and what is still unverified:
+ * bispectral/probes/cursorconfine/RESULTS.md. The symbols are resolved by name
+ * at runtime, never linked, so a macOS that drops them costs this handler and
+ * nothing else.
+ */
+
+typedef void *SevoRegionRef;
+
+static CGError (*sevo_new_region_with_rect)(const CGRect*, SevoRegionRef*);
+static void (*sevo_release_region)(SevoRegionRef);
+static void (*sevo_set_window_cursor_restriction_shape)(uint32_t, SevoRegionRef);
+
+static BOOL load_cursor_restriction_symbols(void)
+{
+    static dispatch_once_t once;
+    static BOOL loaded;
+
+    dispatch_once(&once, ^{
+        void *skylight = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",
+                                RTLD_LAZY);
+
+        if (!skylight) return;
+        /* The two region calls are CoreGraphics exports, which this handle
+           reaches through the shared cache all the same. */
+        sevo_new_region_with_rect = dlsym(skylight, "CGSNewRegionWithRect");
+        sevo_release_region = dlsym(skylight, "CGSReleaseRegion");
+        sevo_set_window_cursor_restriction_shape = dlsym(skylight, "SLSSetWindowCursorRestrictionShape");
+        loaded = sevo_new_region_with_rect && sevo_release_region &&
+                 sevo_set_window_cursor_restriction_shape;
+    });
+    return loaded;
+}
+
+/* One line per decision, so a game's mouse-look can be followed in the wine
+   log without a debugger. */
+static void cursor_confine_note(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static void cursor_confine_note(const char *format, ...)
+{
+    char line[256];
+    va_list args;
+
+    va_start(args, format);
+    vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    fprintf(stderr, "sevo:cursor %s\n", line);
+    fflush(stderr);
+}
+
+
+@implementation WineCursorRestrictionClipCursorHandler
+
+@synthesize clippingCursor, cursorClipRect;
+
+    + (BOOL) isAvailable
+    {
+        return cursor_confine && load_cursor_restriction_symbols();
+    }
+
+    /* The restriction shape is in the window server's global display space,
+       which is the space macdrv_clip_cursor already works in: top-left origin
+       screen points across every display. */
+    - (BOOL) startClippingCursor:(CGRect)rect
+    {
+        WineWindow* ownerWindow = [[WineApplicationController sharedController] frontWineWindow];
+        SevoRegionRef region = NULL;
+        CGError error;
+
+        if (!ownerWindow)
+        {
+            /* Nothing to tie the shape to yet; the controller keeps the rect
+               and asks again when a window becomes key. */
+            cursor_confine_note("no front window for %gx%g at %g,%g",
+                                rect.size.width, rect.size.height, rect.origin.x, rect.origin.y);
+            return FALSE;
+        }
+        if (clippingCursor && ![self stopClippingCursor]) return FALSE;
+
+        error = sevo_new_region_with_rect(&rect, &region);
+        if (error != kCGErrorSuccess || !region)
+        {
+            cursor_confine_note("no region for %gx%g (error %d)",
+                                rect.size.width, rect.size.height, (int)error);
+            return FALSE;
+        }
+
+        sevo_set_window_cursor_restriction_shape((uint32_t)ownerWindow.windowNumber, region);
+        sevo_release_region(region);
+
+        clippingWindowNumber = ownerWindow.windowNumber;
+        cursorClipRect = rect;
+        clippingCursor = TRUE;
+        cursor_confine_note("confined window %ld to %gx%g at %g,%g",
+                            (long)clippingWindowNumber, rect.size.width, rect.size.height,
+                            rect.origin.x, rect.origin.y);
+        return TRUE;
+    }
+
+    - (BOOL) stopClippingCursor
+    {
+        if (clippingWindowNumber)
+        {
+            sevo_set_window_cursor_restriction_shape((uint32_t)clippingWindowNumber, NULL);
+            cursor_confine_note("released window %ld", (long)clippingWindowNumber);
+        }
+        clippingWindowNumber = 0;
+        clippingCursor = FALSE;
         return TRUE;
     }
 

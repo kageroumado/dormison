@@ -150,6 +150,12 @@ extern int presenter_log_on;
    default. The pointer-acceleration curve shapes what the cursor does, which
    is right for a cursor and wrong for a camera. */
 extern int linear_mouse;
+/* Confine the cursor at the window server rather than through an event tap or
+   a window's confinement rect: `Mac Driver\CursorConfine=Y`, or
+   SEVO_CURSOR_CONFINE=1 in the environment. The private call reaches the
+   compositor, which is the layer that can hold a pointer inside one display of
+   a multi-display Mac. */
+extern int cursor_confine;
 extern int resizable_windows;
 extern bool use_precise_scrolling;
 extern int gl_surface_mode;

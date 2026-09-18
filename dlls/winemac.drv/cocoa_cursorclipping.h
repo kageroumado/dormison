@@ -71,3 +71,20 @@
     + (BOOL) isAvailable;
 
 @end
+
+
+/* Clipping through the window server's own cursor restriction shape
+ * (SkyLight's SLSSetWindowCursorRestrictionShape), which is the only layer
+ * that holds a pointer inside one display of a multi-display Mac. Selected by
+ * `Mac Driver\CursorConfine=Y` / SEVO_CURSOR_CONFINE=1.
+ */
+@interface WineCursorRestrictionClipCursorHandler : NSObject <WineClipCursorHandler>
+{
+    BOOL clippingCursor;
+    CGRect cursorClipRect;
+    NSInteger clippingWindowNumber;
+}
+
+    + (BOOL) isAvailable;
+
+@end

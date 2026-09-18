@@ -123,6 +123,8 @@ enum {
 
     - (void) windowGotFocus:(WineWindow*)window;
 
+    - (void) applyDeferredClip;
+
     - (BOOL) waitUntilQueryDone:(bool*)done timeout:(NSDate*)timeout processEvents:(BOOL)processEvents;
 
     - (void) noteKey:(uint16_t)keyCode pressed:(BOOL)pressed;

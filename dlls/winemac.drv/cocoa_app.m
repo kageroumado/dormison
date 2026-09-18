@@ -377,6 +377,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
         macdrv_event* event;
 
         [self invalidateGotFocusEvents];
+        [self applyDeferredClip];
 
         event = macdrv_create_event(WINDOW_GOT_FOCUS, window);
         event->window_got_focus.serial = windowFocusSerial;
@@ -1033,18 +1034,26 @@ static NSString* WineLocalizedString(unsigned int stringID)
         }
     }
 
+    /* A clip that is being held: because the cursor is visible over a window
+       shown in a window, or because the handler had no window of ours to tie
+       a confinement rect to. Both change with activation or with the cursor
+       hiding, and this is what those moments call. */
+    - (void) applyDeferredClip
+    {
+        CGRect rect = deferredClipRect;
+
+        if (!hasDeferredClip) return;
+        hasDeferredClip = FALSE;
+        [self startClippingCursor:rect];
+    }
+
     - (void) hideCursor
     {
         if (!clientWantsCursorHidden)
         {
             clientWantsCursorHidden = TRUE;
             [self updateCursor:TRUE];
-            if (hasDeferredClip)
-            {
-                CGRect rect = deferredClipRect;
-                hasDeferredClip = FALSE;
-                [self startClippingCursor:rect];
-            }
+            [self applyDeferredClip];
         }
     }
 
@@ -1307,7 +1316,9 @@ static NSString* WineLocalizedString(unsigned int stringID)
     - (BOOL) startClippingCursor:(CGRect)rect
     {
         if (!clipCursorHandler) {
-            if (use_confinement_cursor_clipping && [WineConfinementClipCursorHandler isAvailable])
+            if ([WineCursorRestrictionClipCursorHandler isAvailable])
+                clipCursorHandler = [[WineCursorRestrictionClipCursorHandler alloc] init];
+            else if (use_confinement_cursor_clipping && [WineConfinementClipCursorHandler isAvailable])
                 clipCursorHandler = [[WineConfinementClipCursorHandler alloc] init];
             else
                 clipCursorHandler = [[WineEventTapClipCursorHandler alloc] init];
@@ -1331,7 +1342,16 @@ static NSString* WineLocalizedString(unsigned int stringID)
             return TRUE;
 
         if (![clipCursorHandler startClippingCursor:rect])
+        {
+            /* A confinement rect has to be tied to a window of ours that is in
+               front, and a game that calls ClipCursor before its window
+               activates has none — the first thing many of them do. Keep the
+               rect so the activation applies it; dropped, mouse-look stayed
+               dead for the life of the process. */
+            deferredClipRect = rect;
+            hasDeferredClip = TRUE;
             return FALSE;
+        }
 
         [self setCursorPosition:NSPointToCGPoint([self flippedMouseLocation:[NSEvent mouseLocation]])];
 
@@ -2372,6 +2392,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
         [self updateFullscreenWindows];
         [self adjustWindowLevels:YES];
+        [self applyDeferredClip];
 
         if (beenActive)
             [self unminimizeWindowIfNoneVisible];
