@@ -29,6 +29,7 @@
 #import "cocoa_window.h"
 #import "d3dmetal_objc.h"
 #include "sevo_presenter.h"
+#include "sevo_stats.h"
 
 #include "macdrv_cocoa.h"
 #import "cocoa_app.h"
@@ -1340,6 +1341,7 @@ static NSView* wine_content_view_of(NSWindow* window)
         else if (window)
             deviceScale = [window backingScaleFactor];
         if (deviceScale <= 0) deviceScale = 1;
+        sevo_stats_note_window((unsigned long long)window.windowNumber);
         sevo_presenter_layout(_presenter, deviceScale, retina_on ? 2.0 : 1.0,
                               NSWidth([self bounds]), NSHeight([self bounds]));
     }
@@ -1474,6 +1476,7 @@ static NSView* wine_content_view_of(NSWindow* window)
         else if (window)
             deviceScale = [window backingScaleFactor];
         if (deviceScale <= 0) deviceScale = 1;
+        sevo_stats_note_window((unsigned long long)window.windowNumber);
         sevo_presenter_layout(_presenter, deviceScale, retina_on ? 2.0 : 1.0,
                               NSWidth([self bounds]), NSHeight([self bounds]));
     }

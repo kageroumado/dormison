@@ -310,6 +310,15 @@ func log(_ message: String) {
     fputs("sevo:presenter \(message)\n", stderr)
 }
 
+/// The present counter's page, in the driver's C half (`sevo_stats.c`).
+/// Declared rather than imported: the archive is compiled on its own, with no
+/// view of winemac.drv's headers, and the two meet at the link.
+@_silgen_name("sevo_stats_note_present")
+func sevoStatsNotePresent(_ source: UInt32)
+
+/// `SEVO_STATS_SOURCE_PRESENTER`.
+let sevoStatsSourcePresenter: UInt32 = 2
+
 // MARK: - One view's presenter
 
 /// What every presented view shares: the on-screen layer at the device
@@ -430,6 +439,7 @@ class ViewPresenter: NSObject {
         statsLock.lock()
         presented += 1
         statsLock.unlock()
+        sevoStatsNotePresent(sevoStatsSourcePresenter)
         summarize()
         return real
     }

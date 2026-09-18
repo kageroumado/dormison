@@ -36,6 +36,7 @@
 
 #include "macdrv.h"
 #include "sevo_provenance.h"
+#include "sevo_stats.h"
 #include "wine/server.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
@@ -1139,6 +1140,7 @@ static void macdrv_client_surface_present(struct client_surface *client, HDC hdc
 static void macdrv_client_surface_present_frame(struct client_surface *client, HDC hdc)
 {
     sevo_provenance_note_present(client);
+    sevo_stats_note_present(SEVO_STATS_SOURCE_CLIENT_SURFACE);
     macdrv_client_surface_present(client, hdc);
 }
 

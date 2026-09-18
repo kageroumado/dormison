@@ -32,6 +32,7 @@
 #import "d3dmetal_objc.h"
 #include "sevo_presenter.h"
 #include "sevo_provenance.h"
+#include "sevo_stats.h"
 #import <Metal/Metal.h>
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
@@ -68,9 +69,12 @@
                     [queue postEvent:event];
                     macdrv_release_event(event);
                     sevo_provenance_note_drawable();
+                    sevo_stats_note_window((unsigned long long)view.window.windowNumber);
                 }
             }
         }
+
+        sevo_stats_note_drawable();
 
         /* With the presenter the drawable is one of its textures: this
            layer is off screen, so its own drawables would never be shown. */

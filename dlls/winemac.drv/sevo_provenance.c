@@ -39,6 +39,7 @@
 #define WIN32_NO_STATUS
 #include "macdrv.h"
 #include "sevo_provenance.h"
+#include "sevo_stats.h"
 
 /* How much of a recorded sha256 identifies a renderer DLL in the log. */
 #define SEVO_HASH_CHARS 8
@@ -377,6 +378,8 @@ void sevo_provenance_init(int presenter_on, const char *upscaler)
     renderer_record(engine_dir, "d3d11", cfg_d3d11, sizeof(cfg_d3d11));
     renderer_record(engine_dir, "d3d12", cfg_d3d12, sizeof(cfg_d3d12));
     renderer_record(engine_dir, "dxgi", cfg_dxgi, sizeof(cfg_dxgi));
+
+    sevo_stats_init((unsigned int)strtoul(appid, NULL, 10), exe);
 
     fprintf(stderr, "sevo:run pid=%d exe=%s appid=%s engine=%s\n",
             getpid(), exe[0] ? exe : "unknown", appid, engine);

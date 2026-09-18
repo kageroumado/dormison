@@ -1,0 +1,222 @@
+/*
+ * The present counter: a page of shared memory per process that the app
+ * samples to get a frame rate and a stall signal without hooking the game.
+ *
+ * Copyright 2026 kageroumado
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#if 0
+#pragma makedep unix
+#endif
+
+#include "config.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "sevo_stats.h"
+
+/* The page's hot fields, at the offsets sevo_stats_page names. A reader is
+   another process on another architecture, so every one of them is a plain
+   aligned 64-bit word. */
+struct stats_page
+{
+    _Atomic uint64_t magic;
+    _Atomic uint64_t frames;
+    _Atomic uint64_t drawables;
+    _Atomic uint64_t last_present_ns;
+    uint64_t         start_ns;
+    _Atomic uint64_t window_id;
+    uint32_t         version;
+    uint32_t         pid;
+    _Atomic uint32_t source;
+    uint32_t         appid;
+    char             exe[32];
+};
+
+_Static_assert(sizeof(struct stats_page) == sizeof(struct sevo_stats_page),
+               "the written page and the documented page are one layout");
+_Static_assert(sizeof(struct stats_page) <= SEVO_STATS_PAGE_SIZE, "the page fits its page");
+
+static struct stats_page *_Atomic page;
+static pthread_once_t page_once = PTHREAD_ONCE_INIT;
+static char page_path[PATH_MAX];
+static uint32_t process_appid;
+static char process_exe[32];
+
+static uint64_t uptime_ns(void)
+{
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+/* The prefix this process runs in, the way ntdll's loader resolves it. */
+static const char *prefix_path(void)
+{
+    const char *prefix = getenv("WINEPREFIX");
+
+    if (prefix && prefix[0] == '/') return prefix;
+    return NULL;
+}
+
+/* Makes the directory and every parent of it under the prefix. */
+static int make_run_directory(char *out, size_t size)
+{
+    const char *prefix = prefix_path();
+    char path[PATH_MAX];
+
+    if (!prefix) return 0;
+    if (snprintf(path, sizeof(path), "%s/.sevo", prefix) >= (int)sizeof(path)) return 0;
+    if (mkdir(path, 0700) && errno != EEXIST) return 0;
+    if (snprintf(path, sizeof(path), "%s/.sevo/run", prefix) >= (int)sizeof(path)) return 0;
+    if (mkdir(path, 0700) && errno != EEXIST) return 0;
+    return snprintf(out, size, "%s", path) < (int)size;
+}
+
+/* Drops the pages of processes that are gone. A process killed outright
+   never runs its own cleanup, so the directory is swept by the next one to
+   present rather than by whoever left the file. */
+static void sweep_dead_pages(const char *directory)
+{
+    struct dirent *entry;
+    DIR *dir = opendir(directory);
+
+    if (!dir) return;
+    while ((entry = readdir(dir)))
+    {
+        char path[PATH_MAX], *end;
+        long value;
+
+        value = strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || strcmp(end, ".stats")) continue;
+        if (value <= 0 || value == (long)getpid()) continue;
+        if (!kill((pid_t)value, 0) || errno != ESRCH) continue;
+        if (snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name) < (int)sizeof(path))
+            unlink(path);
+    }
+    closedir(dir);
+}
+
+static void close_page(void)
+{
+    if (page_path[0]) unlink(page_path);
+}
+
+static void open_page(void)
+{
+    char directory[PATH_MAX];
+    struct stats_page *mapped;
+    int fd;
+
+    if (!make_run_directory(directory, sizeof(directory))) return;
+    sweep_dead_pages(directory);
+    if (snprintf(page_path, sizeof(page_path), "%s/%d.stats", directory, getpid())
+        >= (int)sizeof(page_path))
+    {
+        page_path[0] = 0;
+        return;
+    }
+
+    fd = open(page_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
+    {
+        page_path[0] = 0;
+        return;
+    }
+    if (ftruncate(fd, SEVO_STATS_PAGE_SIZE))
+    {
+        close(fd);
+        unlink(page_path);
+        page_path[0] = 0;
+        return;
+    }
+    mapped = mmap(NULL, SEVO_STATS_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED)
+    {
+        unlink(page_path);
+        page_path[0] = 0;
+        return;
+    }
+
+    mapped->version = SEVO_STATS_VERSION;
+    mapped->pid = (uint32_t)getpid();
+    mapped->appid = process_appid;
+    mapped->start_ns = uptime_ns();
+    memcpy(mapped->exe, process_exe, sizeof(mapped->exe));
+    /* Last, and with release ordering: the magic is what says the rest of
+       the page is there to be read. */
+    atomic_store_explicit(&mapped->magic, SEVO_STATS_MAGIC, memory_order_release);
+    atomic_store_explicit(&page, mapped, memory_order_release);
+    atexit(close_page);
+}
+
+void sevo_stats_init(unsigned int appid, const char *exe)
+{
+    process_appid = appid;
+    snprintf(process_exe, sizeof(process_exe), "%s", exe ? exe : "");
+}
+
+void sevo_stats_note_present(unsigned int source)
+{
+    struct stats_page *current_page;
+    unsigned int current;
+
+    pthread_once(&page_once, open_page);
+    if (!(current_page = atomic_load_explicit(&page, memory_order_acquire))) return;
+
+    /* One path counts. The presenter takes over from the client surface the
+       moment it presents, because it is the one whose frames reach the
+       screen; a lower path arriving afterwards is the same frame counted
+       twice. */
+    current = atomic_load_explicit(&current_page->source, memory_order_relaxed);
+    if (current > source) return;
+    if (current < source) atomic_store_explicit(&current_page->source, source, memory_order_relaxed);
+
+    atomic_store_explicit(&current_page->last_present_ns, uptime_ns(), memory_order_relaxed);
+    atomic_fetch_add_explicit(&current_page->frames, 1, memory_order_relaxed);
+}
+
+void sevo_stats_note_drawable(void)
+{
+    struct stats_page *current_page;
+
+    pthread_once(&page_once, open_page);
+    if (!(current_page = atomic_load_explicit(&page, memory_order_acquire))) return;
+    atomic_fetch_add_explicit(&current_page->drawables, 1, memory_order_relaxed);
+}
+
+void sevo_stats_note_window(unsigned long long window_id)
+{
+    struct stats_page *current_page = atomic_load_explicit(&page, memory_order_acquire);
+    uint64_t none = 0;
+
+    if (!current_page || !window_id) return;
+    atomic_compare_exchange_strong_explicit(&current_page->window_id, &none, (uint64_t)window_id,
+                                            memory_order_relaxed, memory_order_relaxed);
+}
