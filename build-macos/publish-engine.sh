@@ -148,7 +148,7 @@ MANIFEST="$RELEASES/engine.json"
 echo "==> manifest: $CHANNEL -> $VERSION"
 gh release download engine --repo "$APP_REPO" --pattern engine.json --output "$MANIFEST" --clobber
 python3 - "$MANIFEST" "$CHANNEL" "$NAME" "$URL" "$SHA256" "$SIZE" "$MIN_APP_VERSION" "$STAGE/engine-info.json" <<'PY'
-import json, sys
+import hashlib, json, sys, urllib.request
 path, channel, version, url, sha256, size, min_app, info_path = sys.argv[1:]
 manifest = json.load(open(path))
 info = json.load(open(info_path))
@@ -158,15 +158,37 @@ manifest.setdefault("channels", {})[channel] = {
     "sha256": sha256, "sizeBytes": int(size),
     "notes": f"wine {info['wine']}; commit {info['commit'][:12]}",
 }
+
+def digest(source):
+    """The sha256 of the component payload, streamed from its release asset.
+
+    The publisher never holds these bytes: package-engine.sh copies the DLLs
+    out of deps-raw/ and records only the upstream URL, so the digest the app
+    checks a download against has to be fetched here."""
+    hasher = hashlib.sha256()
+    with urllib.request.urlopen(source, timeout=120) as body:
+        for chunk in iter(lambda: body.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
 components = manifest.setdefault("components", {})
 for key in ("dxmt", "dxvk"):
     source = info.get(key)
     if not source:
         continue
     tested = components.setdefault(key, [])
-    if not any(entry.get("url") == source for entry in tested):
-        tested.insert(0, {"version": source.rsplit("/", 2)[1].lstrip("v"), "url": source,
-                          "sha256": None, "notes": f"run with {version}"})
+    entry = next((e for e in tested if e.get("url") == source), None)
+    if entry is None:
+        entry = {"version": source.rsplit("/", 2)[1].lstrip("v"), "url": source,
+                 "sha256": None, "notes": None}
+        tested.insert(0, entry)
+    # The same component URL rides release after release, and the entry has
+    # to name the engine it is shipping with now rather than the one it was
+    # first published under.
+    entry["notes"] = f"run with {version}"
+    if not entry.get("sha256"):
+        print(f"    hashing {key} {entry['version']}…", file=sys.stderr)
+        entry["sha256"] = digest(source)
 json.dump(manifest, open(path, "w"), indent=2)
 open(path, "a").write("\n")
 print(json.dumps(manifest["channels"][channel], indent=2))
