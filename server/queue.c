@@ -629,6 +629,14 @@ void set_clip_rectangle( struct desktop *desktop, const struct rectangle *rect, 
 
     old_flags = desktop->clip_flags;
     desktop->clip_flags = flags;
+    /* Who asked for this, so the clip can be given back to them when they
+       take the foreground. */
+    if (flags == SET_CURSOR_NOCLIP) desktop->clip_pid = 0;
+    else if (rect)
+    {
+        desktop->clip_rect = *rect;
+        desktop->clip_pid = current ? current->process->id : 0;
+    }
 
     /* warp the mouse to be inside the clip rect */
     x = max( min( desktop_shm->cursor.x, new_rect.right - 1 ), new_rect.left );
@@ -648,15 +656,31 @@ static void set_foreground_input( struct desktop *desktop, struct process *proce
 {
     input_shm_t *input_shm, *old_input_shm;
     shared_object_t dummy_obj = {0};
+    int keeps_clip;
 
     if (input) input->user_time = monotonic_time;
     if (desktop->foreground_input == input) return;
     input_shm = input ? input->shared : &dummy_obj.shm.input;
     old_input_shm = desktop->foreground_input ? desktop->foreground_input->shared : &dummy_obj.shm.input;
 
-    set_clip_rectangle( desktop, NULL, SET_CURSOR_NOCLIP, 1 );
+    /* A process that clipped the cursor and is only now taking the foreground
+       — a game that grabs the mouse before its window is up — keeps its clip.
+       Every other change of foreground releases it. Without this the game's
+       own activation threw the clip away and nothing asked for it again, so
+       mouse-look never held the pointer. The clip is handed on after the new
+       foreground is recorded, because that is the thread the driver's clip
+       message has to reach. */
+    keeps_clip = desktop->clip_pid && desktop->clip_pid == process->id;
+    if (!keeps_clip) set_clip_rectangle( desktop, NULL, SET_CURSOR_NOCLIP, 1 );
     desktop->foreground_input = input;
     desktop->foreground_pid = process->id;
+    if (keeps_clip)
+    {
+        process_id_t owner = desktop->clip_pid;
+
+        set_clip_rectangle( desktop, &desktop->clip_rect, desktop->clip_flags, 0 );
+        desktop->clip_pid = owner;
+    }
 
     SHARED_WRITE_BEGIN( old_input_shm, input_shm_t )
     {

@@ -84,6 +84,8 @@ struct desktop
     unsigned char        alt_pressed;      /* last key press was Alt (used to determine msg on release) */
     struct key_repeat    key_repeat;       /* key auto-repeat */
     unsigned int         clip_flags;       /* last cursor clip flags */
+    struct rectangle     clip_rect;        /* last cursor clip rectangle */
+    process_id_t         clip_pid;         /* id of the process that clipped the cursor */
     user_handle_t        cursor_win;       /* window that contains the cursor */
     desktop_shm_t       *shared;           /* desktop session shared memory */
 };

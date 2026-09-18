@@ -281,6 +281,8 @@ static bool desktop_init( struct object *obj, const void *init_data )
     desktop->foreground_pid = 0;
     desktop->users = 0;
     desktop->clip_flags = 0;
+    desktop->clip_pid = 0;
+    memset( &desktop->clip_rect, 0, sizeof(desktop->clip_rect) );
     desktop->cursor_win = 0;
     desktop->alt_pressed = 0;
     memset( &desktop->key_repeat, 0, sizeof(desktop->key_repeat) );
