@@ -156,10 +156,13 @@ static inline int futex_wait( const LONG *addr, int val, struct timespec *timeou
 #ifdef MAC_OS_VERSION_14_4
     if (__builtin_available( macOS 14.4, * ))
     {
-        /* 18446744073 seconds could overflow a uint64_t in nanoseconds */
-        if (timeout && timeout->tv_sec < 18446744073)
+        /* 18446744073 seconds could overflow a uint64_t in nanoseconds; a wait that long
+         * is waited for in pieces rather than becoming the untimed call below. */
+        if (timeout)
         {
-            uint64_t ns_timeout = (timeout->tv_sec * 1000000000) + timeout->tv_nsec;
+            uint64_t ns_timeout = timeout->tv_sec >= 18446744073
+                ? 18446744072ull * 1000000000ull
+                : ((uint64_t)timeout->tv_sec * 1000000000) + timeout->tv_nsec;
 
             if (!ns_timeout)
             {
@@ -174,29 +177,48 @@ static inline int futex_wait( const LONG *addr, int val, struct timespec *timeou
     }
 #endif
 
-    /* 4294 seconds could overflow a uint32_t in microseconds */
-    if (timeout && timeout->tv_sec < 4294)
+    /* A timeout that does not fit the argument is waited for in pieces: zero means
+     * "forever" to both syscalls, so handing the overflow straight through turns a
+     * finite wait into an endless one. A piece that expires reports ETIMEDOUT and the
+     * caller, which holds the real deadline, decides whether that is the end. */
+    if (timeout)
     {
-        uint32_t us_timeout = ((uint32_t)timeout->tv_sec * 1000000) + ((uint32_t)timeout->tv_nsec / 1000);
+        uint64_t us_timeout;
 
+        if (timeout->tv_sec >= 4294) us_timeout = 4293u * 1000000u;
+        else
+        {
+            us_timeout = ((uint64_t)timeout->tv_sec * 1000000) + ((uint64_t)timeout->tv_nsec / 1000);
+            /* Anything under a microsecond still has to wait: rounding it to zero would
+             * mean "forever" below and reads as an immediate timeout above. */
+            if (!us_timeout && timeout->tv_nsec) us_timeout = 1;
+        }
         if (!us_timeout)
         {
             errno = ETIMEDOUT;
             return -1;
         }
-        return __ulock_wait( UL_COMPARE_AND_WAIT, (void *)addr, (uint64_t)val, us_timeout );
+        return __ulock_wait( UL_COMPARE_AND_WAIT, (void *)addr, (uint64_t)val, (uint32_t)us_timeout );
     }
 
     return __ulock_wait( UL_COMPARE_AND_WAIT, (void *)addr, (uint64_t)val, 0 );
 }
 
+/* An interrupted wake woke nobody, and the sleeper it was for has no second waker. */
 static inline int futex_wake_one( const LONG *addr )
 {
+    int ret;
+
+    do
+    {
 #ifdef MAC_OS_VERSION_14_4
-    if (__builtin_available( macOS 14.4, * ))
-        return os_sync_wake_by_address_any( (void *)addr, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE );
+        if (__builtin_available( macOS 14.4, * ))
+            ret = os_sync_wake_by_address_any( (void *)addr, 4, OS_SYNC_WAKE_BY_ADDRESS_NONE );
+        else
 #endif
-    return __ulock_wake( UL_COMPARE_AND_WAIT, (void *)addr, 0 );
+            ret = __ulock_wake( UL_COMPARE_AND_WAIT, (void *)addr, 0 );
+    } while (ret == -1 && errno == EINTR);
+    return ret;
 }
 
 #endif /* __APPLE__ */
@@ -3609,6 +3631,12 @@ static union tid_alert_entry *get_tid_alert_entry( HANDLE tid )
 }
 
 
+#ifdef USE_FUTEX
+/* The states of a thread's alert word. Only its own thread arms it, and only an armed
+ * word costs the waker a system call. */
+enum { ALERT_EMPTY, ALERT_NOTIFIED, ALERT_PARKED };
+#endif
+
 /***********************************************************************
  *             NtAlertMultipleThreadByThreadId (NTDLL.@)
  */
@@ -3642,7 +3670,9 @@ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
 #ifdef USE_FUTEX
     {
         LONG *futex = &entry->futex;
-        if (!InterlockedExchange( futex, 1 ))
+        /* Only a waiter that armed the word is in the kernel; one that is still looking
+         * at it finds the notification by itself. */
+        if (InterlockedExchange( futex, ALERT_NOTIFIED ) == ALERT_PARKED)
             futex_wake_one( futex );
         return STATUS_SUCCESS;
     }
@@ -3693,6 +3723,46 @@ static LONGLONG update_timeout( ULONGLONG end )
 /***********************************************************************
  *             NtWaitForAlertByThreadId (NTDLL.@)
  */
+/* How long NtWaitForAlertByThreadId looks at its own word before parking, in
+ * YieldProcessor iterations. SEVO_WAIT_SPIN overrides the default; 0 parks on the
+ * first look. */
+#ifndef SEVO_WAIT_SPIN_DEFAULT
+#define SEVO_WAIT_SPIN_DEFAULT 0
+#endif
+
+static int alert_spin_count = -1;
+
+static int alert_spin_budget(void)
+{
+    if (alert_spin_count < 0)
+    {
+        const char *value = getenv( "SEVO_WAIT_SPIN" );
+        int parsed = value ? atoi( value ) : SEVO_WAIT_SPIN_DEFAULT;
+        alert_spin_count = parsed < 0 ? 0 : parsed;
+    }
+    return alert_spin_count;
+}
+
+/* Take the notification if it is there. */
+static inline BOOL consume_alert( LONG *futex )
+{
+    return InterlockedCompareExchange( futex, ALERT_EMPTY, ALERT_NOTIFIED ) == ALERT_NOTIFIED;
+}
+
+/* Reads only: exchanging here would write to the line the waker is about to write.
+ * Returns TRUE when the word looks set and is worth consuming. */
+static inline BOOL spin_for_alert( LONG *futex )
+{
+    int budget = alert_spin_budget();
+
+    while (budget--)
+    {
+        YieldProcessor();
+        if (__atomic_load_n( futex, __ATOMIC_RELAXED ) == ALERT_NOTIFIED) return TRUE;
+    }
+    return FALSE;
+}
+
 NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEGER *timeout )
 {
     union tid_alert_entry *entry = get_tid_alert_entry( ULongToHandle(get_thread_data()->tid) );
@@ -3715,7 +3785,15 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
                 end = get_absolute_timeout( timeout );
         }
 
-        while (!InterlockedExchange( futex, 0 ))
+        if (consume_alert( futex )) return STATUS_ALERTED;
+
+        /* A notification that is already on its way costs less to wait out here than to
+         * park for, and the waker of an unarmed word makes no system call at all. */
+        if (spin_for_alert( futex ) && consume_alert( futex )) return STATUS_ALERTED;
+
+        /* Arm the word, then park on the armed value. A failed arm means the
+         * notification arrived first; a word already armed is a wait being resumed. */
+        while (InterlockedCompareExchange( futex, ALERT_PARKED, ALERT_EMPTY ) != ALERT_NOTIFIED)
         {
             if (timeout)
             {
@@ -3724,13 +3802,21 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
 
                 timespec.tv_sec = timeleft / (ULONGLONG)TICKSPERSEC;
                 timespec.tv_nsec = (timeleft % TICKSPERSEC) * 100;
-                ret = futex_wait( futex, 0, &timespec );
+                ret = futex_wait( futex, ALERT_PARKED, &timespec );
             }
             else
-                ret = futex_wait( futex, 0, NULL );
+                ret = futex_wait( futex, ALERT_PARKED, NULL );
 
-            if (ret == -1 && errno == ETIMEDOUT) return STATUS_TIMEOUT;
+            /* futex_wait waits in pieces when a timeout does not fit its argument, so a
+             * piece expiring only ends the wait once the deadline itself has passed. A
+             * notification that beats the disarm stays in the word for the next wait. */
+            if (ret == -1 && errno == ETIMEDOUT && timeout && !update_timeout( end ))
+            {
+                InterlockedCompareExchange( futex, ALERT_EMPTY, ALERT_PARKED );
+                return STATUS_TIMEOUT;
+            }
         }
+        consume_alert( futex );
         return STATUS_ALERTED;
     }
 #elif defined(HAVE_KQUEUE)

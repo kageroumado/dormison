@@ -537,7 +537,10 @@ void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
             }
             else
             {
+                /* Owned: there is nothing to publish, so a thread that is only going to
+                 * wait leaves the lock's cache line unwritten. */
                 wait = TRUE;
+                break;
             }
         } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
 
@@ -835,19 +838,34 @@ struct futex_queue
     LONG lock;
 };
 
-static struct futex_queue futex_queues[256];
+/* One bucket per cache line: two addresses that hash apart should not make their
+ * waiters write to the same line. */
+struct DECLSPEC_ALIGN(64) futex_bucket
+{
+    struct futex_queue queue;
+    char padding[64 - sizeof(struct futex_queue) % 64];
+};
 
+static struct futex_bucket futex_buckets[256];
+
+/* A game lays out an array of locks at the same offset in page after page, so the
+ * bucket has to depend on every address bit: multiplying by the golden ratio carries
+ * them all into the top of the word, where the bucket is taken from. */
 static struct futex_queue *get_futex_queue( const void *addr )
 {
     ULONG_PTR val = (ULONG_PTR)addr;
 
-    return &futex_queues[(val >> 4) % ARRAY_SIZE(futex_queues)];
+    return &futex_buckets[(unsigned int)((val * 0x9e3779b97f4a7c15ull) >> 56)].queue;
 }
 
+/* Test, then test-and-set: a failing attempt should read the line, not write it. */
 static void spin_lock( LONG *lock )
 {
-    while (InterlockedCompareExchange( lock, -1, 0 ))
-        YieldProcessor();
+    for (;;)
+    {
+        if (!InterlockedCompareExchange( lock, -1, 0 )) return;
+        while (ReadNoFence( lock )) YieldProcessor();
+    }
 }
 
 static void spin_unlock( LONG *lock )
@@ -908,14 +926,14 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
 
     ret = NtWaitForAlertByThreadId( NULL, timeout );
 
-    /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). */
+    /* The entry lives on this stack frame, and a waker that has cleared `addr` is not
+     * finished with it — RtlWakeAddressAll reads `tid` after the clear. Taking the lock
+     * serializes against every waker before the entry dies; never skip it on an unlocked
+     * read of `addr`. */
+    spin_lock( &queue->lock );
     if (entry.addr)
-    {
-        spin_lock( &queue->lock );
-        if (entry.addr)
-            list_remove( &entry.entry );
-        spin_unlock( &queue->lock );
-    }
+        list_remove( &entry.entry );
+    spin_unlock( &queue->lock );
 
     TRACE("returning %#lx\n", ret);
 
@@ -942,26 +960,30 @@ void WINAPI RtlWakeAddressAll( const void *addr )
     if (!queue->queue.next)
         list_init(&queue->queue);
 
-    LIST_FOR_EACH_ENTRY_SAFE( entry, next, &queue->queue, struct futex_entry, entry )
+    /* More waiters on one address than the batch holds: the lock is dropped between
+     * batches rather than the system call being made under it, and the walk starts
+     * again from the head — the entries already taken no longer match. */
+    for (;;)
     {
-        if (entry->addr == addr)
+        count = 0;
+        LIST_FOR_EACH_ENTRY_SAFE( entry, next, &queue->queue, struct futex_entry, entry )
         {
+            if (entry->addr != addr) continue;
+            tids[count++] = (HANDLE)(ULONG_PTR)entry->tid;
             entry->addr = NULL;
             list_remove( &entry->entry );
-            if (count == ARRAY_SIZE(tids))
-            {
-                NtAlertMultipleThreadByThreadId( tids, count, NULL, NULL );
-                count = 0;
-            }
-            tids[count++] = (HANDLE)(ULONG_PTR)entry->tid;
+            if (count == ARRAY_SIZE(tids)) break;
         }
-    }
 
-    /* Try not to make a system call while holding a spinlock (even if that can be responsible for spurious wake
-     * up scenario). */
-    spin_unlock( &queue->lock );
-    if (count)
-        NtAlertMultipleThreadByThreadId( tids, count, NULL, NULL );
+        /* Never a system call while holding a spinlock (even if that can be responsible
+         * for a spurious wake up scenario). */
+        spin_unlock( &queue->lock );
+        if (count)
+            NtAlertMultipleThreadByThreadId( tids, count, NULL, NULL );
+        if (count < ARRAY_SIZE(tids)) return;
+
+        spin_lock( &queue->lock );
+    }
 }
 
 /***********************************************************************

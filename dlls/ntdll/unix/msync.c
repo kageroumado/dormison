@@ -343,6 +343,14 @@ static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
     return STATUS_SUCCESS;
 }
 
+#if defined(__x86_64__) || defined(__i386__)
+#define YIELD_PROCESSOR __asm__ __volatile__( "pause" ::: "memory" )
+#elif defined(__aarch64__)
+#define YIELD_PROCESSOR __asm__ __volatile__( "yield" ::: "memory" )
+#else
+#define YIELD_PROCESSOR do {} while (0)
+#endif
+
 static inline int check_shm_contention( void **objs_shm, void *alert_obj_shm, int count, int tid )
 {
     int i, val;
@@ -386,14 +394,30 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
     if (mr != MACH_MSG_SUCCESS)
         return STATUS_PENDING;
 
-    while (__atomic_load_n( addr, __ATOMIC_ACQUIRE ) == 2)
+    /* Waiting for the server to acknowledge the registration. The writer of `addr` has
+     * no wake protocol for a sleeper, so this is a spin: it yields the core, rechecks
+     * the objects every 64th turn, and gives up at the deadline. */
     {
-        if (check_shm_contention( objs_shm, alert_obj_shm, count, tid ))
+        unsigned int turn = 0;
+
+        while (__atomic_load_n( addr, __ATOMIC_ACQUIRE ) == 2)
         {
-            /* The registration is already submitted: the removal makes the
-             * server drop its nodes, and the interest counts drop with it. */
-            server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
-            return STATUS_PENDING;
+            YIELD_PROCESSOR;
+            if (!(++turn & 0x3f))
+            {
+                if (check_shm_contention( objs_shm, alert_obj_shm, count, tid ))
+                {
+                    /* The registration is already submitted: the removal makes the
+                     * server drop its nodes, and the interest counts drop with it. */
+                    server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+                    return STATUS_PENDING;
+                }
+                if (end && !update_timeout( *end ))
+                {
+                    server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+                    return STATUS_TIMEOUT;
+                }
+            }
         }
     }
 
