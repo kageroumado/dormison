@@ -12,8 +12,8 @@
  * by every process that draws, which is the only place a patch can sit without putting a
  * file next to a game's executable.
  *
- * Off unless SEVO_FORCE_UMA says otherwise: 1 reports UMA, 2 also reports
- * CacheCoherentUMA. A game that believes the second one may write into memory expecting
+ * Off unless SEVO_FORCE_UMA says otherwise: 1 reports UMA and leaves CacheCoherentUMA as
+ * the device answered it, 2 also reports CacheCoherentUMA. A game that believes the second one may write into memory expecting
  * no flush, so it is deliberately a separate step.
  *
  * Copyright 2026 kageroumado
@@ -80,7 +80,7 @@ static HRESULT STDMETHODCALLTYPE uma_check_feature_support(ID3D12Device *device,
     {
         D3D12_FEATURE_DATA_ARCHITECTURE *architecture = data;
         architecture->UMA = TRUE;
-        architecture->CacheCoherentUMA = force_uma >= 2;
+        if (force_uma >= 2) architecture->CacheCoherentUMA = TRUE;
         TRACE("ARCHITECTURE node %u -> UMA 1, coherent %u\n",
               architecture->NodeIndex, architecture->CacheCoherentUMA);
     }
@@ -89,7 +89,7 @@ static HRESULT STDMETHODCALLTYPE uma_check_feature_support(ID3D12Device *device,
     {
         D3D12_FEATURE_DATA_ARCHITECTURE1 *architecture = data;
         architecture->UMA = TRUE;
-        architecture->CacheCoherentUMA = force_uma >= 2;
+        if (force_uma >= 2) architecture->CacheCoherentUMA = TRUE;
         TRACE("ARCHITECTURE1 node %u -> UMA 1, coherent %u\n",
               architecture->NodeIndex, architecture->CacheCoherentUMA);
     }
@@ -131,7 +131,7 @@ static void patch_device_vtable(void)
         real_check_feature_support = device->lpVtbl->CheckFeatureSupport;
         *slot = uma_check_feature_support;
         VirtualProtect(slot, sizeof(*slot), old, &old);
-        note("reporting UMA=1 coherent=%d to this process", force_uma >= 2);
+        note("reporting UMA=1 coherent=%s to this process", force_uma >= 2 ? "1" : "device");
     }
     else note("the vtable is not writable (error %lu); nothing changed", GetLastError());
 
