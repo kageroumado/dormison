@@ -43,6 +43,7 @@ SOURCES = \
 	mouse.c \
 	opengl.c \
 	sevo_provenance.c \
+	sevo_uma.c \
 	sevo_stats.c \
 	surface.c \
 	systray.c \

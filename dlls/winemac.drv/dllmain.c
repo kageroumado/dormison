@@ -701,6 +701,9 @@ static void fill_d3dmetal_host_callbacks(UINT64 *callbacks)
 #endif  /* _WIN64 */
 
 
+/* sevo_uma.c: reports the memory the hardware has, when asked to. */
+extern void sevo_uma_init(void);
+
 static BOOL process_attach(void)
 {
     struct init_params params;
@@ -739,6 +742,8 @@ static BOOL process_attach(void)
     params.d3dmetal_unixlib_handle = __wine_unixlib_handle;
 
     if (MACDRV_CALL(init, &params)) return FALSE;
+
+    sevo_uma_init();
 
     return TRUE;
 }
