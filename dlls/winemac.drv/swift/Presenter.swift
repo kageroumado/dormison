@@ -709,12 +709,17 @@ class ViewPresenter: NSObject {
         }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        layer.string = text
+        defer { CATransaction.commit() }
         let bounds = layer.superlayer?.bounds ?? host.bounds
+        // A message box or a splash is a window of the game's too, and the readout would
+        // cover what it says.
+        layer.isHidden = bounds.width < ReadoutMetrics.smallestWindow.width
+            || bounds.height < ReadoutMetrics.smallestWindow.height
+        guard !layer.isHidden else { return }
+        layer.string = text
         // Bottom left, clear of the title bar the topmost layer also spans.
         let y = (layer.superlayer?.isGeometryFlipped ?? false) ? bounds.height - 44 : 8
         layer.frame = CGRect(x: 8, y: y, width: min(max(bounds.width - 16, 200), 640), height: 36)
-        CATransaction.commit()
     }
 
     private func summarize() {
@@ -1074,4 +1079,10 @@ final class SevoDrawable: NSObject, CAMetalDrawable {
     func present(afterMinimumDuration duration: CFTimeInterval) {
         presenter.presentDirectly(self) { $0.present(afterMinimumDuration: duration) }
     }
+}
+
+/// The smallest window the picture readout is drawn in, in points. The line is 36 points tall
+/// and at least 200 wide; a game's own window is never this small, its dialogs usually are.
+enum ReadoutMetrics {
+    static let smallestWindow = CGSize(width: 320, height: 240)
 }
