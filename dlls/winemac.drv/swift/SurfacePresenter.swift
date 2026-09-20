@@ -24,11 +24,13 @@ import Foundation
 import Metal
 import QuartzCore
 
-/// A GDI surface's presenter. The DIB is read on the program's thread only,
-/// inside `flush`, where win32u holds the surface lock that keeps the
+/// A GDI surface's presenter. The DIB is read inside `flush`, on the
+/// program's thread, where win32u holds the surface lock that keeps the
 /// program from drawing: the dirty rectangle is copied into a staging slot
 /// there, and the GPU blits the slot into the frame texture on the
-/// presenter's queue. The frame texture is the accumulated truth of what the
+/// presenter's queue. A refresh that finds a frame texture made new by a
+/// layout fills it from the DIB too, without that lock: a picture caught
+/// mid-draw is put right by the flush that ends the draw. The frame texture is the accumulated truth of what the
 /// view shows (win32u rounds a surface up to 128 pixels, and the rest is
 /// never drawn); a refresh presents it again, and a resize seeds the new
 /// texture from the old one on the GPU. Frames go on screen from a display
@@ -82,8 +84,8 @@ final class SurfacePresenter: ViewPresenter {
     /// while it is meant to run.
     private let linkQueue = DispatchQueue(label: "sevo.surface.link", qos: .userInteractive)
 
-    /// `deallocator` runs when the presenter goes away; every read of the
-    /// DIB happens inside `flush`, so nothing reads it after that.
+    /// `deallocator` runs when the presenter goes away, after its last read
+    /// of the DIB.
     init?(
         bits: UnsafeMutableRawPointer, size: Int, bytesPerRow: Int, width: Int, height: Int,
         deallocator: @escaping (UnsafeMutableRawPointer, Int) -> Void

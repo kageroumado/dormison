@@ -39,9 +39,9 @@ extern int sevo_presenter_init(const char *upscaler, const char *final_filter, c
 extern void *sevo_presenter_attach(void *renderer_layer);
 /* Takes over one GDI window surface. `bits` is the DIB the program draws
    into (BGRA, top-down, `stride` bytes per row, `width` x `height` pixels),
-   in an allocation of `size` bytes. The presenter reads the DIB only inside
-   sevo_presenter_surface_flush, and calls `release(context)` once the handle
-   is gone. The returned handle owns the on-screen layer; NULL when the
+   in an allocation of `size` bytes. The presenter reads the DIB inside
+   sevo_presenter_surface_flush and when a refresh fills a frame a layout made
+   new, and calls `release(context)` once the handle is gone. The returned handle owns the on-screen layer; NULL when the
    presenter is not running, in which case `release` is never called. */
 extern void *sevo_presenter_attach_surface(void *bits, size_t size, int stride, int width, int height,
                                            void (*release)(void *context), void *context);
