@@ -3,6 +3,15 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r14
+
+- A game drawn with GDI no longer hangs with the upscaler on. The view that shows a window
+  surface's frames called into its presenter from `dealloc`, and AppKit keeps a removed view
+  in the autorelease pool — while the pointer is over it, for one — until after the presenter
+  has been released: the call landed in freed memory on the Cocoa main thread, and the
+  window stayed on "Initializing.." under a spinning cursor. The view holds the layer it
+  hosts and forgets the presenter when it is detached. Found with Gore Screaming Show.
+
 ## r13
 
 - OpenGL games go through the presenter. wined3d's Direct3D 9, which is what most visual

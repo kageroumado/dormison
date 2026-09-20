@@ -425,10 +425,12 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 @interface WineSurfaceView : WineBaseView
 {
     void* _presenter;
+    CALayer* _hostedLayer;
 }
 
     - (id) initWithFrame:(NSRect)frame presenter:(void*)presenter;
     - (void*) presenter;
+    - (void) presenterWillDetach;
     - (void) presentationLayoutChanged;
 
 @end
@@ -924,6 +926,7 @@ static NSView* wine_content_view_of(NSWindow* window)
         if (!_surfaceView) return;
         if (presenter && [_surfaceView presenter] != presenter) return;
         presenter_trace("surface view %p released", _surfaceView);
+        [_surfaceView presenterWillDetach];
         [_surfaceView removeFromSuperview];
         [_surfaceView release];
         _surfaceView = nil;
@@ -1402,6 +1405,7 @@ static NSView* wine_content_view_of(NSWindow* window)
             CALayer* layer = (CALayer*)sevo_presenter_onscreen_layer(presenter);
 
             _presenter = presenter;
+            _hostedLayer = [layer retain];
             self.wantsLayer = YES;
             self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawNever;
             layer.anchorPoint = CGPointZero;
@@ -1412,9 +1416,20 @@ static NSView* wine_content_view_of(NSWindow* window)
         return self;
     }
 
+    /* The presenter is the caller's and is released right after the view is
+       detached, while AppKit may keep the view in an autorelease pool until
+       the pool pops. From here on the view knows no presenter: the layer it
+       hosts is its own reference, and dealloc touches nothing else. */
+    - (void) presenterWillDetach
+    {
+        [_hostedLayer removeFromSuperlayer];
+        _presenter = NULL;
+    }
+
     - (void) dealloc
     {
-        [(CALayer*)sevo_presenter_onscreen_layer(_presenter) removeFromSuperlayer];
+        [_hostedLayer removeFromSuperlayer];
+        [_hostedLayer release];
         [super dealloc];
     }
 
@@ -1427,10 +1442,10 @@ static NSView* wine_content_view_of(NSWindow* window)
        presenter's, so this is points. */
     - (void) sizeHostedLayer
     {
-        CALayer* hosted = (CALayer*)sevo_presenter_onscreen_layer(_presenter);
+        CALayer* hosted = _hostedLayer;
         CGRect bounds = CGRectMake(0, 0, NSWidth([self bounds]), NSHeight([self bounds]));
 
-        if (CGRectEqualToRect(hosted.bounds, bounds)) return;
+        if (!_presenter || CGRectEqualToRect(hosted.bounds, bounds)) return;
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         hosted.bounds = bounds;
@@ -1460,7 +1475,7 @@ static NSView* wine_content_view_of(NSWindow* window)
 
     - (void) updateLayer
     {
-        sevo_presenter_refresh(_presenter);
+        if (_presenter) sevo_presenter_refresh(_presenter);
     }
 
     /* Device pixels per point of this view: the window's presentation
@@ -1471,6 +1486,7 @@ static NSView* wine_content_view_of(NSWindow* window)
         NSWindow* window = [self window];
         CGFloat deviceScale = 0;
 
+        if (!_presenter) return;
         if ([window isKindOfClass:[WineWindow class]])
             deviceScale = [(WineWindow*)window presentationScale] * [window backingScaleFactor];
         else if (window)
