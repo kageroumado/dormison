@@ -2387,6 +2387,36 @@ static inline BOOL check_invalid_gsbase( struct thread_data *data, ucontext_t *u
 }
 
 
+#ifdef __APPLE__
+/***********************************************************************
+ *           fault_on_foreign_thread
+ *
+ * Every Wine thread runs its handlers on the alternate stack its thread data
+ * lives in. A thread that is not on one was made by the system: the process's
+ * first thread, where AppKit runs, a Core Audio or a dispatch worker. It has
+ * no TEB to raise an exception in, and ending it alone leaves a process whose
+ * windows answer nothing. The signal gets its default action back, so
+ * returning faults again at the same instruction, the process ends, and the
+ * crash report names the frame. A signal another process sent (SI_USER) is
+ * no fault of the thread it landed on and takes the usual path.
+ */
+static BOOL fault_on_foreign_thread( int signal, const siginfo_t *siginfo )
+{
+    struct sigaction sig_act;
+    stack_t stack;
+
+    if (signal != SIGABRT && siginfo->si_code == SI_USER) return FALSE;
+    if (sigaltstack( NULL, &stack ) || (stack.ss_flags & SS_ONSTACK)) return FALSE;
+    memset( &sig_act, 0, sizeof(sig_act) );
+    sig_act.sa_handler = SIG_DFL;
+    sigaction( signal, &sig_act, NULL );
+    return TRUE;
+}
+#else
+static BOOL fault_on_foreign_thread( int signal, const siginfo_t *siginfo ) { return FALSE; }
+#endif
+
+
 /**********************************************************************
  *		segv_handler
  *
@@ -2481,6 +2511,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
         break;
     }
+    if (fault_on_foreign_thread( signal, siginfo )) return;
     if (handle_syscall_fault( data, sigcontext, &rec, &context.c )) return;
     setup_raise_exception( data, sigcontext, &rec, &context );
 }
@@ -2498,6 +2529,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     struct xcontext context;
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(sigcontext) };
 
+    if (fault_on_foreign_thread( signal, siginfo )) return;
     if (handle_syscall_trap( data, sigcontext, siginfo )) return;
 
     save_context( data, &context, sigcontext );
@@ -2643,6 +2675,7 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
                              .ExceptionFlags = EXCEPTION_NONCONTINUABLE,
                              .ExceptionAddress = (void *)RIP_sig(sigcontext) };
 
+    if (fault_on_foreign_thread( signal, siginfo )) return;
     save_context( data, &context, sigcontext );
     setup_raise_exception( data, sigcontext, &rec, &context );
 }
