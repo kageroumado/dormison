@@ -24,6 +24,7 @@
 
 #include "macdrv_cocoa.h"
 #import "cocoa_app.h"
+#include "sevo_stats.h"
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
@@ -94,6 +95,14 @@ static void run_cocoa_app(void* info)
     {
         @autoreleasepool
         {
+            /* Once a second, in every common mode, so a menu or a window drag
+               does not read as a stopped main thread. */
+            NSTimer* beat = [NSTimer timerWithTimeInterval:1 repeats:YES block:^(NSTimer* timer){
+                sevo_stats_note_main_beat();
+            }];
+            beat.tolerance = 0.2;
+            [[NSRunLoop mainRunLoop] addTimer:beat forMode:NSRunLoopCommonModes];
+
             /* Never returns */
             [NSApp run];
         }

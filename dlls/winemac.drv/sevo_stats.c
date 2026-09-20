@@ -58,6 +58,7 @@ struct stats_page
     _Atomic uint32_t source;
     uint32_t         appid;
     char             exe[32];
+    _Atomic uint64_t main_beat_ns;
 };
 
 _Static_assert(sizeof(struct stats_page) == sizeof(struct sevo_stats_page),
@@ -168,6 +169,7 @@ static void open_page(void)
     mapped->pid = (uint32_t)getpid();
     mapped->appid = process_appid;
     mapped->start_ns = uptime_ns();
+    atomic_store_explicit(&mapped->main_beat_ns, mapped->start_ns, memory_order_relaxed);
     memcpy(mapped->exe, process_exe, sizeof(mapped->exe));
     /* Last, and with release ordering: the magic is what says the rest of
        the page is there to be read. */
@@ -215,6 +217,13 @@ void sevo_stats_note_drawable(void)
     pthread_once(&page_once, open_page);
     if (!(current_page = atomic_load_explicit(&page, memory_order_acquire))) return;
     atomic_fetch_add_explicit(&current_page->drawables, 1, memory_order_relaxed);
+}
+
+void sevo_stats_note_main_beat(void)
+{
+    struct stats_page *current_page = atomic_load_explicit(&page, memory_order_acquire);
+
+    if (current_page) atomic_store_explicit(&current_page->main_beat_ns, uptime_ns(), memory_order_relaxed);
 }
 
 void sevo_stats_note_window(unsigned long long window_id)

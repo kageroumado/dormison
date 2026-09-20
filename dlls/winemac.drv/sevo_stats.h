@@ -68,6 +68,12 @@ struct sevo_stats_page
     /* The Steam app id, 0 when the process has none. */
     uint32_t appid;
     char     exe[32];
+    /* When the Cocoa main thread's run loop last turned, written once a
+       second by a timer on that loop. Presents keep counting from the
+       program's own threads while the main thread is blocked or gone, and a
+       window then answers nothing; this is the one field that stops. Zero on
+       a page from an engine that does not write it. */
+    uint64_t main_beat_ns;
 };
 
 /* Names the process for the page it will make. Called once, before any
@@ -78,6 +84,9 @@ extern unsigned int sevo_stats_appid(void);
 
 extern void sevo_stats_note_present(unsigned int source);
 extern void sevo_stats_note_drawable(void);
+/* The main thread's run loop turned. Writes to a page a present has made and
+   makes none, so a process that never draws still leaves no file. */
+extern void sevo_stats_note_main_beat(void);
 /* Frames so far (drawables when D3DMetal takes any, presents otherwise) and the
    Cocoa window number they go to; both 0 before the first present. */
 extern unsigned long long sevo_stats_frame_count(unsigned long long *window_id);
