@@ -55,7 +55,9 @@
 #include <stdlib.h>
 #include <time.h>
 #ifdef __APPLE__
+# include <mach/mach.h>
 # include <mach/mach_time.h>
+# include <mach/thread_switch.h>
 #endif
 #ifdef HAVE_KQUEUE
 # include <sys/event.h>
@@ -72,6 +74,7 @@
 #include "wine/debug.h"
 #include "unix_private.h"
 #include "msync.h"
+#include "sevo_sync_stats.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
@@ -222,6 +225,85 @@ static inline int futex_wake_one( const LONG *addr )
 }
 
 #endif /* __APPLE__ */
+
+int sevo_sync_stats_enabled;
+static const char *sync_stats_path;
+static struct sevo_sync_stats *sync_stats_blocks;
+static pthread_mutex_t sync_stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+static __thread struct sevo_sync_stats *sync_stats_mine;
+
+static const char * const sync_stat_names[] =
+{
+#define X(name) #name,
+    SEVO_SYNC_COUNTERS
+#undef X
+};
+
+__attribute__((constructor)) static void sevo_sync_stats_init(void)
+{
+    sync_stats_path = getenv( "SEVO_SYNC_STATS" );
+    sevo_sync_stats_enabled = sync_stats_path && *sync_stats_path;
+}
+
+struct sevo_sync_stats *sevo_sync_stats_block(void)
+{
+    struct sevo_sync_stats *block = sync_stats_mine;
+
+    if (!block)
+    {
+        static struct sevo_sync_stats overflow;  /* counted into, unlocked, if memory runs out */
+
+        if (!(block = calloc( 1, sizeof(*block) ))) return &overflow;
+        pthread_mutex_lock( &sync_stats_mutex );
+        block->next = sync_stats_blocks;
+        sync_stats_blocks = block;
+        pthread_mutex_unlock( &sync_stats_mutex );
+        sync_stats_mine = block;
+    }
+    return block;
+}
+
+/* One JSON line per process, appended in a single write so lines from processes that
+ * exit together stay whole. */
+void sevo_sync_stats_dump(void)
+{
+    static LONG dumped;
+    struct sevo_sync_stats total = {0}, *block;
+    unsigned int i, threads = 0;
+    char line[4096];
+    int len, fd;
+
+    if (!sevo_sync_stats_enabled || InterlockedExchange( &dumped, 1 )) return;
+
+    pthread_mutex_lock( &sync_stats_mutex );
+    for (block = sync_stats_blocks; block; block = block->next, threads++)
+    {
+        for (i = 0; i < SEVO_STAT_COUNT; i++) total.counters[i] += block->counters[i];
+        for (i = 0; i < SEVO_SPIN_HISTOGRAM_BUCKETS; i++) total.spin_hit_iteration[i] += block->spin_hit_iteration[i];
+    }
+    pthread_mutex_unlock( &sync_stats_mutex );
+
+    /* The command line as far as it fits, with what JSON cannot carry replaced. */
+    len = snprintf( line, sizeof(line), "{\"pid\":%d,\"argv\":\"", (int)getpid() );
+    for (i = 0; main_argv && main_argv[i] && i < 12; i++)
+    {
+        const char *arg;
+        if (i) line[len++] = ' ';
+        for (arg = main_argv[i]; *arg && len < 512; arg++)
+            line[len++] = (*arg == '"' || *arg == '\\' || (unsigned char)*arg < 0x20) ? '/' : *arg;
+    }
+    len += snprintf( line + len, sizeof(line) - len, "\",\"threads\":%u", threads );
+    for (i = 0; i < SEVO_STAT_COUNT && len < sizeof(line) - 64; i++)
+        len += snprintf( line + len, sizeof(line) - len, ",\"%s\":%llu", sync_stat_names[i], total.counters[i] );
+    len += snprintf( line + len, sizeof(line) - len, ",\"spin_hit_iteration_log2\":[" );
+    for (i = 0; i < SEVO_SPIN_HISTOGRAM_BUCKETS && len < sizeof(line) - 32; i++)
+        len += snprintf( line + len, sizeof(line) - len, "%s%llu", i ? "," : "", total.spin_hit_iteration[i] );
+    len += snprintf( line + len, sizeof(line) - len, "]}\n" );
+
+    if ((fd = open( sync_stats_path, O_WRONLY | O_CREAT | O_APPEND, 0644 )) == -1) return;
+    write( fd, line, len );
+    close( fd );
+}
 
 /* create a struct security_descriptor and contained information in one contiguous piece of memory */
 unsigned int wine_server_alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct object_attributes **ret,
@@ -2526,8 +2608,43 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
 /******************************************************************
  *		NtYieldExecution (NTDLL.@)
  */
+#ifdef __APPLE__
+/* What a yield is, chosen by SEVO_YIELD:
+ *   0  sched_yield(), the portable call
+ *   1  thread_switch() with no hint: the same request to the scheduler at a fifth of the
+ *      cost under Rosetta
+ *   2  thread_switch() with a one-millisecond priority depression: a thread that polls by
+ *      yielding stops competing with the threads doing the work it is polling for, which is
+ *      what matters once there are more runnable threads than cores
+ */
+static int yield_mode(void)
+{
+    static LONG mode = -1;
+    LONG value = __atomic_load_n( &mode, __ATOMIC_RELAXED );
+
+    if (value < 0)
+    {
+        value = sevo_env_budget( "SEVO_YIELD", 0, 2 );
+        __atomic_store_n( &mode, value, __ATOMIC_RELAXED );
+    }
+    return value;
+}
+#endif
+
 NTSTATUS WINAPI NtYieldExecution(void)
 {
+    SEVO_STAT( yields );
+#ifdef __APPLE__
+    switch (yield_mode())
+    {
+    case 1:
+        thread_switch( MACH_PORT_NULL, SWITCH_OPTION_NONE, 0 );
+        return STATUS_SUCCESS;
+    case 2:
+        thread_switch( MACH_PORT_NULL, SWITCH_OPTION_DEPRESS, 1 );
+        return STATUS_SUCCESS;
+    }
+#endif
 #ifdef HAVE_SCHED_YIELD
 #ifdef RUSAGE_THREAD
     struct rusage u1, u2;
@@ -2572,6 +2689,9 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
     {
         LARGE_INTEGER now;
         timeout_t when, diff;
+
+        if (timeout->QuadPart < 0 && timeout->QuadPart >= -10000) SEVO_STAT( sleeps_short );
+        else if (timeout->QuadPart) SEVO_STAT( sleeps_long );
 
         if ((when = timeout->QuadPart) < 0)
         {
@@ -3656,6 +3776,22 @@ NTSTATUS WINAPI NtAlertMultipleThreadByThreadId( HANDLE *tids, ULONG count, void
 }
 
 
+/* SEVO_ALERT_ALWAYS_WAKE=1 makes every notification enter the kernel, armed word or
+ * not: the control that separates what the conditional wake saves from what the spin
+ * saves. A measuring knob; nothing ships with it set. */
+static BOOL alert_always_wakes(void)
+{
+    static LONG always = -1;
+    LONG value = __atomic_load_n( &always, __ATOMIC_RELAXED );
+
+    if (value < 0)
+    {
+        value = sevo_env_budget( "SEVO_ALERT_ALWAYS_WAKE", 0, 1 );
+        __atomic_store_n( &always, value, __ATOMIC_RELAXED );
+    }
+    return value;
+}
+
 /***********************************************************************
  *             NtAlertThreadByThreadId (NTDLL.@)
  */
@@ -3672,8 +3808,24 @@ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
         LONG *futex = &entry->futex;
         /* Only a waiter that armed the word is in the kernel; one that is still looking
          * at it finds the notification by itself. */
-        if (InterlockedExchange( futex, ALERT_NOTIFIED ) == ALERT_PARKED)
-            futex_wake_one( futex );
+        /* ENOENT is the waiter that armed the word and had not reached the kernel yet: it
+         * finds the notification at the kernel's compare. Anything else leaves a sleeper
+         * that later wakers, seeing the word already notified, will not call for. */
+        SEVO_STAT( alert_notifies );
+        if (InterlockedExchange( futex, ALERT_NOTIFIED ) == ALERT_PARKED || alert_always_wakes())
+        {
+            SEVO_STAT( alert_wake_calls );
+            if (futex_wake_one( futex ) == -1)
+            {
+                if (errno == ENOENT) SEVO_STAT( alert_wake_nobody );
+                else
+                {
+                    static LONG failures;
+                    LONG count = InterlockedIncrement( &failures );
+                    if (count <= 8) ERR( "wake of tid %p failed: %s (%d so far)\n", tid, strerror( errno ), (int)count );
+                }
+            }
+        }
         return STATUS_SUCCESS;
     }
 #elif defined(HAVE_KQUEUE)
@@ -3723,24 +3875,84 @@ static LONGLONG update_timeout( ULONGLONG end )
 /***********************************************************************
  *             NtWaitForAlertByThreadId (NTDLL.@)
  */
+/* A spin budget from the environment: decimal turns, clamped to [0, max]; anything that
+ * does not parse as a whole number is the fallback. */
+int sevo_env_budget( const char *name, int fallback, int max )
+{
+    const char *value = getenv( name );
+    char *end;
+    long parsed;
+
+    if (!value || !*value) return fallback;
+    errno = 0;
+    parsed = strtol( value, &end, 10 );
+    if (errno || *end) return fallback;
+    if (parsed < 0) return 0;
+    return parsed > max ? max : (int)parsed;
+}
+
 /* How long NtWaitForAlertByThreadId looks at its own word before parking, in
- * YieldProcessor iterations. SEVO_WAIT_SPIN overrides the default; 0 parks on the
- * first look. */
+ * YieldProcessor iterations. SEVO_WAIT_SPIN sets it; the default, 0, parks on the first
+ * look, as Wine does. An iteration is 0.38 ns under Rosetta on an M1 Max, so 5200 is two
+ * microseconds: the shortest look that catches a ping-pong reply every time, where a park
+ * and its wake cost four to eight times the cycles of the whole spin. It stays a choice
+ * because no game has yet run faster for it and a 16-thread lock pays 8-35 % more cycles. */
 #ifndef SEVO_WAIT_SPIN_DEFAULT
 #define SEVO_WAIT_SPIN_DEFAULT 0
 #endif
-
-static int alert_spin_count = -1;
+#define SEVO_WAIT_SPIN_MAX 1000000
+#define ALERT_SPIN_BATCH 512
 
 static int alert_spin_budget(void)
 {
-    if (alert_spin_count < 0)
+    /* Published atomically: every thread that races here computes the same value. */
+    static LONG budget = -1;
+    LONG value = __atomic_load_n( &budget, __ATOMIC_RELAXED );
+
+    if (value < 0)
     {
-        const char *value = getenv( "SEVO_WAIT_SPIN" );
-        int parsed = value ? atoi( value ) : SEVO_WAIT_SPIN_DEFAULT;
-        alert_spin_count = parsed < 0 ? 0 : parsed;
+        value = sevo_env_budget( "SEVO_WAIT_SPIN", SEVO_WAIT_SPIN_DEFAULT, SEVO_WAIT_SPIN_MAX );
+        __atomic_store_n( &budget, value, __ATOMIC_RELAXED );
     }
-    return alert_spin_count;
+    return value;
+}
+
+/* SEVO_WAIT_SPIN_ADAPT=1: a thread whose spins keep running out stops spinning. After
+ * eight misses in a row it parks at once for the next 64 waits, except for one probe in
+ * sixteen that spins the whole budget to see whether the pattern changed; a hit ends the
+ * retreat. The state is the thread's own, so a ping-pong pair and an oversubscribed lock
+ * in one process each get the policy that suits them. */
+#define ALERT_SPIN_MISS_LIMIT 8
+#define ALERT_SPIN_RETREAT    64
+#define ALERT_SPIN_PROBE_MASK 15
+
+static BOOL alert_spin_adapts(void)
+{
+    static LONG adapts = -1;
+    LONG value = __atomic_load_n( &adapts, __ATOMIC_RELAXED );
+
+    if (value < 0)
+    {
+        value = sevo_env_budget( "SEVO_WAIT_SPIN_ADAPT", 0, 1 );
+        __atomic_store_n( &adapts, value, __ATOMIC_RELAXED );
+    }
+    return value;
+}
+
+static __thread unsigned int alert_spin_misses, alert_spin_retreat;
+
+static inline BOOL alert_spin_allowed(void)
+{
+    if (!alert_spin_adapts() || !alert_spin_retreat) return TRUE;
+    return !(--alert_spin_retreat & ALERT_SPIN_PROBE_MASK);
+}
+
+static inline void alert_spin_result( BOOL hit )
+{
+    if (!alert_spin_adapts()) return;
+    if (hit) alert_spin_misses = alert_spin_retreat = 0;
+    else if (++alert_spin_misses >= ALERT_SPIN_MISS_LIMIT && !alert_spin_retreat)
+        alert_spin_retreat = ALERT_SPIN_RETREAT;
 }
 
 /* Take the notification if it is there. */
@@ -3750,16 +3962,37 @@ static inline BOOL consume_alert( LONG *futex )
 }
 
 /* Reads only: exchanging here would write to the line the waker is about to write.
- * Returns TRUE when the word looks set and is worth consuming. */
-static inline BOOL spin_for_alert( LONG *futex )
+ * Returns TRUE when the word looks set and is worth consuming. The spin is part of the
+ * wait, so it ends at the wait's deadline, looked at once a batch. */
+static inline BOOL spin_for_alert( LONG *futex, const ULONGLONG *end )
 {
-    int budget = alert_spin_budget();
+    int total = alert_spin_budget(), budget = total;
 
-    while (budget--)
+    if (budget > 0 && !alert_spin_allowed())
     {
-        YieldProcessor();
-        if (__atomic_load_n( futex, __ATOMIC_RELAXED ) == ALERT_NOTIFIED) return TRUE;
+        SEVO_STAT( alert_spins_skipped );
+        return FALSE;
     }
+    if (budget > 0) SEVO_STAT( alert_spins );
+    while (budget > 0)
+    {
+        int batch = budget < ALERT_SPIN_BATCH ? budget : ALERT_SPIN_BATCH;
+
+        budget -= batch;
+        while (batch--)
+        {
+            YieldProcessor();
+            if (__atomic_load_n( futex, __ATOMIC_RELAXED ) == ALERT_NOTIFIED)
+            {
+                SEVO_STAT( alert_spin_hits );
+                sevo_stat_spin_hit( total - budget - batch );
+                alert_spin_result( TRUE );
+                return TRUE;
+            }
+        }
+        if (end && !update_timeout( *end )) return FALSE;
+    }
+    if (total > 0) alert_spin_result( FALSE );
     return FALSE;
 }
 
@@ -3776,6 +4009,7 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
         LONG *futex = &entry->futex;
         ULONGLONG end;
         int ret;
+        BOOL parked = FALSE;
 
         if (timeout)
         {
@@ -3785,16 +4019,31 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
                 end = get_absolute_timeout( timeout );
         }
 
-        if (consume_alert( futex )) return STATUS_ALERTED;
+        SEVO_STAT( alert_waits );
+        if (consume_alert( futex ))
+        {
+            SEVO_STAT( alert_pending_on_entry );
+            return STATUS_ALERTED;
+        }
+
+        /* A poll, or a deadline already behind us, never spins: only a notification
+         * that was pending on entry can satisfy it. */
+        if (timeout && !update_timeout( end ))
+        {
+            SEVO_STAT( alert_poll_timeouts );
+            return STATUS_TIMEOUT;
+        }
 
         /* A notification that is already on its way costs less to wait out here than to
          * park for, and the waker of an unarmed word makes no system call at all. */
-        if (spin_for_alert( futex ) && consume_alert( futex )) return STATUS_ALERTED;
+        if (spin_for_alert( futex, timeout ? &end : NULL ) && consume_alert( futex ))
+            return STATUS_ALERTED;
 
         /* Arm the word, then park on the armed value. A failed arm means the
          * notification arrived first; a word already armed is a wait being resumed. */
         while (InterlockedCompareExchange( futex, ALERT_PARKED, ALERT_EMPTY ) != ALERT_NOTIFIED)
         {
+            parked = TRUE;
             if (timeout)
             {
                 LONGLONG timeleft = update_timeout( end );
@@ -3807,16 +4056,24 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
             else
                 ret = futex_wait( futex, ALERT_PARKED, NULL );
 
+            SEVO_STAT( alert_parks );
+            if (ret != -1) SEVO_STAT( alert_park_woken );
+            else if (errno == ETIMEDOUT) SEVO_STAT( alert_park_timeouts );
+            else SEVO_STAT( alert_park_errors );
+
             /* futex_wait waits in pieces when a timeout does not fit its argument, so a
              * piece expiring only ends the wait once the deadline itself has passed. A
              * notification that beats the disarm stays in the word for the next wait. */
             if (ret == -1 && errno == ETIMEDOUT && timeout && !update_timeout( end ))
             {
                 InterlockedCompareExchange( futex, ALERT_EMPTY, ALERT_PARKED );
+                SEVO_STAT( alert_timeouts );
                 return STATUS_TIMEOUT;
             }
         }
-        consume_alert( futex );
+        if (!parked) SEVO_STAT( alert_arm_lost );
+        /* Only this thread clears its word, so the notification the loop saw is still there. */
+        if (!consume_alert( futex )) ERR( "alert word %p lost its notification\n", futex );
         return STATUS_ALERTED;
     }
 #elif defined(HAVE_KQUEUE)

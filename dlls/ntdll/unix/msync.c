@@ -64,6 +64,7 @@
 
 #include "unix_private.h"
 #include "msync.h"
+#include "sevo_sync_stats.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
@@ -300,6 +301,7 @@ static inline void server_remove_wait( unsigned int msgh_id, const int *objs, vo
         message.shm_idx[count++] = alert_obj;
 
     message.shm_idx[0] |= (1 << 29);
+    SEVO_STAT( msync_removals );
 
     message.header.msgh_size = sizeof(mach_msg_header_t) +
                                count * sizeof(unsigned int);
@@ -309,6 +311,59 @@ static inline void server_remove_wait( unsigned int msgh_id, const int *objs, vo
 
     if (mr != MACH_MSG_SUCCESS)
         ERR("Failed to send server remove wait: %#x\n", mr);
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+#define YIELD_PROCESSOR __asm__ __volatile__( "pause" ::: "memory" )
+#elif defined(__aarch64__)
+#define YIELD_PROCESSOR __asm__ __volatile__( "yield" ::: "memory" )
+#else
+#define YIELD_PROCESSOR do {} while (0)
+#endif
+
+#define SEVO_OBJECT_SPIN_MAX 1000000
+#define OBJECT_SPIN_BATCH 512
+
+/* How long a wait on one object looks at the object's word before parking on it, in
+ * YIELD_PROCESSOR iterations. SEVO_OBJECT_SPIN sets it; 0 parks on the first look. */
+static int object_spin_budget(void)
+{
+    /* Published atomically: every thread that races here computes the same value. */
+    static int budget = -1;
+    int value = __atomic_load_n( &budget, __ATOMIC_RELAXED );
+
+    if (value < 0)
+    {
+        value = sevo_env_budget( "SEVO_OBJECT_SPIN", 0, SEVO_OBJECT_SPIN_MAX );
+        __atomic_store_n( &budget, value, __ATOMIC_RELAXED );
+    }
+    return value;
+}
+
+/* Reads only. TRUE when the word moved off val, so the caller's next grab is worth making.
+ * The spin is part of the wait and ends at the wait's deadline, looked at once a batch. */
+static inline BOOL spin_for_object( const int *word, int val, const ULONGLONG *end )
+{
+    int budget = object_spin_budget();
+
+    if (budget > 0) SEVO_STAT( msync_direct_spins );
+    while (budget > 0)
+    {
+        int batch = budget < OBJECT_SPIN_BATCH ? budget : OBJECT_SPIN_BATCH;
+
+        budget -= batch;
+        while (batch--)
+        {
+            YIELD_PROCESSOR;
+            if (__atomic_load_n( word, __ATOMIC_RELAXED ) != val)
+            {
+                SEVO_STAT( msync_direct_spin_hits );
+                return TRUE;
+            }
+        }
+        if (end && !update_timeout( *end )) return FALSE;
+    }
+    return FALSE;
 }
 
 static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
@@ -329,11 +384,15 @@ static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
         if (__atomic_load_n( (int *)obj_shm, __ATOMIC_ACQUIRE ) != val)
             return STATUS_PENDING;
 
+        if (spin_for_object( (const int *)obj_shm, val, end ))
+            return STATUS_PENDING;
+
         if (end)
         {
             ns_timeleft = update_timeout( *end ) * 100;
             if (!ns_timeleft) return STATUS_TIMEOUT;
         }
+        SEVO_STAT( msync_direct_parks );
         ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, obj_shm, val, ns_timeleft );
     } while (ret == -EINTR || ret == -EFAULT);
 
@@ -343,13 +402,32 @@ static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
     return STATUS_SUCCESS;
 }
 
-#if defined(__x86_64__) || defined(__i386__)
-#define YIELD_PROCESSOR __asm__ __volatile__( "pause" ::: "memory" )
-#elif defined(__aarch64__)
-#define YIELD_PROCESSOR __asm__ __volatile__( "yield" ::: "memory" )
-#else
-#define YIELD_PROCESSOR do {} while (0)
+/* A thread's word in shm_tid_map while it registers a wait. The server answers a
+ * registration by writing 1, or 0 when the wait is already satisfied, and wakes the
+ * thread only when what it replaced was ACK_PARKED. server/msync.c has the same values. */
+#define ACK_PENDING 2
+#define ACK_PARKED  3
+
+#ifndef SEVO_ACK_SPIN_DEFAULT
+#define SEVO_ACK_SPIN_DEFAULT 4096
 #endif
+
+#define SEVO_ACK_SPIN_MAX 2000000000
+
+/* Turns of the acknowledgment spin before it parks. SEVO_ACK_SPIN overrides it. */
+static unsigned int ack_spin_budget(void)
+{
+    /* Published atomically: every thread that races here computes the same value. */
+    static int budget = -1;
+    int value = __atomic_load_n( &budget, __ATOMIC_RELAXED );
+
+    if (value < 0)
+    {
+        value = sevo_env_budget( "SEVO_ACK_SPIN", SEVO_ACK_SPIN_DEFAULT, SEVO_ACK_SPIN_MAX );
+        __atomic_store_n( &budget, value, __ATOMIC_RELAXED );
+    }
+    return value;
+}
 
 static inline int check_shm_contention( void **objs_shm, void *alert_obj_shm, int count, int tid )
 {
@@ -387,26 +465,54 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
     unsigned int msgh_id;
     int total_count = count + (alert_obj ? 1 : 0);
 
-    __atomic_store_n( addr, 2, __ATOMIC_RELEASE );
+    __atomic_store_n( addr, ACK_PENDING, __ATOMIC_RELEASE );
     msgh_id = (tid << 8) | total_count;
     mr = server_register_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
 
     if (mr != MACH_MSG_SUCCESS)
         return STATUS_PENDING;
+    SEVO_STAT( msync_registrations );
 
-    /* Waiting for the server to acknowledge the registration. The writer of `addr` has
-     * no wake protocol for a sleeper, so this is a spin: it yields the core, rechecks
-     * the objects every 64th turn, and gives up at the deadline. */
+    /* Waiting for the server to acknowledge the registration. A short look, rechecking
+     * the objects every 64th turn; then the word is armed and the wait parks, because a
+     * thread spinning here competes for a core with the pump it is waiting for. */
     {
-        unsigned int turn = 0;
+        unsigned int turn = 0, budget = ack_spin_budget();
 
-        while (__atomic_load_n( addr, __ATOMIC_ACQUIRE ) == 2)
+        while ((val = __atomic_load_n( addr, __ATOMIC_ACQUIRE )) == ACK_PENDING || val == ACK_PARKED)
         {
+            if (turn >= budget)
+            {
+                int expected = ACK_PENDING;
+
+                if (val == ACK_PENDING)
+                {
+                    if (!__atomic_compare_exchange_n( addr, &expected, ACK_PARKED, 0,
+                                                      __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
+                        continue;
+                    SEVO_STAT( msync_ack_parks );
+                    SEVO_STAT_ADD( msync_ack_turns, turn );
+                }
+                if (end)
+                {
+                    ns_timeleft = update_timeout( *end ) * 100;
+                    if (!ns_timeleft)
+                    {
+                        server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+                        return STATUS_TIMEOUT;
+                    }
+                }
+                ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, ACK_PARKED, ns_timeleft );
+                continue;
+            }
+
             YIELD_PROCESSOR;
             if (!(++turn & 0x3f))
             {
                 if (check_shm_contention( objs_shm, alert_obj_shm, count, tid ))
                 {
+                    SEVO_STAT( msync_ack_contention );
+                    SEVO_STAT_ADD( msync_ack_turns, turn );
                     /* The registration is already submitted: the removal makes the
                      * server drop its nodes, and the interest counts drop with it. */
                     server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
@@ -419,6 +525,7 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
                 }
             }
         }
+        if (turn < budget) SEVO_STAT_ADD( msync_ack_turns, turn );
     }
 
     do
@@ -432,6 +539,7 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
                 return STATUS_TIMEOUT;
             }
         }
+        SEVO_STAT( msync_registered_parks );
         ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, 1, ns_timeleft );
         val = __atomic_load_n( addr, __ATOMIC_ACQUIRE );
         if (!val)
@@ -682,18 +790,21 @@ static inline void signal_all( void *shm, unsigned int shm_idx )
     __thread static mach_msg_header_t send_header;
     struct event *event_obj = (struct event *)shm;
 
+    SEVO_STAT( signal_all_calls );
     __ulock_wake( UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL, shm, 0 );
 
     if (!__atomic_load_n( &event_obj->multiple_waiters, __ATOMIC_SEQ_CST ))
         return;
+    SEVO_STAT( signal_all_messages );
 
     send_header.msgh_bits = msgh_bits_send;
     send_header.msgh_id = shm_idx;
     send_header.msgh_size = sizeof(send_header);
     send_header.msgh_remote_port = server_port;
 
-    mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
-               MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+    if (mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
+                   MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 ) != MACH_MSG_SUCCESS)
+        SEVO_STAT( signal_all_send_failures );
 }
 
 NTSTATUS msync_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
@@ -844,6 +955,8 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
     int single_wait = 0;
     ULONGLONG end;
     int i, ret;
+
+    SEVO_STAT( msync_waits );
 
     current_tid = GetCurrentThreadId();
 
@@ -997,6 +1110,9 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
          * waiting for an instant while we put things back. */
 
         NTSTATUS status = STATUS_SUCCESS;
+        unsigned int attempts = 0;
+
+        SEVO_STAT( waitall_calls );
 
         while (1)
         {
@@ -1006,6 +1122,16 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
 
 tryagain:
             taken = was_abandoned = 0;
+            SEVO_STAT( waitall_attempts );
+
+            /* A retry that finds every object signaled never reaches do_single_wait,
+             * which is where the deadline and the alert are looked at; so they are
+             * looked at here, from the second attempt on. */
+            if (attempts++)
+            {
+                if (timeout && !update_timeout( end )) return STATUS_TIMEOUT;
+                if (alert_obj_shm && __atomic_load_n( alert_obj_shm, __ATOMIC_SEQ_CST )) goto userapc;
+            }
 
             /* First step: try to wait on each object in sequence. */
 
@@ -1055,14 +1181,20 @@ tryagain:
                     int tid = __atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST );
 
                     if (tid && tid != ~0 && tid != current_tid)
+                    {
+                        SEVO_STAT( waitall_readiness_failures );
                         goto tryagain;
+                    }
                 }
                 else
                 {
                     struct event *event = (struct event *)objs_shm[i];
 
                     if (!__atomic_load_n( &event->signaled, __ATOMIC_SEQ_CST ))
+                    {
+                        SEVO_STAT( waitall_readiness_failures );
                         goto tryagain;
+                    }
                 }
             }
 
@@ -1129,11 +1261,14 @@ tryagain:
                 }
             }
 
+            SEVO_STAT( waitall_successes );
             if (was_abandoned) return STATUS_ABANDONED;
 
             return STATUS_SUCCESS;
 
 tooslow:
+            SEVO_STAT( waitall_rollbacks );
+            SEVO_STAT_ADD( waitall_rolled_objects, __builtin_popcountll( taken ) );
             /* Put back only what this attempt consumed, in the state it was
              * found, and wake the waiters the consumption hid it from. */
             for (--i; i >= 0; i--)

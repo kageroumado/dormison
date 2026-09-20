@@ -339,12 +339,26 @@ static inline void unregister_wait( mach_register_message_t *message, unsigned i
         remove_tid( message->shm_idx[i], tid );
 }
 
+/* ENOENT is a thread that was not asleep. An interrupted wake woke nobody and is made
+ * again; any other failure leaves a sleeper nobody else will call for, so it is said. */
+static inline void wake_word( int *shm )
+{
+    static unsigned int failures;
+    int ret;
+
+    do ret = __ulock_wake( UL_COMPARE_AND_WAIT_SHARED, (void *)shm, 0 );
+    while (ret == -1 && errno == EINTR);
+
+    if (ret == -1 && errno != ENOENT && failures++ < 8)
+        fprintf( stderr, "msync: wake of %p failed: %s\n", shm, strerror( errno ) );
+}
+
 static inline void wake_tid( int tid )
 {
     int *shm = shm_tid_map + tid;
 
     __atomic_store_n( shm, 0, __ATOMIC_RELEASE );
-    __ulock_wake( UL_COMPARE_AND_WAIT_SHARED, (void *)shm, 0 );
+    wake_word( shm );
 }
 
 static inline void signal_all_internal( unsigned int shm_idx )
@@ -515,8 +529,10 @@ static void *mach_message_pump( void *args )
             add_tid( receive_message.shm_idx[i], tid );
             if (i == count - 1)
             {
-                /* The client can stop spinning and safely start waiting now */
-                __atomic_store_n( shm_tid_map + tid, 1, __ATOMIC_RELEASE );
+                /* The client can stop spinning and safely start waiting now; one that
+                 * has parked on the acknowledgment (3, ACK_PARKED in ntdll) needs the wake. */
+                if (__atomic_exchange_n( shm_tid_map + tid, 1, __ATOMIC_SEQ_CST ) == 3)
+                    wake_word( shm_tid_map + tid );
             }
         }
     }

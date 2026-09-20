@@ -75,6 +75,7 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include "sevo_sync_stats.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(thread);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
@@ -1543,6 +1544,7 @@ void abort_thread( int status )
  */
 void abort_process( int status )
 {
+    sevo_sync_stats_dump();
     _exit( get_unix_exit_code( status ));
 }
 
@@ -1589,6 +1591,7 @@ static DECLSPEC_NORETURN void exit_thread( int status )
  */
 void exit_process( int status )
 {
+    sevo_sync_stats_dump();
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
     process_exit_wrapper( get_unix_exit_code( status ));
 }

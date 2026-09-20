@@ -20,6 +20,7 @@
  */
 
 extern int do_msync(void);
+extern int sevo_env_budget( const char *name, int fallback, int max );
 extern void msync_init(void);
 extern void msync_close( int obj );
 

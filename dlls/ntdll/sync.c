@@ -514,6 +514,18 @@ void WINAPI RtlInitializeSRWLock( RTL_SRWLOCK *lock )
 void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
 {
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
+    union { struct srw_lock s; LONG l; } free, taken;
+
+    /* A free lock is taken in one exchange, before this thread counts itself among the
+     * waiters: counting first is a second locked write on the line every contender reads. */
+    free.s = *u.s;
+    if (!free.s.owners)
+    {
+        taken.s = free.s;
+        taken.s.owners = 1;
+        taken.s.exclusive_waiters |= 1;
+        if (InterlockedCompareExchange( u.l, taken.l, free.l ) == free.l) return;
+    }
 
     InterlockedExchangeAdd16( &u.s->exclusive_waiters, 2 );
 
@@ -830,12 +842,14 @@ struct futex_entry
     struct list entry;
     const void *addr;
     DWORD tid;
+    ULONGLONG enrolled;  /* the queue's count when this entry joined its tail */
 };
 
 struct futex_queue
 {
     struct list queue;
     LONG lock;
+    ULONGLONG enrollments;
 };
 
 /* One bucket per cache line: two addresses that hash apart should not make their
@@ -920,6 +934,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
 
     if (!queue->queue.next)
         list_init( &queue->queue );
+    entry.enrolled = queue->enrollments++;
     list_add_tail( &queue->queue, &entry.entry );
 
     spin_unlock( &queue->lock );
@@ -949,6 +964,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
     struct futex_queue *queue = get_futex_queue( addr );
     struct futex_entry *entry, *next;
     unsigned int count = 0;
+    ULONGLONG cohort;
     HANDLE tids[256];
 
     TRACE("%p\n", addr);
@@ -960,14 +976,21 @@ void WINAPI RtlWakeAddressAll( const void *addr )
     if (!queue->queue.next)
         list_init(&queue->queue);
 
+    /* This call wakes the waiters enrolled before it began, and no others: a woken
+     * thread that finds its value unchanged enrolls again while the batches below are
+     * still going out, and without the bound the walk could collect it forever. */
+    cohort = queue->enrollments;
+
     /* More waiters on one address than the batch holds: the lock is dropped between
      * batches rather than the system call being made under it, and the walk starts
-     * again from the head — the entries already taken no longer match. */
+     * again from the head — the entries already taken are off the list. */
     for (;;)
     {
         count = 0;
         LIST_FOR_EACH_ENTRY_SAFE( entry, next, &queue->queue, struct futex_entry, entry )
         {
+            /* The tail is in enrollment order. */
+            if (entry->enrolled >= cohort) break;
             if (entry->addr != addr) continue;
             tids[count++] = (HANDLE)(ULONG_PTR)entry->tid;
             entry->addr = NULL;
