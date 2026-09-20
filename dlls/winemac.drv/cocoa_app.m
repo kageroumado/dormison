@@ -291,6 +291,10 @@ static const NSTimeInterval kFrameRateInterval = 0.5;
 
 static WineFrameRateCounter* sevoFrameRateCounter;
 
+/* How long a close or a Quit may go untaken before the user is asked. Windows
+   calls a window hung after five seconds without a message read. */
+static const NSTimeInterval kUnansweredRequestSeconds = 5;
+
 @implementation WineApplicationController
 
     @synthesize keyboardType, lastFlagsChanged;
@@ -2791,6 +2795,61 @@ static WineFrameRateCounter* sevoFrameRateCounter;
         return YES;
     }
 
+    /* A close or a Quit is a request the program's own thread answers. One that
+       loads or loops without taking messages never does, and the window then
+       ignores its close button for as long as that lasts. Windows says such a
+       window is not responding and offers to end the program; so does this. */
+    - (void) watchRequest:(macdrv_event*)event forWindow:(WineWindow*)window
+    {
+        if (unansweredAlert) return;
+
+        macdrv_retain_event(event);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kUnansweredRequestSeconds * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            WineWindow* host = window.isVisible ? window : [self frontWineWindow];
+
+            if (!__atomic_load_n(&event->taken, __ATOMIC_RELAXED) && !unansweredAlert && host)
+                [self offerToEndProgramOver:host waitingOn:event];
+            macdrv_release_event(event);
+        });
+    }
+
+    - (void) offerToEndProgramOver:(WineWindow*)window waitingOn:(macdrv_event*)event
+    {
+        NSString* name = [[NSRunningApplication currentApplication] localizedName] ?: @"The game";
+        NSAlert* alert = [[[NSAlert alloc] init] autorelease];
+        NSTimer* timer;
+
+        alert.alertStyle = NSAlertStyleWarning;
+        alert.messageText = [NSString stringWithFormat:@"\u201c%@\u201d is not responding", name];
+        alert.informativeText = @"It has not answered for a few seconds. A game that is loading may answer "
+                                 "in a while. Ending it loses anything it has not saved.";
+        [alert addButtonWithTitle:@"Wait"];
+        [alert addButtonWithTitle:@"End Game"].hasDestructiveAction = YES;
+
+        macdrv_retain_event(event);
+        unansweredAlert = [alert retain];
+
+        /* The program answering is the better ending: the sheet leaves by itself. */
+        timer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer* t){
+            if (__atomic_load_n(&event->taken, __ATOMIC_RELAXED) && window.attachedSheet == alert.window)
+                [window endSheet:alert.window returnCode:NSAlertFirstButtonReturn];
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+
+        [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse response){
+            [timer invalidate];
+            macdrv_release_event(event);
+            [unansweredAlert release];
+            unansweredAlert = nil;
+            if (response == NSAlertSecondButtonReturn)
+            {
+                fprintf(stderr, "sevo:exit pid=%d ended by the user while not responding\n", getpid());
+                _exit(1);
+            }
+        }];
+    }
+
     - (NSApplicationTerminateReply) applicationShouldTerminate:(NSApplication *)sender
     {
         NSApplicationTerminateReply ret = NSTerminateNow;
@@ -2828,6 +2887,9 @@ static WineFrameRateCounter* sevoFrameRateCounter;
         }
 
         [eventQueuesLock unlock];
+
+        if (ret == NSTerminateLater)
+            [self watchRequest:event forWindow:nil];
 
         macdrv_release_event(event);
 

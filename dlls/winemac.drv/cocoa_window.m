@@ -3993,6 +3993,7 @@ static NSView* wine_content_view_of(NSWindow* window)
     {
         macdrv_event* event = macdrv_create_event(WINDOW_CLOSE_REQUESTED, self);
         [queue postEvent:event];
+        [[WineApplicationController sharedController] watchRequest:event forWindow:self];
         macdrv_release_event(event);
         return NO;
     }

@@ -364,6 +364,7 @@ typedef uint64_t macdrv_event_mask;
 typedef struct macdrv_event {
     int                 refs;
     int                 deliver;
+    int                 taken;      /* a thread took it off its queue */
     int                 type;
     macdrv_window       window;
     union {

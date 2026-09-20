@@ -298,6 +298,7 @@ static const OSType WineHotKeySignature = 'Wine';
                 if (event->event->deliver == INT_MAX ||
                     __atomic_sub_fetch(&event->event->deliver, 1, __ATOMIC_RELAXED) >= 0)
                 {
+                    __atomic_store_n(&event->event->taken, 1, __ATOMIC_RELAXED);
                     ret = event;
                     break;
                 }

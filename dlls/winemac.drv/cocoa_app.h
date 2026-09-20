@@ -43,6 +43,7 @@ enum {
 
 @interface WineApplicationController : NSObject <NSApplicationDelegate>
 {
+    NSAlert* unansweredAlert;   /* the "not responding" sheet, while it is up */
     CFRunLoopSourceRef requestSource;
     NSMutableArray* requests;
     dispatch_queue_t requestsManipQueue;
@@ -122,6 +123,7 @@ enum {
     - (double) ticksForEventTime:(NSTimeInterval)eventTime;
 
     - (void) windowGotFocus:(WineWindow*)window;
+    - (void) watchRequest:(macdrv_event*)event forWindow:(WineWindow*)window;
 
     - (void) applyDeferredClip;
 
