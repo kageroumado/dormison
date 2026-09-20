@@ -243,7 +243,7 @@ final class SurfacePresenter: ViewPresenter {
 
     /// The frame goes on screen again, after a layout. A texture the layout
     /// made new is filled from the DIB first.
-    func refresh() {
+    override func refresh() {
         lock.lock()
         guard let frame = currentFrame() else {
             lock.unlock()

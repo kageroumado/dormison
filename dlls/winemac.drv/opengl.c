@@ -39,7 +39,10 @@
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/glu.h>
 #include <OpenGL/CGLRenderers.h>
+#include <OpenGL/CGLIOSurface.h>
 #include <dlfcn.h>
+
+#include "sevo_presenter.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wgl);
 
@@ -69,12 +72,39 @@ struct macdrv_context
     macdrv_view             read_view;
     CGLPBufferObj           read_pbuffer;
     int                     swap_interval;
+    /* The draw or read drawable is one the presenter shows: the context has
+       no view, and opengl32 binds the drawable's framebuffer object where
+       the program binds framebuffer 0. */
+    BOOL                    draw_presented;
+    BOOL                    read_presented;
+};
+
+/* A window drawable the presenter shows. Its buffers are renderbuffers of
+   a framebuffer object, in the context's share group (Apple's OpenGL keeps
+   framebuffer objects there too, so one serves every context sharing with
+   the one that made it). A swap copies the back buffer into an IOSurface of
+   the presenter's ring, top row first, and into the front buffer. The helper
+   framebuffers keep that copy away from the draw and read buffer state of
+   the one the program sees. */
+struct gl_presented
+{
+    void           *presenter;      /* sevo_presenter_attach_gl handle; NULL for a drawable on a view */
+    CGLContextObj   owner;          /* a context of the share group the objects live in */
+    SIZE            size;           /* of the buffers; 0x0 until a context first needs them */
+    GLuint          fbo;            /* front at attachment 0, back at 1, depth and stencil */
+    GLuint          front_fbo;
+    GLuint          back_fbo;
+    GLuint          ring_fbo;
+    GLuint          front, back, depth;
+    GLuint          ring[SEVO_GL_RING];
+    BOOL            drawn;
 };
 
 struct gl_drawable
 {
     struct opengl_drawable  base;
     CGLPBufferObj           pbuffer;
+    struct gl_presented     presented;
 };
 
 static struct gl_drawable *impl_from_opengl_drawable(struct opengl_drawable *base)
@@ -1424,6 +1454,281 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
     return TRUE;
 }
 
+
+/**********************************************************************
+ *              presented_format
+ *
+ * Whether the presenter can show a drawable of this format: eight bits a
+ * channel, one sample, one eye. The rest stays on a view.
+ */
+static BOOL presented_format(const pixel_format *pf)
+{
+    const struct color_mode *mode = &color_modes[pf->color_mode];
+
+    if (mode->is_float || mode->color_bits > 32) return FALSE;
+    if (mode->red_bits != 8 || mode->green_bits != 8 || mode->blue_bits != 8) return FALSE;
+    if (pf->stereo || (pf->sample_buffers && pf->samples > 1)) return FALSE;
+    return TRUE;
+}
+
+static void presented_init(struct gl_drawable *gl)
+{
+    struct macdrv_client_surface *client = impl_from_client_surface(gl->base.client);
+    const pixel_format *pf = get_pixel_format(gl->base.format, FALSE);
+    struct gl_presented *presented = &gl->presented;
+
+    if (!presenter_on || !gl_presenter_on || !pf || !presented_format(pf)) return;
+    if (!(presented->presenter = sevo_presenter_attach_gl())) return;
+
+    opengl_drawable_map_buffer(&gl->base, GL_FRONT_LEFT, GL_COLOR_ATTACHMENT0);
+    opengl_drawable_map_buffer(&gl->base, GL_FRONT, GL_COLOR_ATTACHMENT0);
+    opengl_drawable_map_buffer(&gl->base, GL_LEFT, GL_COLOR_ATTACHMENT0);
+    opengl_drawable_map_buffer(&gl->base, GL_FRONT_AND_BACK, GL_COLOR_ATTACHMENT0);
+    opengl_drawable_map_buffer(&gl->base, GL_BACK_LEFT, gl->base.doublebuffer ? GL_COLOR_ATTACHMENT1 : 0);
+    opengl_drawable_map_buffer(&gl->base, GL_BACK, gl->base.doublebuffer ? GL_COLOR_ATTACHMENT1 : 0);
+    opengl_drawable_map_buffer(&gl->base, GL_FRONT_RIGHT, 0);
+    opengl_drawable_map_buffer(&gl->base, GL_BACK_RIGHT, 0);
+    opengl_drawable_map_buffer(&gl->base, GL_RIGHT, 0);
+
+    macdrv_view_attach_presenter(client->cocoa_view, presented->presenter);
+    TRACE("drawable %s is the presenter's %p\n", debugstr_opengl_drawable(&gl->base), presented->presenter);
+}
+
+static GLenum presented_depth_format(const pixel_format *pf)
+{
+    if (pf->stencil_bits) return pf->depth_bits > 24 ? GL_DEPTH32F_STENCIL8 : GL_DEPTH24_STENCIL8;
+    if (pf->depth_bits > 24) return GL_DEPTH_COMPONENT32;
+    if (pf->depth_bits > 16) return GL_DEPTH_COMPONENT24;
+    return pf->depth_bits ? GL_DEPTH_COMPONENT16 : 0;
+}
+
+/* What the copies and the storage calls below change that a program can see. */
+struct presented_saved_state
+{
+    GLint draw_fbo, read_fbo, renderbuffer, rectangle, scissor;
+};
+
+static void presented_save_state(struct presented_saved_state *state)
+{
+    funcs->p_glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &state->draw_fbo);
+    funcs->p_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &state->read_fbo);
+    funcs->p_glGetIntegerv(GL_RENDERBUFFER_BINDING, &state->renderbuffer);
+    funcs->p_glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &state->rectangle);
+    state->scissor = funcs->p_glIsEnabled(GL_SCISSOR_TEST);
+    if (state->scissor) funcs->p_glDisable(GL_SCISSOR_TEST);
+}
+
+static void presented_restore_state(const struct presented_saved_state *state)
+{
+    if (state->scissor) funcs->p_glEnable(GL_SCISSOR_TEST);
+    funcs->p_glBindTexture(GL_TEXTURE_RECTANGLE, state->rectangle);
+    funcs->p_glBindRenderbuffer(GL_RENDERBUFFER, state->renderbuffer);
+    funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, state->read_fbo);
+    funcs->p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, state->draw_fbo);
+}
+
+static void presented_delete_ring(struct gl_presented *presented)
+{
+    funcs->p_glDeleteTextures(SEVO_GL_RING, presented->ring);
+    memset(presented->ring, 0, sizeof(presented->ring));
+}
+
+/* A new ring from the presenter at the buffers' size, each surface wrapped
+   in a rectangle texture. With a context of the share group current. */
+static BOOL presented_create_ring(struct gl_presented *presented, CGLContextObj cglcontext)
+{
+    int i;
+
+    presented_delete_ring(presented);
+    if (!sevo_presenter_gl_resize(presented->presenter, presented->size.cx, presented->size.cy)) return FALSE;
+
+    funcs->p_glGenTextures(SEVO_GL_RING, presented->ring);
+    for (i = 0; i < SEVO_GL_RING; i++)
+    {
+        IOSurfaceRef surface = sevo_presenter_gl_surface(presented->presenter, i);
+        CGLError err;
+
+        funcs->p_glBindTexture(GL_TEXTURE_RECTANGLE, presented->ring[i]);
+        err = CGLTexImageIOSurface2D(cglcontext, GL_TEXTURE_RECTANGLE, GL_RGBA, presented->size.cx, presented->size.cy,
+                                     GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, surface, 0);
+        if (err != kCGLNoError)
+        {
+            ERR("CGLTexImageIOSurface2D failed with error %d %s\n", err, CGLErrorString(err));
+            presented_delete_ring(presented);
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/**********************************************************************
+ *              presented_update
+ *
+ * Makes the drawable's buffers, or gives them the client area's size, with
+ * `context` current. A drawable whose objects live in another share group
+ * (a core profile context after a legacy one, which cannot share on macOS)
+ * keeps them there; that context draws to nothing.
+ */
+static void presented_update(struct gl_drawable *gl, struct macdrv_context *context)
+{
+    const pixel_format *pf = get_pixel_format(gl->base.format, FALSE);
+    struct gl_presented *presented = &gl->presented;
+    struct presented_saved_state state;
+    SIZE size = gl->base.virtual_size;
+    GLenum depth_format, status;
+
+    if (size.cx < 1) size.cx = 1;
+    if (size.cy < 1) size.cy = 1;
+    if (presented->fbo && presented->size.cx == size.cx && presented->size.cy == size.cy) return;
+
+    if (presented->fbo && !funcs->p_glIsFramebuffer(presented->fbo))
+    {
+        FIXME("drawable %s belongs to another share group than context %p\n", debugstr_opengl_drawable(&gl->base), context);
+        return;
+    }
+
+    presented_save_state(&state);
+
+    if (!presented->fbo)
+    {
+        GLuint fbos[4], buffers[3];
+
+        CGLRetainContext((presented->owner = context->cglcontext));
+        funcs->p_glGenFramebuffers(4, fbos);
+        funcs->p_glGenRenderbuffers(3, buffers);
+        presented->fbo = fbos[0];
+        presented->front_fbo = fbos[1];
+        presented->back_fbo = fbos[2];
+        presented->ring_fbo = fbos[3];
+        presented->front = buffers[0];
+        presented->back = buffers[1];
+        presented->depth = buffers[2];
+    }
+    presented->size = size;
+
+    funcs->p_glBindRenderbuffer(GL_RENDERBUFFER, presented->front);
+    funcs->p_glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, size.cx, size.cy);
+    if (gl->base.doublebuffer)
+    {
+        funcs->p_glBindRenderbuffer(GL_RENDERBUFFER, presented->back);
+        funcs->p_glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, size.cx, size.cy);
+    }
+    if ((depth_format = presented_depth_format(pf)))
+    {
+        funcs->p_glBindRenderbuffer(GL_RENDERBUFFER, presented->depth);
+        funcs->p_glRenderbufferStorage(GL_RENDERBUFFER, depth_format, size.cx, size.cy);
+    }
+
+    funcs->p_glBindFramebuffer(GL_FRAMEBUFFER, presented->fbo);
+    funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, presented->front);
+    if (gl->base.doublebuffer)
+        funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_RENDERBUFFER, presented->back);
+    if (depth_format)
+        funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, presented->depth);
+    if (pf->stencil_bits)
+        funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, presented->depth);
+    funcs->p_glDrawBuffer(gl->base.doublebuffer ? GL_COLOR_ATTACHMENT1 : GL_COLOR_ATTACHMENT0);
+    funcs->p_glReadBuffer(gl->base.doublebuffer ? GL_COLOR_ATTACHMENT1 : GL_COLOR_ATTACHMENT0);
+    status = funcs->p_glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) ERR("drawable %s framebuffer status %#x\n", debugstr_opengl_drawable(&gl->base), status);
+
+    /* A window's buffers start black, and so does the picture: the presenter
+       would otherwise show what the memory last held. */
+    funcs->p_glBindFramebuffer(GL_FRAMEBUFFER, presented->front_fbo);
+    funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, presented->front);
+    funcs->p_glBindFramebuffer(GL_FRAMEBUFFER, presented->back_fbo);
+    funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER,
+                                       gl->base.doublebuffer ? presented->back : presented->front);
+
+    if (!presented_create_ring(presented, context->cglcontext))
+        ERR("drawable %s has no surfaces to present into\n", debugstr_opengl_drawable(&gl->base));
+
+    presented_restore_state(&state);
+
+    gl->base.draw_fbo = gl->base.read_fbo = presented->fbo;
+    TRACE("drawable %s framebuffer %u at %s\n", debugstr_opengl_drawable(&gl->base), presented->fbo,
+          wine_dbgstr_point((POINT *)&size));
+}
+
+/**********************************************************************
+ *              presented_present
+ *
+ * Puts the back buffer on screen and into the front buffer, or the front
+ * buffer on screen for a program that draws there. With a context of the
+ * share group current.
+ */
+static void presented_present(struct gl_drawable *gl, BOOL swap, int interval)
+{
+    struct macdrv_client_surface *client = impl_from_client_surface(gl->base.client);
+    struct gl_presented *presented = &gl->presented;
+    LONG width = presented->size.cx, height = presented->size.cy;
+    struct presented_saved_state state;
+    int slot;
+
+    if (!presented->fbo || !presented->ring[0]) return;
+
+    presented_save_state(&state);
+    funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, swap ? presented->back_fbo : presented->front_fbo);
+
+    if ((slot = sevo_presenter_gl_acquire(presented->presenter)) >= 0)
+    {
+        funcs->p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, presented->ring_fbo);
+        funcs->p_glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE, presented->ring[slot], 0);
+        funcs->p_glBlitFramebuffer(0, 0, width, height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+    else WARN("drawable %s: every surface is in flight, frame dropped\n", debugstr_opengl_drawable(&gl->base));
+
+    if (swap && gl->base.doublebuffer)
+    {
+        funcs->p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, presented->front_fbo);
+        funcs->p_glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+
+    presented_restore_state(&state);
+    funcs->p_glFlush();
+
+    if (slot >= 0) sevo_presenter_gl_present(presented->presenter, slot, interval > 0);
+    if (!presented->drawn)
+    {
+        presented->drawn = TRUE;
+        macdrv_view_drawn(client->cocoa_view);
+    }
+}
+
+/* The drawable's objects are deleted in a context of their share group made
+   for that: the last release can come from a thread with no context, or with
+   one of another group. */
+static void presented_destroy(struct gl_drawable *gl)
+{
+    struct macdrv_client_surface *client = impl_from_client_surface(gl->base.client);
+    struct gl_presented *presented = &gl->presented;
+
+    if (!presented->presenter) return;
+
+    if (presented->fbo)
+    {
+        CGLContextObj previous = CGLGetCurrentContext(), scratch = NULL;
+        GLuint fbos[4] = { presented->fbo, presented->front_fbo, presented->back_fbo, presented->ring_fbo };
+        GLuint buffers[3] = { presented->front, presented->back, presented->depth };
+
+        if (CGLCreateContext(CGLGetPixelFormat(presented->owner), presented->owner, &scratch) == kCGLNoError && scratch)
+        {
+            CGLSetCurrentContext(scratch);
+            presented_delete_ring(presented);
+            funcs->p_glDeleteFramebuffers(4, fbos);
+            funcs->p_glDeleteRenderbuffers(3, buffers);
+            funcs->p_glFlush();
+            CGLSetCurrentContext(previous);
+            CGLReleaseContext(scratch);
+        }
+        else WARN("no context to delete the objects of drawable %s in\n", debugstr_opengl_drawable(&gl->base));
+        CGLReleaseContext(presented->owner);
+    }
+
+    macdrv_view_detach_presenter(client->cocoa_view, presented->presenter);
+    presented->presenter = NULL;
+}
+
 static BOOL macdrv_surface_create(struct client_surface *client, int format, struct opengl_drawable **drawable)
 {
     struct macdrv_win_data *data;
@@ -1441,6 +1746,7 @@ static BOOL macdrv_surface_create(struct client_surface *client, int format, str
     release_win_data(data);
 
     if (!(gl = opengl_drawable_create(sizeof(*gl), &macdrv_surface_funcs, format, client))) return FALSE;
+    presented_init(gl);
     *drawable = &gl->base;
     return TRUE;
 }
@@ -1448,6 +1754,7 @@ static BOOL macdrv_surface_create(struct client_surface *client, int format, str
 static void macdrv_surface_destroy(struct opengl_drawable *base)
 {
     TRACE("drawable %s\n", debugstr_opengl_drawable(base));
+    presented_destroy(impl_from_opengl_drawable(base));
 }
 
 /**********************************************************************
@@ -1472,7 +1779,12 @@ static void make_context_current(struct macdrv_context *context, BOOL read)
         pbuffer = context->draw_pbuffer;
     }
 
-    if (view || !pbuffer)
+    if (read ? context->read_presented : context->draw_presented)
+    {
+        CGLClearDrawable(context->cglcontext);
+        macdrv_make_context_current_offscreen(context->context);
+    }
+    else if (view || !pbuffer)
         macdrv_make_context_current(context->context, view, cgrect_from_rect(view_rect));
     else
     {
@@ -1975,11 +2287,22 @@ static void macdrv_glCopyPixels(GLint x, GLint y, GLsizei width, GLsizei height,
 static void macdrv_surface_flush(struct opengl_drawable *base, UINT flags)
 {
     struct macdrv_client_surface *client = impl_from_client_surface(base->client);
+    struct gl_drawable *gl = impl_from_opengl_drawable(base);
     struct macdrv_context *context = NtCurrentTeb()->glReserved2;
 
     TRACE("%s flags %#x\n", debugstr_opengl_drawable(base), flags);
 
     if (!context) return;
+    if (gl->presented.presenter)
+    {
+        if (flags & GL_FLUSH_UPDATED) presented_update(gl, context);
+        if (flags & GL_FLUSH_PRESENT)
+        {
+            presented_present(gl, FALSE, 0);
+            client_surface_present(base->client);
+        }
+        return;
+    }
     if (flags & GL_FLUSH_INTERVAL) set_swap_interval(context, base->interval);
     if (flags & GL_FLUSH_UPDATED) make_context_current(context, context->read_view == client->cocoa_view);
     if (flags & GL_FLUSH_PRESENT)
@@ -2245,8 +2568,14 @@ static BOOL macdrv_make_current(struct opengl_drawable *draw_base, struct opengl
     context->read_hwnd = context->draw_hwnd = NULL;
     context->read_view = context->draw_view = NULL;
     context->read_pbuffer = context->draw_pbuffer = NULL;
+    context->draw_presented = !!draw->presented.presenter;
+    context->read_presented = !!read->presented.presenter;
 
-    if (draw->base.client)
+    if (context->draw_presented)
+    {
+        context->draw_hwnd = draw->base.client->hwnd;
+    }
+    else if (draw->base.client)
     {
         struct macdrv_client_surface *client = impl_from_client_surface(draw->base.client);
         context->draw_hwnd = draw->base.client->hwnd;
@@ -2257,7 +2586,7 @@ static BOOL macdrv_make_current(struct opengl_drawable *draw_base, struct opengl
         context->draw_pbuffer = draw->pbuffer;
     }
 
-    if (read != draw)
+    if (read != draw && !context->read_presented)
     {
         if (read->base.client)
         {
@@ -2276,6 +2605,11 @@ static BOOL macdrv_make_current(struct opengl_drawable *draw_base, struct opengl
 
     make_context_current(context, FALSE);
     NtCurrentTeb()->glReserved2 = context;
+
+    /* opengl32 binds the drawables' framebuffer objects right after this, so
+       they exist by now. */
+    if (context->draw_presented) presented_update(draw, context);
+    if (context->read_presented && read != draw) presented_update(read, context);
 
     return TRUE;
 }
@@ -2717,11 +3051,16 @@ static void *macdrv_get_proc_address(const char *name)
 static BOOL macdrv_surface_swap(struct opengl_drawable *base)
 {
     struct macdrv_context *context = NtCurrentTeb()->glReserved2;
+    struct gl_drawable *gl = impl_from_opengl_drawable(base);
 
     TRACE("%s context %p/%p/%p\n", debugstr_opengl_drawable(base), context, (context ? context->context : NULL),
           (context ? context->cglcontext : NULL));
 
-    if (context)
+    if (context && gl->presented.presenter)
+    {
+        presented_present(gl, TRUE, base->interval);
+    }
+    else if (context)
     {
         struct macdrv_client_surface *client = impl_from_client_surface(base->client);
         make_context_current(context, context->read_view == client->cocoa_view);

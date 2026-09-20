@@ -12,7 +12,7 @@
 
 SWIFTC ?= swiftc
 TARGET ?= x86_64-apple-macos14
-SOURCES = Presenter.swift SurfacePresenter.swift FinalPass.swift Scalers.swift MPVHook.swift
+SOURCES = Presenter.swift SurfacePresenter.swift GLPresenter.swift FinalPass.swift Scalers.swift MPVHook.swift
 
 libwinemacswift.a: $(SOURCES)
 	$(SWIFTC) -emit-library -static -target $(TARGET) -O -parse-as-library \

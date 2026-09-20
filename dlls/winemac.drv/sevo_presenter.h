@@ -51,10 +51,28 @@ extern void *sevo_presenter_attach_surface(void *bits, size_t size, int stride, 
    staging is all in flight and the caller keeps the rectangle dirty for
    its next flush. */
 extern int sevo_presenter_surface_flush(void *presenter, int left, int top, int right, int bottom);
-/* The window wants the surface on screen again: presenting the last frame
-   afresh gives a layer the system emptied behind a covered window its
-   picture back. */
-extern void sevo_presenter_surface_refresh(void *presenter);
+/* The window wants a surface's or an OpenGL drawable's picture on screen
+   again: presenting the last frame afresh gives a layer the system emptied
+   behind a covered window its picture back. */
+extern void sevo_presenter_refresh(void *presenter);
+
+/* Takes over one OpenGL window drawable. The driver draws each frame into an
+   IOSurface of the presenter's ring, top row first, and the presenter puts it
+   on screen. The returned handle owns the on-screen layer; NULL when the
+   presenter is not running. */
+extern void *sevo_presenter_attach_gl(void);
+/* A new ring of SEVO_GL_RING BGRA surfaces of this size. The driver deletes
+   its textures of the old ring first. Returns 1 when the ring exists. */
+#define SEVO_GL_RING 4
+extern int sevo_presenter_gl_resize(void *presenter, int width, int height);
+extern void *sevo_presenter_gl_surface(void *presenter, int index);  /* IOSurfaceRef, unretained */
+/* The slot to draw the next frame into, or -1 when every surface is still
+   being read and the frame is to be dropped. An acquired slot ends in
+   sevo_presenter_gl_present, after glFlush, or sevo_presenter_gl_abandon.
+   A present with `synced` waits for the display as a swap interval does. */
+extern int sevo_presenter_gl_acquire(void *presenter);
+extern void sevo_presenter_gl_present(void *presenter, int index, int synced);
+extern void sevo_presenter_gl_abandon(void *presenter, int index);
 extern void *sevo_presenter_onscreen_layer(void *presenter);       /* CAMetalLayer*, unretained */
 /* The view's geometry: device pixels per point (the presentation scale
    included), the source's pixels per point (the renderer layer's

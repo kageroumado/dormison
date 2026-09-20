@@ -292,6 +292,20 @@ void macdrv_make_context_current(macdrv_opengl_context c, macdrv_view v, CGRect 
 }
 
 /***********************************************************************
+ *              macdrv_make_context_current_offscreen
+ */
+void macdrv_make_context_current_offscreen(macdrv_opengl_context c)
+{
+@autoreleasepool
+{
+    WineOpenGLContext *context = (WineOpenGLContext*)c;
+
+    [context removeFromViews:YES];
+    [context makeCurrentContext];
+}
+}
+
+/***********************************************************************
  *              macdrv_update_opengl_context
  */
 void macdrv_update_opengl_context(macdrv_opengl_context c)

@@ -112,11 +112,50 @@ public func sevoPresenterAttachSurface(
 /// Presents the last frame again. A layer whose content the system dropped
 /// while the window was hidden or covered gets its picture back this way; a
 /// program that has finished drawing does not flush again.
-@_cdecl("sevo_presenter_surface_refresh")
-public func sevoPresenterSurfaceRefresh(_ handle: UnsafeMutableRawPointer) {
-    guard let presenter = Unmanaged<ViewPresenter>.fromOpaque(handle).takeUnretainedValue() as? SurfacePresenter
-    else { return }
-    presenter.refresh()
+@_cdecl("sevo_presenter_refresh")
+public func sevoPresenterRefresh(_ handle: UnsafeMutableRawPointer) {
+    Unmanaged<ViewPresenter>.fromOpaque(handle).takeUnretainedValue().refresh()
+}
+
+/// Takes over one OpenGL window drawable, whose frames the driver draws into
+/// the presenter's IOSurfaces.
+///
+/// - Returns: a retained handle, released by `sevo_presenter_detach`, or
+///   NULL when the presenter is not running.
+@_cdecl("sevo_presenter_attach_gl")
+public func sevoPresenterAttachGL() -> UnsafeMutableRawPointer? {
+    guard Presenter.shared.device != nil, let presenter = GLViewPresenter() else { return nil }
+    return Unmanaged<ViewPresenter>.passRetained(presenter).toOpaque()
+}
+
+private func glPresenter(_ handle: UnsafeMutableRawPointer) -> GLViewPresenter? {
+    Unmanaged<ViewPresenter>.fromOpaque(handle).takeUnretainedValue() as? GLViewPresenter
+}
+
+@_cdecl("sevo_presenter_gl_resize")
+public func sevoPresenterGLResize(_ handle: UnsafeMutableRawPointer, _ width: Int32, _ height: Int32) -> Int32 {
+    glPresenter(handle)?.resize(width: Int(width), height: Int(height)) == true ? 1 : 0
+}
+
+@_cdecl("sevo_presenter_gl_surface")
+public func sevoPresenterGLSurface(_ handle: UnsafeMutableRawPointer, _ index: Int32) -> UnsafeMutableRawPointer? {
+    guard let surface = glPresenter(handle)?.surface(at: Int(index)) else { return nil }
+    return Unmanaged.passUnretained(surface).toOpaque()
+}
+
+@_cdecl("sevo_presenter_gl_acquire")
+public func sevoPresenterGLAcquire(_ handle: UnsafeMutableRawPointer) -> Int32 {
+    Int32(glPresenter(handle)?.acquire() ?? -1)
+}
+
+@_cdecl("sevo_presenter_gl_present")
+public func sevoPresenterGLPresent(_ handle: UnsafeMutableRawPointer, _ index: Int32, _ synced: Int32) {
+    glPresenter(handle)?.present(index: Int(index), synced: synced != 0)
+}
+
+@_cdecl("sevo_presenter_gl_abandon")
+public func sevoPresenterGLAbandon(_ handle: UnsafeMutableRawPointer, _ index: Int32) {
+    glPresenter(handle)?.abandon(index: Int(index))
 }
 
 /// The program finished drawing `left, top, right, bottom` of a surface, in
@@ -411,7 +450,7 @@ let sevoStatsSourcePresenter: UInt32 = 2
 /// What every presented view shares: the on-screen layer at the device
 /// pixels the view covers, the scaler chain, and the final pass that draws
 /// a frame into one of the layer's drawables. A subclass supplies the
-/// frames: a Metal renderer's, or a GDI surface's.
+/// frames: a Metal renderer's, a GDI surface's, or an OpenGL drawable's.
 class ViewPresenter: NSObject {
     let device: MTLDevice
     let finalPass: FinalPass
@@ -473,6 +512,9 @@ class ViewPresenter: NSObject {
     /// The upscaler or the filter changed: a subclass that can present its last
     /// frame again does. Main thread.
     func optionsChanged() {}
+
+    /// The last frame goes on screen again, for a subclass that keeps one.
+    func refresh() {}
 
     /// What a subclass sets on the fresh layer.
     func configure(_ layer: CAMetalLayer) {}

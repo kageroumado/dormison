@@ -1460,7 +1460,7 @@ static NSView* wine_content_view_of(NSWindow* window)
 
     - (void) updateLayer
     {
-        sevo_presenter_surface_refresh(_presenter);
+        sevo_presenter_refresh(_presenter);
     }
 
     /* Device pixels per point of this view: the window's presentation
@@ -4535,6 +4535,46 @@ void macdrv_window_detach_surface(macdrv_window w, void *presenter)
 
     OnMainThreadAsync(^{
         [[window wineContentView] detachSurfaceView:presenter];
+        sevo_presenter_detach(presenter);
+    });
+}
+}
+
+
+/***********************************************************************
+ *              macdrv_view_attach_presenter
+ *
+ * Gives a client view a subview whose layer is the presenter's, for an
+ * OpenGL drawable the presenter shows. The presenter handle stays the
+ * caller's until macdrv_view_detach_presenter releases it.
+ */
+void macdrv_view_attach_presenter(macdrv_view v, void *presenter)
+{
+@autoreleasepool
+{
+    WineContentView* view = (WineContentView*)v;
+
+    OnMainThreadAsync(^{
+        [view attachSurfaceView:presenter];
+    });
+}
+}
+
+
+/***********************************************************************
+ *              macdrv_view_detach_presenter
+ *
+ * Removes the presenter's subview and releases the presenter, in that
+ * order, on the main thread: the subview's layer is the presenter's.
+ */
+void macdrv_view_detach_presenter(macdrv_view v, void *presenter)
+{
+@autoreleasepool
+{
+    WineContentView* view = (WineContentView*)v;
+
+    OnMainThreadAsync(^{
+        [view detachSurfaceView:presenter];
         sevo_presenter_detach(presenter);
     });
 }

@@ -142,6 +142,11 @@ extern int presentation_log_on;
    Presenter=Y`, or SEVO_PRESENTER=1 in the environment as the bottle default.
    Off, the driver behaves as it does without the presenter at all. */
 extern int presenter_on;
+/* With the presenter on, an OpenGL window drawable is drawn off screen and
+   shown by the presenter, which is what puts the upscaler over wined3d's
+   Direct3D 9. `Mac Driver\OpenGLPresenter=N` or SEVO_GL_PRESENTER=0 keeps
+   OpenGL on its own view. */
+extern int gl_presenter_on;
 extern char upscaler_option[64];      /* the upscaler in force; the View menu changes it */
 extern char final_filter_option[16];
 /* Traces the presenter's frames and the Metal view lifecycle to stderr:
@@ -556,6 +561,11 @@ extern void macdrv_window_set_color_image(macdrv_window w, CGImageRef image, CGR
 extern void macdrv_window_attach_surface(macdrv_window w, void *presenter);
 extern void macdrv_window_detach_surface(macdrv_window w, void *presenter);
 extern void macdrv_window_surface_drawn(macdrv_window w);
+/* An OpenGL drawable shown by the presenter (sevo_presenter_attach_gl): its
+   client view gets a subview for the presenter's layer, and gives it back
+   with the presenter released. */
+extern void macdrv_view_attach_presenter(macdrv_view v, void *presenter);
+extern void macdrv_view_detach_presenter(macdrv_view v, void *presenter);
 extern void macdrv_view_drawn(macdrv_view v);
 extern void macdrv_window_set_shape_image(macdrv_window w, CGImageRef image);
 extern void macdrv_set_window_shape(macdrv_window w, const CGRect *rects, int count);
@@ -615,6 +625,9 @@ extern int macdrv_set_pasteboard_data(CFStringRef type, CFDataRef data, macdrv_w
 extern macdrv_opengl_context macdrv_create_opengl_context(void* cglctx);
 extern void macdrv_dispose_opengl_context(macdrv_opengl_context c);
 extern void macdrv_make_context_current(macdrv_opengl_context c, macdrv_view v, CGRect r);
+/* Makes the context current with no view: what it draws goes to framebuffer
+   objects. */
+extern void macdrv_make_context_current_offscreen(macdrv_opengl_context c);
 extern void macdrv_update_opengl_context(macdrv_opengl_context c);
 extern void macdrv_flush_opengl_context(macdrv_opengl_context c);
 
