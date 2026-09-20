@@ -37,6 +37,27 @@ import QuartzCore
 ///   - trace: non-zero to trace frames to stderr (`PresenterLog`).
 ///   - debug: the `PresenterDebug` option; `clear` paints the drawable red
 ///     instead of the frame.
+/// The upscaler and the final filter change now, for every view of the
+/// process. A null argument leaves that one as it is.
+@_cdecl("sevo_presenter_set_options")
+public func sevoPresenterSetOptions(_ upscaler: UnsafePointer<CChar>?, _ filter: UnsafePointer<CChar>?) {
+    Presenter.shared.setOptions(
+        upscaler: upscaler.map { String(cString: $0) }, filter: filter.map { String(cString: $0) })
+}
+
+/// Shows or hides the readout over every presented view.
+@_cdecl("sevo_presenter_set_readout")
+public func sevoPresenterSetReadout(_ shown: Int32) {
+    Presenter.shared.setReadout(shown != 0)
+}
+
+/// The shader packages that can be chosen, newline-separated, in a buffer
+/// the caller frees with `free`.
+@_cdecl("sevo_presenter_package_names")
+public func sevoPresenterPackageNames() -> UnsafeMutablePointer<CChar>? {
+    strdup(Presenter.shared.packageNames.joined(separator: "\n"))
+}
+
 /// - Returns: 1 when the presenter has a Metal device and its shaders, 0
 ///   when the driver should behave as if the option were off.
 @_cdecl("sevo_presenter_init")
@@ -197,6 +218,72 @@ final class Presenter: @unchecked Sendable {
     private(set) var finalPass: FinalPass?
     private var hooked = false
 
+    /// Raised by every change of the upscaler or the final filter; a view's
+    /// presenter rebuilds its chain when its own copy falls behind.
+    private(set) var optionsGeneration = 0
+    /// Whether each view draws its readout: engine, source and target size,
+    /// upscaler, filter, frames a second.
+    private(set) var showsReadout = false
+    private let optionsLock = NSLock()
+
+    /// The upscaler and final filter change for every view of this process,
+    /// from its next frame. `nil` leaves one as it is.
+    func setOptions(upscaler: String?, filter: String?) {
+        optionsLock.lock()
+        config = PresenterConfig(
+            upscaler: upscaler ?? config.upscaler,
+            filter: filter.map { FinalFilter(option: $0) } ?? config.filter,
+            shaderDirectories: config.shaderDirectories, tracing: config.tracing, debugClear: config.debugClear)
+        optionsGeneration += 1
+        let live = views.allObjects
+        optionsLock.unlock()
+        log("now: upscaler \(config.upscalerName) filter \(config.filter)")
+        // A picture at rest presents nothing, so the change would wait for the
+        // program's next redraw; each view is asked to put its frame up again.
+        DispatchQueue.main.async { live.forEach { $0.optionsChanged() } }
+    }
+
+    func setReadout(_ shown: Bool) {
+        optionsLock.lock()
+        showsReadout = shown
+        let live = views.allObjects
+        optionsLock.unlock()
+        if Thread.isMainThread {
+            live.forEach { $0.readoutChanged(shown) }
+        } else {
+            DispatchQueue.main.async { live.forEach { $0.readoutChanged(shown) } }
+        }
+    }
+
+    /// Every live view's presenter, weakly: the readout is switched on views
+    /// that may not present another frame for minutes.
+    private let views = NSHashTable<ViewPresenter>.weakObjects()
+
+    func register(_ view: ViewPresenter) {
+        optionsLock.lock()
+        views.add(view)
+        let shown = showsReadout
+        optionsLock.unlock()
+        if shown { DispatchQueue.main.async { [weak view] in view?.readoutChanged(true) } }
+    }
+
+    /// The shader packages a menu can offer: every directory under the search
+    /// path that holds a `graph.json`, by name.
+    var packageNames: [String] {
+        var directories = config.shaderDirectories.split(separator: ":").map(String.init)
+        if directories.isEmpty {
+            directories = [NSHomeDirectory() + "/Library/Application Support/Sevoflurane/Shaders"]
+        }
+        var names: Set<String> = []
+        for directory in directories {
+            for name in (try? FileManager.default.contentsOfDirectory(atPath: directory)) ?? []
+            where FileManager.default.fileExists(atPath: directory + "/" + name + "/graph.json") {
+                names.insert(name)
+            }
+        }
+        return names.sorted()
+    }
+
     var tracing: Bool { config.tracing }
     var debugClear: Bool { config.debugClear }
 
@@ -328,9 +415,20 @@ let sevoStatsSourcePresenter: UInt32 = 2
 class ViewPresenter: NSObject {
     let device: MTLDevice
     let finalPass: FinalPass
-    let filter: FinalFilter
-    let scaler: Scaler?
+    private(set) var filter: FinalFilter
+    private(set) var scaler: Scaler?
+    /// The generation of ``Presenter/optionsGeneration`` this view's chain
+    /// was built from.
+    private var builtFrom = 0
     private let renderPass = MTLRenderPassDescriptor()
+
+    /// The readout: a text layer over the picture, made and updated on the
+    /// main thread, once a second.
+    private var readout: CATextLayer?
+    private var readoutTimer: Timer?
+    /// Written by the presenting thread, read by the timer, under `statsLock`.
+    private var readoutFrames = 0
+    private var readoutSizes = ""
 
     private let pixelFormat: MTLPixelFormat
     private let contentsScale: CGFloat
@@ -372,6 +470,10 @@ class ViewPresenter: NSObject {
         return layer
     }
 
+    /// The upscaler or the filter changed: a subclass that can present its last
+    /// frame again does. Main thread.
+    func optionsChanged() {}
+
     /// What a subclass sets on the fresh layer.
     func configure(_ layer: CAMetalLayer) {}
 
@@ -386,9 +488,11 @@ class ViewPresenter: NSObject {
         self.finalPass = finalPass
         self.filter = shared.config.filter
         self.scaler = shared.makeScaler()
+        self.builtFrom = shared.optionsGeneration
         self.pixelFormat = pixelFormat
         self.contentsScale = contentsScale
         super.init()
+        shared.register(self)
     }
 
     // MARK: Geometry (main thread)
@@ -428,9 +532,11 @@ class ViewPresenter: NSObject {
         if intermediates.isEmpty {
             intermediates = Array(repeating: nil, count: max(1, onscreen.maximumDrawableCount))
         }
+        adoptOptions()
         acquisitions += 1
         let slot = acquisitions % intermediates.count
         let target = real.texture
+        noteForReadout(source: source, target: target)
         let scaled = scaler?.encode(source: source, target: MTLSize(width: target.width, height: target.height, depth: 1), in: commandBuffer) ?? source
         finalPass.encode(
             source: scaled, into: target, filter: filter, pass: renderPass,
@@ -464,6 +570,88 @@ class ViewPresenter: NSObject {
 
     /// The source's part of the trace summary.
     var sourceDescription: String { "" }
+
+    /// Rebuilds the chain when the process's options moved on. On the
+    /// presenting thread, which is the only one that reads the chain.
+    private func adoptOptions() {
+        let shared = Presenter.shared
+        guard builtFrom != shared.optionsGeneration else { return }
+        builtFrom = shared.optionsGeneration
+        filter = shared.config.filter
+        scaler = shared.makeScaler()
+    }
+
+    /// Counts the frame for the readout and remembers what it was scaled from and to.
+    private func noteForReadout(source: MTLTexture, target: MTLTexture) {
+        guard Presenter.shared.showsReadout else { return }
+        statsLock.lock()
+        readoutFrames += 1
+        readoutSizes = "\(source.width)×\(source.height) → \(target.width)×\(target.height)"
+        statsLock.unlock()
+    }
+
+    /// The readout was switched. On: a timer puts the line up every second, frames or
+    /// none, since a picture at rest presents nothing. Main thread.
+    func readoutChanged(_ shown: Bool) {
+        readoutTimer?.invalidate()
+        readoutTimer = nil
+        guard shown else {
+            readout?.removeFromSuperlayer()
+            readout = nil
+            return
+        }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.updateReadout() }
+        RunLoop.main.add(timer, forMode: .common)
+        readoutTimer = timer
+        updateReadout()
+    }
+
+    private func updateReadout() {
+        statsLock.lock()
+        let frames = readoutFrames
+        let sizes = readoutSizes
+        readoutFrames = 0
+        statsLock.unlock()
+        let config = Presenter.shared.config
+        let chain = scaler == nil && !["off", "lanczos", "passthrough"].contains(config.upscalerName)
+            ? "\(config.upscalerName) (unavailable)" : config.upscalerName
+        let engine = ProcessInfo.processInfo.environment["SEVO_ENGINE_NAME"] ?? "dormison"
+        let rate = frames == 0 ? "picture at rest" : "\(frames) fps"
+        showReadout("\(engine) · \(sourceDescription)\n\(sizes.isEmpty ? "no frame yet" : sizes)"
+            + " · upscaler \(chain) · filter \(config.filter) · \(rate)")
+    }
+
+    private func showReadout(_ text: String) {
+        guard Presenter.shared.showsReadout, let host = onscreenLayer else { return }
+        let layer: CATextLayer
+        if let readout {
+            layer = readout
+        } else {
+            layer = CATextLayer()
+            layer.font = "Menlo-Bold" as CFString
+            layer.fontSize = 12
+            layer.foregroundColor = CGColor(red: 0.6, green: 1, blue: 0.6, alpha: 1)
+            layer.backgroundColor = CGColor(gray: 0, alpha: 0.6)
+            layer.cornerRadius = 4
+            layer.contentsScale = 2
+            layer.isWrapped = true
+            layer.zPosition = 1000
+            // On the window's topmost layer: the view that hosts the picture sits under
+            // the program's client views, and one of those can cover it.
+            var top: CALayer = host
+            while let parent = top.superlayer { top = parent }
+            top.addSublayer(layer)
+            readout = layer
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.string = text
+        let bounds = layer.superlayer?.bounds ?? host.bounds
+        // Bottom left, clear of the title bar the topmost layer also spans.
+        let y = (layer.superlayer?.isGeometryFlipped ?? false) ? bounds.height - 44 : 8
+        layer.frame = CGRect(x: 8, y: y, width: min(max(bounds.width - 16, 200), 640), height: 36)
+        CATransaction.commit()
+    }
 
     private func summarize() {
         guard Presenter.shared.tracing else { return }

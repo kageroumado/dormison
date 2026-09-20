@@ -176,6 +176,12 @@ static void open_page(void)
     atexit(close_page);
 }
 
+/* The Steam app this process belongs to, 0 when it is not a game's. */
+unsigned int sevo_stats_appid(void)
+{
+    return process_appid;
+}
+
 void sevo_stats_init(unsigned int appid, const char *exe)
 {
     process_appid = appid;

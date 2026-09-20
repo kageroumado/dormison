@@ -22,6 +22,8 @@
 #import "cocoa_cursorclipping.h"
 #import "cocoa_event.h"
 #import "cocoa_window.h"
+#include "sevo_presenter.h"
+#include "sevo_stats.h"
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
@@ -112,6 +114,9 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
 @end
 
+
+/* Whether the View menu has the presenter's readout switched on. */
+static BOOL sevoReadoutShown;
 
 @implementation WineApplicationController
 
@@ -223,7 +228,13 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
     - (void) transformProcessToForeground:(BOOL)activateIfTransformed
     {
-        if ([NSApp activationPolicy] != NSApplicationActivationPolicyRegular)
+        /* A game started through its own loader bundle is a regular app from its first
+           instruction, and still needs the menus: without them it has no Window menu, no
+           Enter Full Screen, and no View menu. */
+        static BOOL mainMenuBuilt;
+        BOOL becomesRegular = [NSApp activationPolicy] != NSApplicationActivationPolicyRegular;
+
+        if (becomesRegular || !mainMenuBuilt)
         {
             NSMenu* mainMenu;
             NSMenu* submenu;
@@ -231,7 +242,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
             NSString* title;
             NSMenuItem* item;
 
-            [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+            mainMenuBuilt = YES;
+            if (becomesRegular) [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
             if (activateIfTransformed)
                 [self tryToActivateIgnoringOtherApps:YES];
@@ -276,6 +288,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
             [item setSubmenu:submenu];
             [mainMenu addItem:item];
 
+            [self addSevoViewMenuTo:mainMenu];
+
             // Window menu
             submenu = [[[NSMenu alloc] initWithTitle:WineLocalizedString(STRING_MENU_WINDOW)] autorelease];
             [submenu addItemWithTitle:WineLocalizedString(STRING_MENU_ITEM_MINIMIZE)
@@ -302,7 +316,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
             [NSApp setMainMenu:mainMenu];
             [NSApp setWindowsMenu:submenu];
 
-            [NSApp setApplicationIconImage:self.applicationIcon];
+            /* The bundle's own icon stands where there is one. */
+            if (becomesRegular) [NSApp setApplicationIconImage:self.applicationIcon];
         }
     }
 
@@ -642,6 +657,140 @@ static NSString* WineLocalizedString(unsigned int stringID)
         }
 
         return nil;
+    }
+
+    /* The View menu: how the program's picture reaches the screen. A choice is applied at
+       once where the presenter is running, and handed to `sevo` either way, which writes it
+       into the game's own settings so the next launch starts with it. */
+    - (void) addSevoViewMenuTo:(NSMenu*)mainMenu
+    {
+        NSMenu* view = [[[NSMenu alloc] initWithTitle:@"View"] autorelease];
+        NSMenu* upscalers = [[[NSMenu alloc] initWithTitle:@"Upscaler"] autorelease];
+        NSMenu* filters = [[[NSMenu alloc] initWithTitle:@"Final Filter"] autorelease];
+        NSMenuItem* item;
+        char* packages = sevo_presenter_package_names();
+
+        for (NSArray* pair in @[@[@"Off", @"off"], @[@"Lanczos", @"lanczos"], @[@"MetalFX", @"metalfx"]])
+        {
+            item = [upscalers addItemWithTitle:pair[0] action:@selector(sevoChooseUpscaler:) keyEquivalent:@""];
+            [item setTarget:self];
+            [item setRepresentedObject:pair[1]];
+        }
+        if (packages && *packages)
+        {
+            [upscalers addItem:[NSMenuItem separatorItem]];
+            for (NSString* name in [[NSString stringWithUTF8String:packages] componentsSeparatedByString:@"\n"])
+            {
+                item = [upscalers addItemWithTitle:name action:@selector(sevoChooseUpscaler:) keyEquivalent:@""];
+                [item setTarget:self];
+                [item setRepresentedObject:name];
+            }
+        }
+        free(packages);
+
+        for (NSArray* pair in @[@[@"Nearest", @"nearest"], @[@"Bilinear", @"bilinear"], @[@"Lanczos", @"lanczos"]])
+        {
+            item = [filters addItemWithTitle:pair[0] action:@selector(sevoChooseFilter:) keyEquivalent:@""];
+            [item setTarget:self];
+            [item setRepresentedObject:pair[1]];
+        }
+
+        item = [view addItemWithTitle:@"Upscaler" action:NULL keyEquivalent:@""];
+        [item setSubmenu:upscalers];
+        item = [view addItemWithTitle:@"Final Filter" action:NULL keyEquivalent:@""];
+        [item setSubmenu:filters];
+        [view addItem:[NSMenuItem separatorItem]];
+        item = [view addItemWithTitle:@"Show Picture Details" action:@selector(sevoToggleReadout:) keyEquivalent:@"i"];
+        [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
+        [item setTarget:self];
+
+        item = [[[NSMenuItem alloc] init] autorelease];
+        [item setTitle:@"View"];
+        [item setSubmenu:view];
+        [mainMenu addItem:item];
+    }
+
+    - (BOOL) validateMenuItem:(NSMenuItem*)menuItem
+    {
+        SEL action = [menuItem action];
+
+        if (action == @selector(sevoChooseUpscaler:))
+            [menuItem setState:!strcasecmp(upscaler_option, [[menuItem representedObject] UTF8String]) ? NSControlStateValueOn : NSControlStateValueOff];
+        else if (action == @selector(sevoChooseFilter:))
+            [menuItem setState:!strcasecmp(final_filter_option, [[menuItem representedObject] UTF8String]) ? NSControlStateValueOn : NSControlStateValueOff];
+        else if (action == @selector(sevoToggleReadout:))
+        {
+            [menuItem setState:sevoReadoutShown ? NSControlStateValueOn : NSControlStateValueOff];
+            return presenter_on;
+        }
+        return YES;
+    }
+
+    /* Hands a per-game setting to `sevo app config`, the one writer of the game's settings.
+       SEVO_CLI names it where the app set it; the symlink the app installs is the fallback. */
+    - (void) sevoStoreSetting:(NSString*)key value:(NSString*)value
+    {
+        unsigned int appid = sevo_stats_appid();
+        const char* cli = getenv("SEVO_CLI");
+        NSString* path = cli && *cli ? [NSString stringWithUTF8String:cli] : @"/usr/local/bin/sevo";
+        NSTask* task;
+
+        if (!appid || ![[NSFileManager defaultManager] isExecutableFileAtPath:path]) return;
+        task = [[[NSTask alloc] init] autorelease];
+        [task setExecutableURL:[NSURL fileURLWithPath:path]];
+        [task setArguments:@[@"app", @"config", [NSString stringWithFormat:@"%u", appid], key, value]];
+        [task setStandardOutput:[NSFileHandle fileHandleWithNullDevice]];
+        [task setStandardError:[NSFileHandle fileHandleWithNullDevice]];
+        [task launchAndReturnError:NULL];
+    }
+
+    - (void) sevoChooseUpscaler:(NSMenuItem*)sender
+    {
+        NSString* name = [sender representedObject];
+        BOOL wasOff = !strcasecmp(upscaler_option, "off");
+        BOOL nowOff = ![name caseInsensitiveCompare:@"off"];
+
+        snprintf(upscaler_option, sizeof(upscaler_option), "%s", [name UTF8String]);
+        [self sevoStoreSetting:@"upscaler" value:name];
+
+        if (presenter_on && !nowOff)
+        {
+            sevo_presenter_set_options([name UTF8String], NULL);
+            return;
+        }
+        if (presenter_on && nowOff)
+        {
+            /* The presenter stays in the picture's path until the program ends; plain
+               resampling is the nearest thing to off it can do meanwhile. */
+            sevo_presenter_set_options("lanczos", NULL);
+        }
+        if (wasOff != nowOff)
+        {
+            NSAlert* alert = [[[NSAlert alloc] init] autorelease];
+            [alert setMessageText:nowOff ? @"The upscaler turns off the next time this game starts."
+                                         : @"The upscaler turns on the next time this game starts."];
+            [alert setInformativeText:nowOff ? @"Until then the picture is resampled with Lanczos."
+                                             : @"This game started without it, and it cannot join a running game."];
+            [alert addButtonWithTitle:@"Quit Game"];
+            [alert addButtonWithTitle:@"Later"];
+            if ([alert runModal] == NSAlertFirstButtonReturn)
+                [NSApp terminate:nil];
+        }
+    }
+
+    - (void) sevoChooseFilter:(NSMenuItem*)sender
+    {
+        NSString* name = [sender representedObject];
+
+        snprintf(final_filter_option, sizeof(final_filter_option), "%s", [name UTF8String]);
+        [self sevoStoreSetting:@"filter" value:name];
+        if (presenter_on) sevo_presenter_set_options(NULL, [name UTF8String]);
+    }
+
+    - (void) sevoToggleReadout:(NSMenuItem*)sender
+    {
+        sevoReadoutShown = !sevoReadoutShown;
+        sevo_presenter_set_readout(sevoReadoutShown);
     }
 
     - (void) adjustWindowLevels:(BOOL)active

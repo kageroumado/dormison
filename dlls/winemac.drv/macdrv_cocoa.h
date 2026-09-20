@@ -142,6 +142,8 @@ extern int presentation_log_on;
    Presenter=Y`, or SEVO_PRESENTER=1 in the environment as the bottle default.
    Off, the driver behaves as it does without the presenter at all. */
 extern int presenter_on;
+extern char upscaler_option[64];      /* the upscaler in force; the View menu changes it */
+extern char final_filter_option[16];
 /* Traces the presenter's frames and the Metal view lifecycle to stderr:
    `Mac Driver\PresenterLog=Y` or SEVO_PRESENTER_LOG=1. */
 extern int presenter_log_on;

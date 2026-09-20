@@ -74,6 +74,7 @@ struct sevo_stats_page
    present; the page itself is made by the first present, so a process that
    never draws leaves no file. */
 extern void sevo_stats_init(unsigned int appid, const char *exe);
+extern unsigned int sevo_stats_appid(void);
 
 extern void sevo_stats_note_present(unsigned int source);
 extern void sevo_stats_note_drawable(void);

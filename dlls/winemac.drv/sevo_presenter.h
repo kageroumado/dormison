@@ -67,4 +67,12 @@ extern void *sevo_presenter_next_drawable(void *presenter);
    on the calling thread, before the handle is released. */
 extern void sevo_presenter_detach(void *presenter);
 
+/* The View menu's side. The upscaler and the final filter change for every presented view
+   from its next frame; NULL leaves one as it is. */
+extern void sevo_presenter_set_options(const char *upscaler, const char *final_filter);
+/* The readout over the picture: engine, sizes, upscaler, filter, frames a second. */
+extern void sevo_presenter_set_readout(int shown);
+/* The shader packages that can be chosen, newline-separated; the caller frees it. */
+extern char *sevo_presenter_package_names(void);
+
 #endif
