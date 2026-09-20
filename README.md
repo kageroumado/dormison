@@ -53,12 +53,20 @@ wrappers for toolkit callbacks, and the host-callback table used by
 D3DMetal 4.0. Wine keeps the GS base on Darwin thread storage, mirrors the
 TEB and PEB, and maps `win32u.so` before the toolkit resolves its symbols.
 
-The optional presenter scales Metal and GDI window surfaces. It supports
-Lanczos, MetalFX Spatial and compiled mpv shader packages, including
-fragment and compute passes used by Anime4K and CuNNy. A final filter
-resamples the output. Configure it with `Upscaler`, `FinalFilter` and
-`PresenterLog`, or `SEVO_UPSCALER`, `SEVO_FINAL_FILTER`,
+The optional presenter scales Metal drawables, OpenGL window drawables and
+GDI window surfaces. An OpenGL drawable is a framebuffer object whose swap
+lands in an IOSurface the presenter reads, which is what puts the upscaler
+over wined3d's Direct3D 9; multisampled, stereo, floating-point and 10-bit
+drawables stay on an OpenGL view, and `OpenGLPresenter=N` keeps every one
+there. The presenter supports Lanczos, MetalFX Spatial and compiled mpv
+shader packages, including fragment and compute passes used by Anime4K and
+CuNNy. A final filter resamples the output. Configure it with `Upscaler`,
+`FinalFilter` and `PresenterLog`, or `SEVO_UPSCALER`, `SEVO_FINAL_FILTER`,
 `SEVO_PRESENTER_LOG` and `SEVO_SHADER_DIR`.
+
+A running program has a View menu: Upscaler, Final Filter, Show Frame Rate
+(`FrameRate=Y` or `SEVO_FPS=1` shows it from the first frame) and Show
+Picture Details.
 
 `ResizableWindows` preserves the game's rendering size and aspect ratio
 while allowing the presentation window to resize. `LinearMouse` supplies
