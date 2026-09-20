@@ -173,18 +173,29 @@ final class SurfacePresenter: ViewPresenter {
             lock.unlock()
             return true
         }
-        let rowBytes = width * 4
-        guard let slot = takeSlot(bytes: rowBytes * height) else {
+        guard copyFromDIB(into: frame, x: x, y: y, width: width, height: height) else {
             lock.unlock()
             return false
         }
+        needsFull = false
+        let start = wake()
+        lock.unlock()
+        if start { linkQueue.async { [weak self] in self?.applyLinkState() } }
+        return true
+    }
+
+    /// Copies a rectangle of the DIB into the frame texture through a staging
+    /// slot. `false` when every slot is in flight or Metal gave no command
+    /// buffer. Called with the lock held.
+    private func copyFromDIB(into frame: MTLTexture, x: Int, y: Int, width: Int, height: Int) -> Bool {
+        let rowBytes = width * 4
+        guard let slot = takeSlot(bytes: rowBytes * height) else { return false }
         let contents = slot.contents()
         for row in 0..<height {
             memcpy(contents + row * rowBytes, bits + (y + row) * bytesPerRow + x * 4, rowBytes)
         }
         guard let commandBuffer = queue.makeCommandBuffer(), let blit = commandBuffer.makeBlitCommandEncoder() else {
             freeSlots.append(slot)
-            lock.unlock()
             return false
         }
         blit.label = "sevo surface copy"
@@ -195,10 +206,6 @@ final class SurfacePresenter: ViewPresenter {
         blit.endEncoding()
         commandBuffer.addCompletedHandler { [weak self] buffer in self?.copyCompleted(slot, error: buffer.error) }
         commandBuffer.commit()
-        needsFull = false
-        let start = wake()
-        lock.unlock()
-        if start { linkQueue.async { [weak self] in self?.applyLinkState() } }
         return true
     }
 
@@ -232,14 +239,20 @@ final class SurfacePresenter: ViewPresenter {
         lock.unlock()
     }
 
-    /// The frame goes on screen again. A view whose geometry grew since the
-    /// program last drew shows the old frame seeded into the new texture
-    /// until the program's next flush fills it in.
+    /// The frame goes on screen again, after a layout. A texture the layout
+    /// made new is filled from the DIB first.
     func refresh() {
         lock.lock()
-        guard currentFrame() != nil else {
+        guard let frame = currentFrame() else {
             lock.unlock()
             return
+        }
+        // A texture made for this layout holds whatever the GPU last kept in
+        // that memory beyond what the old frame seeded. The DIB has the
+        // program's picture now, and a program at rest may not flush for
+        // seconds, so the texture takes it here rather than at the next flush.
+        if needsFull, copyFromDIB(into: frame, x: 0, y: 0, width: min(frame.width, dibWidth), height: min(frame.height, dibHeight)) {
+            needsFull = false
         }
         let start = wake()
         lock.unlock()

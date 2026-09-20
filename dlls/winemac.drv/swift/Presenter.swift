@@ -623,6 +623,7 @@ final class MetalViewPresenter: ViewPresenter {
             texture.label = "sevo source \(index)"
             fresh.append(SourceSlot(texture: texture, ring: generation))
         }
+        blacken(fresh.map(\.texture))
         ring = generation
         let out = slots.count - free.count
         slots = fresh
@@ -632,6 +633,27 @@ final class MetalViewPresenter: ViewPresenter {
         for _ in 0..<out { available.signal() }
         log("source \(width)x\(height) \(format.rawValue) x\(MetalViewPresenter.ringDepth)")
         return true
+    }
+
+    /// Fills new source textures with opaque black. Private storage starts as
+    /// whatever the GPU last kept there, and a program that presents before it
+    /// has drawn — most do, for a frame or two — would put that on screen.
+    /// Waited for, so the renderer's first pass cannot be ordered before it.
+    private func blacken(_ textures: [MTLTexture]) {
+        guard let queue = fallbackQueue ?? device.makeCommandQueue(),
+              let commandBuffer = queue.makeCommandBuffer() else { return }
+        fallbackQueue = queue
+        let pass = MTLRenderPassDescriptor()
+        for texture in textures {
+            let attachment = pass.colorAttachments[0]!
+            attachment.texture = texture
+            attachment.loadAction = .clear
+            attachment.storeAction = .store
+            attachment.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+            commandBuffer.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
+        }
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
     }
 
     /// The proxy drawable let go of its slot.
