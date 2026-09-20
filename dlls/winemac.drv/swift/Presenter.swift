@@ -298,6 +298,13 @@ final class Presenter: @unchecked Sendable {
     /// that may not present another frame for minutes.
     private let views = NSHashTable<ViewPresenter>.weakObjects()
 
+    func anotherViewIsDrawing(than view: ViewPresenter) -> Bool {
+        optionsLock.lock()
+        let others = views.allObjects.filter { $0 !== view }
+        optionsLock.unlock()
+        return others.contains(where: \.isDrawing)
+    }
+
     func register(_ view: ViewPresenter) {
         optionsLock.lock()
         views.add(view)
@@ -467,6 +474,13 @@ class ViewPresenter: NSObject {
     private var readoutTimer: Timer?
     /// Written by the presenting thread, read by the timer, under `statsLock`.
     private var readoutFrames = 0
+    /// Frames in the second before the readout's last update, under `statsLock`.
+    private var framesLastSecond = 0
+    var isDrawing: Bool {
+        statsLock.lock()
+        defer { statsLock.unlock() }
+        return framesLastSecond > 0
+    }
     private var readoutSizes = ""
 
     private let pixelFormat: MTLPixelFormat
@@ -653,7 +667,15 @@ class ViewPresenter: NSObject {
         let frames = readoutFrames
         let sizes = readoutSizes
         readoutFrames = 0
+        framesLastSecond = frames
         statsLock.unlock()
+        // A window's GDI surface sits under its Direct3D or OpenGL picture and
+        // is at rest while that one draws: one readout, the drawing view's.
+        if frames == 0, Presenter.shared.anotherViewIsDrawing(than: self) {
+            readout?.isHidden = true
+            return
+        }
+        readout?.isHidden = false
         let config = Presenter.shared.config
         let chain = scaler == nil && !["off", "lanczos", "passthrough"].contains(config.upscalerName)
             ? "\(config.upscalerName) (unavailable)" : config.upscalerName

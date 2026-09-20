@@ -226,3 +226,18 @@ void sevo_stats_note_window(unsigned long long window_id)
     atomic_compare_exchange_strong_explicit(&current_page->window_id, &none, (uint64_t)window_id,
                                             memory_order_relaxed, memory_order_relaxed);
 }
+
+/* Frames so far and the window they go to, for the frame-rate counter the
+   driver draws itself. Drawables are the count to read whenever D3DMetal has
+   taken any: its presents are coalesced, its drawables never are. */
+unsigned long long sevo_stats_frame_count(unsigned long long *window_id)
+{
+    struct stats_page *current_page = atomic_load_explicit(&page, memory_order_acquire);
+    uint64_t drawables;
+
+    if (window_id) *window_id = 0;
+    if (!current_page) return 0;
+    if (window_id) *window_id = atomic_load_explicit(&current_page->window_id, memory_order_relaxed);
+    drawables = atomic_load_explicit(&current_page->drawables, memory_order_relaxed);
+    return drawables ? drawables : atomic_load_explicit(&current_page->frames, memory_order_relaxed);
+}

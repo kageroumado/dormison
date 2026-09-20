@@ -78,6 +78,9 @@ extern unsigned int sevo_stats_appid(void);
 
 extern void sevo_stats_note_present(unsigned int source);
 extern void sevo_stats_note_drawable(void);
+/* Frames so far (drawables when D3DMetal takes any, presents otherwise) and the
+   Cocoa window number they go to; both 0 before the first present. */
+extern unsigned long long sevo_stats_frame_count(unsigned long long *window_id);
 /* The first window number a present path can name; later calls are ignored. */
 extern void sevo_stats_note_window(unsigned long long window_id);
 

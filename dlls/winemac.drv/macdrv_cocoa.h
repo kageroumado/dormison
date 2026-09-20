@@ -149,6 +149,10 @@ extern int presenter_on;
 extern int gl_presenter_on;
 extern char upscaler_option[64];      /* the upscaler in force; the View menu changes it */
 extern char final_filter_option[16];
+/* A frame-rate counter at the top right of the game's window from its first
+   frame: `Mac Driver\FrameRate=Y` or SEVO_FPS=1. View > Show Frame Rate
+   switches it while the game runs. */
+extern int frame_rate_on;
 /* Traces the presenter's frames and the Metal view lifecycle to stderr:
    `Mac Driver\PresenterLog=Y` or SEVO_PRESENTER_LOG=1. */
 extern int presenter_log_on;

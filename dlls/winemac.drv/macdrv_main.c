@@ -61,6 +61,7 @@ int presentation_log_on = 0;
 int presenter_on = 0;
 int gl_presenter_on = 1;
 int presenter_log_on = 0;
+int frame_rate_on = 0;
 char upscaler_option[64] = "off";
 char final_filter_option[16] = "lanczos";
 static char presenter_debug_option[16] = "";
@@ -431,6 +432,10 @@ static void setup_options(void)
         if (env && *env) presenter_on = IS_OPTION_TRUE(*env);
     }
     {
+        const char *env = getenv("SEVO_FPS");
+        if (env && *env) frame_rate_on = IS_OPTION_TRUE(*env);
+    }
+    {
         const char *env = getenv("SEVO_GL_PRESENTER");
         if (env && *env) gl_presenter_on = IS_OPTION_TRUE(*env);
     }
@@ -472,6 +477,8 @@ static void setup_options(void)
         copy_option_string(upscaler_option, sizeof(upscaler_option), buffer);
     if (!get_config_key(hkey, appkey, "FinalFilter", buffer, sizeof(buffer)))
         copy_option_string(final_filter_option, sizeof(final_filter_option), buffer);
+    if (!get_config_key(hkey, appkey, "FrameRate", buffer, sizeof(buffer)))
+        frame_rate_on = IS_OPTION_TRUE(buffer[0]);
     if (!get_config_key(hkey, appkey, "OpenGLPresenter", buffer, sizeof(buffer)))
         gl_presenter_on = IS_OPTION_TRUE(buffer[0]);
     if (!get_config_key(hkey, appkey, "PresenterLog", buffer, sizeof(buffer)))

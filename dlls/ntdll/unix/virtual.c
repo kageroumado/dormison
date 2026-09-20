@@ -5176,6 +5176,16 @@ static void virtual_release_address_space(void)
 #endif  /* _WIN64 */
 
 
+/* SEVO_LARGE_ADDRESS_AWARE=1 gives a 32-bit program the whole 4 GB whatever its
+   image says, as Proton's PROTON_FORCE_LARGE_ADDRESS_AWARE does: a game built
+   without the flag that runs out of the low 2 GB is the common case, one that
+   breaks on a high pointer the rare one. The app writes it per game. */
+static BOOL sevo_forces_large_address_space(void)
+{
+    const char *env = getenv( "SEVO_LARGE_ADDRESS_AWARE" );
+    return env && env[0] == '1';
+}
+
 /***********************************************************************
  *           virtual_set_large_address_space
  *
@@ -5194,7 +5204,8 @@ void virtual_set_large_address_space(void)
                 free_reserved_memory( 0, (char *)0x7ffe0000 );
 #endif
         }
-        else if (main_image_info.ImageCharacteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE)
+        else if ((main_image_info.ImageCharacteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) ||
+                 sevo_forces_large_address_space())
         {
             user_space_wow_limit = limit_4g - 1;
             /* reserve space for top-down allocations; some apps break if the entire high 2G is available */

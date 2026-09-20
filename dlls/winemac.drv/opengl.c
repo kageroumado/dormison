@@ -1640,8 +1640,9 @@ static void presented_update(struct gl_drawable *gl, struct macdrv_context *cont
     funcs->p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER,
                                        gl->base.doublebuffer ? presented->back : presented->front);
 
-    if (!presented_create_ring(presented, context->cglcontext))
-        ERR("drawable %s has no surfaces to present into\n", debugstr_opengl_drawable(&gl->base));
+    /* The surfaces are made at the first present of this size: wined3d makes
+       current on windows it never shows a frame in. */
+    presented_delete_ring(presented);
 
     presented_restore_state(&state);
 
@@ -1665,9 +1666,15 @@ static void presented_present(struct gl_drawable *gl, BOOL swap, int interval)
     struct presented_saved_state state;
     int slot;
 
-    if (!presented->fbo || !presented->ring[0]) return;
+    if (!presented->fbo) return;
 
     presented_save_state(&state);
+    if (!presented->ring[0] && !presented_create_ring(presented, CGLGetCurrentContext()))
+    {
+        ERR("drawable %s has no surfaces to present into\n", debugstr_opengl_drawable(&gl->base));
+        presented_restore_state(&state);
+        return;
+    }
     funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, swap ? presented->back_fbo : presented->front_fbo);
 
     if ((slot = sevo_presenter_gl_acquire(presented->presenter)) >= 0)

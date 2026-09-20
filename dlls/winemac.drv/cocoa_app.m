@@ -118,6 +118,179 @@ static NSString* WineLocalizedString(unsigned int stringID)
 /* Whether the View menu has the presenter's readout switched on. */
 static BOOL sevoReadoutShown;
 
+
+/* The frame-rate counter: a small capsule at the top right of the window the
+   game presents into, in a child window of it, so it sits over a Metal layer,
+   an OpenGL surface and a GDI picture alike and goes where the window goes.
+   It reads the process's own present counter twice a second. */
+@interface WineFrameRateCounter : NSObject
+{
+    NSPanel* panel;
+    NSTextField* label;
+    NSTimer* timer;
+    NSWindow* host;
+    unsigned long long lastFrames;
+    CFAbsoluteTime lastTime;
+}
+    - (void) show;
+    - (void) hide;
+@end
+
+static const CGFloat kFrameRateInset = 12;
+static const CGFloat kFrameRateHeight = 22;
+static const NSTimeInterval kFrameRateInterval = 0.5;
+
+@implementation WineFrameRateCounter
+
+    - (void) dealloc
+    {
+        [self hide];
+        [super dealloc];
+    }
+
+    - (void) show
+    {
+        if (timer) return;
+        lastFrames = sevo_stats_frame_count(NULL);
+        lastTime = CFAbsoluteTimeGetCurrent();
+        timer = [[NSTimer timerWithTimeInterval:kFrameRateInterval target:self selector:@selector(tick:)
+                                       userInfo:nil repeats:YES] retain];
+        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    }
+
+    - (void) hide
+    {
+        [timer invalidate];
+        [timer release];
+        timer = nil;
+        [self detach];
+    }
+
+    - (void) detach
+    {
+        if (!host) return;
+        [[NSNotificationCenter defaultCenter] removeObserver:self name:nil object:host];
+        [host removeChildWindow:panel];
+        [panel orderOut:nil];
+        [host release];
+        host = nil;
+    }
+
+    - (void) makePanel
+    {
+        NSVisualEffectView* backing;
+
+        panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 64, kFrameRateHeight)
+                                           styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+                                             backing:NSBackingStoreBuffered defer:YES];
+        [panel setOpaque:NO];
+        [panel setBackgroundColor:[NSColor clearColor]];
+        [panel setHasShadow:NO];
+        [panel setIgnoresMouseEvents:YES];
+        [panel setReleasedWhenClosed:NO];
+        [panel setCollectionBehavior:NSWindowCollectionBehaviorFullScreenAuxiliary | NSWindowCollectionBehaviorTransient];
+        /* Dark whatever the system is set to: white digits over a game's picture. */
+        [panel setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameVibrantDark]];
+
+        backing = [[[NSVisualEffectView alloc] initWithFrame:[[panel contentView] bounds]] autorelease];
+        [backing setMaterial:NSVisualEffectMaterialHUDWindow];
+        [backing setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
+        [backing setState:NSVisualEffectStateActive];
+        [backing setWantsLayer:YES];
+        [[backing layer] setCornerRadius:kFrameRateHeight / 2];
+        [[backing layer] setMasksToBounds:YES];
+        [backing setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+        [panel setContentView:backing];
+
+        label = [[NSTextField labelWithString:@""] retain];
+        [label setFont:[NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightSemibold]];
+        [label setTextColor:[NSColor whiteColor]];
+        [label setAlignment:NSTextAlignmentCenter];
+        [label setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin | NSViewMaxYMargin];
+        [backing addSubview:label];
+    }
+
+    /* The window the process presents into, once a present has named it;
+       the frontmost game window until then. */
+    - (NSWindow*) presentedWindow
+    {
+        unsigned long long number = 0;
+        NSWindow* window;
+
+        sevo_stats_frame_count(&number);
+        window = number ? [NSApp windowWithWindowNumber:(NSInteger)number] : nil;
+        if (![window isKindOfClass:[WineWindow class]] || ![window isVisible])
+            window = [[WineApplicationController sharedController] frontWineWindow];
+        return window;
+    }
+
+    - (void) attachTo:(NSWindow*)window
+    {
+        NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
+
+        if (window == host) return;
+        [self detach];
+        if (!window) return;
+        if (!panel) [self makePanel];
+        host = [window retain];
+        [host addChildWindow:panel ordered:NSWindowAbove];
+        [nc addObserver:self selector:@selector(hostChanged:) name:NSWindowDidResizeNotification object:host];
+        [nc addObserver:self selector:@selector(hostClosing:) name:NSWindowWillCloseNotification object:host];
+        [self place];
+    }
+
+    - (void) hostChanged:(NSNotification*)note
+    {
+        [self place];
+    }
+
+    - (void) hostClosing:(NSNotification*)note
+    {
+        [self detach];
+    }
+
+    /* Top right of the content, inside the title bar's lower edge. */
+    - (void) place
+    {
+        NSRect content, frame = [panel frame];
+
+        if (!host) return;
+        content = [host contentRectForFrameRect:[host frame]];
+        frame.origin.x = NSMaxX(content) - NSWidth(frame) - kFrameRateInset;
+        frame.origin.y = NSMaxY(content) - NSHeight(frame) - kFrameRateInset;
+        [panel setFrame:frame display:YES];
+    }
+
+    - (void) tick:(NSTimer*)unused
+    {
+        unsigned long long frames = sevo_stats_frame_count(NULL);
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        double elapsed = now - lastTime;
+        NSString* text;
+        NSRect frame;
+
+        [self attachTo:[self presentedWindow]];
+        if (!host || elapsed <= 0) return;
+
+        text = [NSString stringWithFormat:@"%.0f fps", (frames - lastFrames) / elapsed];
+        lastFrames = frames;
+        lastTime = now;
+        if ([text isEqualToString:[label stringValue]]) return;
+
+        [label setStringValue:text];
+        [label sizeToFit];
+        frame = [panel frame];
+        frame.size.width = ceil(NSWidth([label frame])) + kFrameRateHeight;
+        [panel setFrame:frame display:NO];
+        [label setFrame:NSMakeRect(0, (kFrameRateHeight - NSHeight([label frame])) / 2,
+                                   NSWidth(frame), NSHeight([label frame]))];
+        [self place];
+    }
+
+@end
+
+static WineFrameRateCounter* sevoFrameRateCounter;
+
 @implementation WineApplicationController
 
     @synthesize keyboardType, lastFlagsChanged;
@@ -700,9 +873,14 @@ static BOOL sevoReadoutShown;
         item = [view addItemWithTitle:@"Final Filter" action:NULL keyEquivalent:@""];
         [item setSubmenu:filters];
         [view addItem:[NSMenuItem separatorItem]];
+        item = [view addItemWithTitle:@"Show Frame Rate" action:@selector(sevoToggleFrameRate:) keyEquivalent:@"f"];
+        [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
+        [item setTarget:self];
         item = [view addItemWithTitle:@"Show Picture Details" action:@selector(sevoToggleReadout:) keyEquivalent:@"i"];
         [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
         [item setTarget:self];
+
+        if (frame_rate_on) [self sevoSetFrameRateShown:YES];
 
         item = [[[NSMenuItem alloc] init] autorelease];
         [item setTitle:@"View"];
@@ -718,6 +896,8 @@ static BOOL sevoReadoutShown;
             [menuItem setState:!strcasecmp(upscaler_option, [[menuItem representedObject] UTF8String]) ? NSControlStateValueOn : NSControlStateValueOff];
         else if (action == @selector(sevoChooseFilter:))
             [menuItem setState:!strcasecmp(final_filter_option, [[menuItem representedObject] UTF8String]) ? NSControlStateValueOn : NSControlStateValueOff];
+        else if (action == @selector(sevoToggleFrameRate:))
+            [menuItem setState:frame_rate_on ? NSControlStateValueOn : NSControlStateValueOff];
         else if (action == @selector(sevoToggleReadout:))
         {
             [menuItem setState:sevoReadoutShown ? NSControlStateValueOn : NSControlStateValueOff];
@@ -785,6 +965,20 @@ static BOOL sevoReadoutShown;
         snprintf(final_filter_option, sizeof(final_filter_option), "%s", [name UTF8String]);
         [self sevoStoreSetting:@"filter" value:name];
         if (presenter_on) sevo_presenter_set_options(NULL, [name UTF8String]);
+    }
+
+    - (void) sevoSetFrameRateShown:(BOOL)shown
+    {
+        frame_rate_on = shown;
+        if (shown && !sevoFrameRateCounter) sevoFrameRateCounter = [[WineFrameRateCounter alloc] init];
+        if (shown) [sevoFrameRateCounter show];
+        else [sevoFrameRateCounter hide];
+    }
+
+    - (void) sevoToggleFrameRate:(NSMenuItem*)sender
+    {
+        [self sevoSetFrameRateShown:!frame_rate_on];
+        [self sevoStoreSetting:@"fps" value:frame_rate_on ? @"on" : @"off"];
     }
 
     - (void) sevoToggleReadout:(NSMenuItem*)sender
