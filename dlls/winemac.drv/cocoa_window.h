@@ -91,6 +91,10 @@
        content view sits in it, scaled to fit whenever the real frame and the
        frame Wine believes in (wineFrame) differ in size. */
     BOOL presentationScalable;
+    /* The program calls its window resizable and then puts back the size it had: seen once,
+       the window is presented through the scaler from then on. */
+    BOOL programRefusesResize;
+    NSTimeInterval liveResizeEndTime;
     /* A borderless window covering a screen, shown in a titled window at a
        smaller size (RESIZABLE_WINDOWS_WINDOW). Placed once, at the default
        windowed frame; after that the real frame is the user's alone. */

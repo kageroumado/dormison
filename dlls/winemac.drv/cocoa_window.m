@@ -1973,7 +1973,7 @@ static NSView* wine_content_view_of(NSWindow* window)
            different frame under the new style. */
         if (!NSIsEmptyRect(wineContentRect))
             wineFrame = [self frameRectForContentRect:wineContentRect];
-        if ((windowed || features_allow_presentation_scaling(wf)) != presentationScalable)
+        if ((windowed || programRefusesResize || features_allow_presentation_scaling(wf)) != presentationScalable)
         {
             presentationScalable = !presentationScalable;
             if (!presentationScalable)
@@ -2797,6 +2797,17 @@ static NSView* wine_content_view_of(NSWindow* window)
         {
             NSRect frame, oldFrame;
 
+            if ([self programPutBackItsSize:contentRect])
+            {
+                /* From here the size is the user's and the program's frame is scaled into
+                   it; the branch below for a scaled window keeps the real size. */
+                programRefusesResize = YES;
+                presentationScalable = YES;
+                wineContentRect = contentRect;
+                presentation_log(self, "program refused the resize", self.frame,
+                                 [self frameRectForContentRect:contentRect], [wineContentView frame]);
+            }
+
             oldFrame = self.wine_fractionalFrame;
             frame = [self frameRectForContentRect:contentRect];
             if (!NSEqualRects(frame, oldFrame))
@@ -2855,6 +2866,28 @@ static NSView* wine_content_view_of(NSWindow* window)
                 }
             }
         }
+    }
+
+    /* Whether Wine is answering a resize the user is making, or has just made, with the
+       size the window had before it: a program that marks its window resizable and
+       enforces one size all the same (many visual-novel engines do). Only where the
+       fixed-size windows are asked to be resizable, and never for a window already
+       going through the scaler. */
+    - (BOOL) programPutBackItsSize:(NSRect)contentRect
+    {
+        NSSize before, asked, real;
+
+        if (presentationScalable || programRefusesResize) return NO;
+        if (resizable_windows != RESIZABLE_WINDOWS_FIXED && resizable_windows != RESIZABLE_WINDOWS_WINDOW) return NO;
+        if (![self inLiveResize] &&
+            [[NSProcessInfo processInfo] systemUptime] - liveResizeEndTime > 1.0) return NO;
+        if (NSIsEmptyRect(frameAtResizeStart)) return NO;
+
+        before = [self contentRectForFrameRect:frameAtResizeStart].size;
+        asked = contentRect.size;
+        real = [self contentRectForFrameRect:self.frame].size;
+        return fabs(asked.width - before.width) < 1 && fabs(asked.height - before.height) < 1 &&
+               (fabs(real.width - before.width) >= 2 || fabs(real.height - before.height) >= 2);
     }
 
     - (NSRect) wine_fractionalFrame
@@ -3825,6 +3858,7 @@ static NSView* wine_content_view_of(NSWindow* window)
 
     - (void) windowDidEndLiveResize:(NSNotification *)notification
     {
+        liveResizeEndTime = [[NSProcessInfo processInfo] systemUptime];
         if (!maximized)
         {
             macdrv_event* event = macdrv_create_event(WINDOW_RESIZE_ENDED, self);
