@@ -1989,6 +1989,7 @@ static NSView* wine_content_view_of(NSWindow* window)
         }
         [self adjustFeaturesForState];
         [self setHasShadow:wf->shadow];
+        [self attachFullScreenToolbar];
     }
 
     // Indicates if the window would be visible if the app were not hidden.
@@ -4023,6 +4024,23 @@ static NSView* wine_content_view_of(NSWindow* window)
     {
         enteringFullScreen = TRUE;
         nonFullscreenFrame = self.wine_fractionalFrame;
+    }
+
+    /* macOS 27 never slides the title bar in under the menu bar for an x86-64 process in
+       full screen, unless the window has a toolbar; it need not be visible. So a titled
+       window carries a hidden, empty one from the start: one attached on the way into
+       full screen ignores being hidden and leaves a title row over the program's picture,
+       and the auto-hide presentation option brings the missing title bar back.
+       (Research/wine-engine/macos27-rosetta-fullscreen-titlebar has the reproducer.) */
+    - (void) attachFullScreenToolbar
+    {
+        NSToolbar* toolbar;
+
+        if ([self toolbar] || !([self styleMask] & NSWindowStyleMaskTitled)) return;
+        toolbar = [[[NSToolbar alloc] initWithIdentifier:@"org.winehq.fullscreen"] autorelease];
+        /* Hidden once attached: hiding it first does not hold. */
+        [self setToolbar:toolbar];
+        [toolbar setVisible:NO];
     }
 
     - (void) windowWillExitFullScreen:(NSNotification*)notification
