@@ -3,6 +3,35 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r13
+
+- OpenGL games go through the presenter. wined3d's Direct3D 9, which is what most visual
+  novels that are not plain GDI draw with, ended in an OpenGL view the upscaler never saw.
+  A window's OpenGL drawable is a framebuffer object whose swap lands in an IOSurface the
+  presenter reads, so Lanczos, MetalFX, Anime4K and CuNNy apply to those games as they do
+  to a Metal one. 9-nine-:Episode 1 runs 1600x900 to 3200x1800 through Anime4K with no
+  dropped frame. Multisampled, stereo, floating-point and 10-bit drawables stay on a view;
+  `Mac Driver\OpenGLPresenter=N` puts every drawable back on one.
+- A running game has a View menu: Upscaler and Final Filter switch live and are written
+  back to the game's settings, Show Frame Rate (Option-Command-F) puts one number in a
+  capsule at the top right of the window whatever draws the picture, and Show Picture
+  Details (Option-Command-I) names the engine, the source and target size, the upscaler
+  and the filter. Games started through their own Dock bundle get the standard menus too.
+- A window that puts its old size back while it is being resized goes through the scaler
+  (9-nine and engines like it). No texture is shown before it holds a picture, which was a
+  purple second at launch. Every titled window carries a hidden toolbar, which is what
+  gives an x86-64 program a title bar in full screen on macOS 27.
+- `SEVO_LARGE_ADDRESS_AWARE=1` gives a 32-bit program the whole 4 GB whatever its image
+  says. The app has written the variable per game since r4; nothing read it.
+- The waiting paths in ntdll and msync: a waker enters the kernel only for a waiter that
+  parked, a waiter cannot leave while a waker holds its stack entry, `RtlWakeAddressAll`
+  wakes the waiters enrolled before it began, and an exclusive SRW acquire takes a free
+  lock before it counts itself a waiter. The spins built on top (`SEVO_OBJECT_SPIN`, the
+  alert spin, the retreating yield) are off unless asked for: they make synthetic hand-offs
+  up to ten times quicker and have not raised the frame rate of a game.
+- `SEVO_FORCE_UMA=1` leaves `CacheCoherentUMA` as the device answered it, and the driver
+  can report the memory the machine has.
+
 ## r11
 
 - wineserver is native arm64. The server runs no guest code, so it is the one process
