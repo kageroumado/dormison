@@ -3,6 +3,21 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r15
+
+- A program whose window has stopped taking messages is said so, as Windows says it: a close
+  button or a Quit the program has not taken within five seconds puts a sheet on the window,
+  "“<name>” is not responding", with Wait and End Game. End Game ends the process and logs
+  `sevo:exit … ended by the user while not responding`. Found with HuniePop's two-and-a-half
+  minute load, during which the close button did nothing.
+- A fault on a thread Wine did not make (the Cocoa main thread, an audio or dispatch thread)
+  ends the process with a macOS crash report, where it used to end only that thread and leave
+  a window that answered nothing. Wine's handler assumes a thread it made.
+- The per-process stats page carries a beat written once a second from the Cocoa main thread's
+  run loop, so the app can tell a blocked main thread from a game that is merely quiet or busy.
+- View › Show Picture Details stays out of windows under 320 by 240 points, so a game's message
+  boxes and dialogs are readable with it on.
+
 ## r14
 
 - A game drawn with GDI no longer hangs with the upscaler on. The view that shows a window
