@@ -113,6 +113,14 @@ make -C $W/wine-src/dlls/winemac.drv/swift
 `package-engine.sh` refuses to package when the archive is missing or newer
 than the staged `winemac.so`, which is the shape a forgotten rebuild takes.
 
+## Release names
+
+A release is `dormison-r<N>` and a beta `dormison-b<N>`, the same `N` when the beta is what
+becomes the release. `kagerou publish dormison -v b<N> -p` writes `channels.beta`;
+`-v r<N>` writes `channels.stable`. The app shows either as "Dormison r<N>" / "Dormison b<N>"
+and takes the channel Settings › Engine names (`sevo engine channel beta`). r15 was published
+to beta under the old naming; from the next release the names above apply.
+
 ## Build, stage, package
 
 Packaging needs a donor: an engine Sevoflurane has already installed (the
