@@ -604,7 +604,14 @@ void msync_init_shm(void)
 
     if (kr != KERN_SUCCESS)
     {
-        fprintf( stderr, "msync: error: mach_vm_map failed with %d: %s\n", kr, mach_error_string( kr ) );
+        /* Fatal on purpose: a client started with WINEMSYNC=1 exits when the
+         * server has no msync port (msync_init in ntdll: bootstrap_look_up
+         * fails and the client exits), so a server running without msync
+         * would strand every client; a server that exits is replaced by the
+         * next client's launch. */
+        fprintf( stderr, "msync: error: pid %ld: mach_vm_map of %llu bytes (page size %lu) failed with %d: %s\n",
+                 (long)getpid(), (unsigned long long)shm_tid_size, (unsigned long)vm_kernel_page_size,
+                 kr, mach_error_string( kr ) );
         fatal_error( "could not map tid shared memory\n" );
     }
 }

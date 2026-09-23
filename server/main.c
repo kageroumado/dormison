@@ -258,8 +258,10 @@ int main( int argc, char *argv[] )
     init_limits();
 
     sock_init();
-    msync_init_shm();
+    /* The tid map is 64 MB; it is mapped by the server that holds the lock, after
+     * open_master_socket has sent every other candidate home. */
     open_master_socket();
+    msync_init_shm();
     msync_init();
 
     if (debug_level) fprintf( stderr, "wineserver: starting (pid=%ld)\n", (long) getpid() );

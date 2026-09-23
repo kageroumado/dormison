@@ -17,6 +17,10 @@ uses the section for `r<N>` as the GitHub release body.
   `Failed to send server register wait` lines, 7.9 GB, the game at 94 % CPU. A send that
   reports the server's port gone (`MACH_SEND_INVALID_DEST`) now prints one line and ends the
   thread, the way the socket path ends it on `EPIPE`; the last thread takes the process down.
+- wineserver maps the 64 MB tid shared memory after it holds the master socket's lock.
+  Every candidate a client spawned mapped it first and only then learned that a server was
+  already alive; a replacement server logged `mach_vm_map failed with 3: (os/kern) no space
+  available`. The failure line carries the pid, the size, the page size and the kernel's text.
 
 ## r15
 
