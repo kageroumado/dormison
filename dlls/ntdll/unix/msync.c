@@ -31,6 +31,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -41,6 +43,7 @@
 #endif
 #include <mach/mach_init.h>
 #include <mach/mach_port.h>
+#include <mach/notify.h>
 #include <mach/mach_vm.h>
 #include <mach/vm_page_size.h>
 #include <mach/message.h>
@@ -736,6 +739,78 @@ void msync_close( int obj )
     }
 }
 
+/* A thread parked on one object's word (msync_wait_single) sleeps in the kernel on shared
+ * memory and never sends the server anything, so abort_if_server_gone cannot reach it:
+ * with the wineserver dead, a process whose threads all wait that way lives on with no
+ * server at all. This thread holds a dead-name notification for server_port and ends the
+ * process when the port dies. It costs one parked thread and nothing while the server
+ * lives. */
+static void *server_death_watch( void *arg )
+{
+    mach_port_t notify_port = (mach_port_t)(uintptr_t)arg;
+    struct
+    {
+        mach_dead_name_notification_t notification;
+        mach_msg_trailer_t trailer;
+    } message;
+    mach_msg_return_t mr;
+    char line[160];
+    int len;
+
+    for (;;)
+    {
+        mr = mach_msg( &message.notification.not_header, MACH_RCV_MSG, 0,
+                       sizeof(message), notify_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL );
+        if (mr == MACH_MSG_SUCCESS && message.notification.not_header.msgh_id == MACH_NOTIFY_DEAD_NAME)
+            break;
+        /* Only the kernel holds a right to this port; anything else it says carries no right. */
+        if (mr != MACH_MSG_SUCCESS && mr != MACH_RCV_TOO_LARGE && mr != MACH_RCV_INTERRUPTED)
+            return NULL;
+    }
+    /* A plain write: ERR needs the TEB of a Wine thread, which this thread has none of, and
+     * blocks forever looking for it. */
+    len = snprintf( line, sizeof(line), "%04x:err:sync:server_death_watch msync server is gone "
+                    "(the wineserver died); the process ends\n", (unsigned int)getpid() );
+    if (len > 0) write( 2, line, len < (int)sizeof(line) ? len : (int)sizeof(line) - 1 );
+    abort_process( 1 );
+}
+
+static void watch_server_death(void)
+{
+    mach_port_t notify_port, previous = MACH_PORT_NULL;
+    sigset_t all, saved;
+    pthread_attr_t attr;
+    pthread_t thread;
+    kern_return_t kr;
+
+    if (mach_port_allocate( mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &notify_port ) != KERN_SUCCESS)
+    {
+        ERR( "no port for the msync server watch\n" );
+        return;
+    }
+    /* sync = 1: a port that is already dead is notified at once. */
+    kr = mach_port_request_notification( mach_task_self(), server_port, MACH_NOTIFY_DEAD_NAME, 1,
+                                         notify_port, MACH_MSG_TYPE_MAKE_SEND_ONCE, &previous );
+    if (kr != KERN_SUCCESS)
+    {
+        ERR( "msync server watch not armed: %#x\n", kr );
+        mach_port_mod_refs( mach_task_self(), notify_port, MACH_PORT_RIGHT_RECEIVE, -1 );
+        return;
+    }
+    if (previous != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), previous );
+
+    /* The thread is not a Wine thread: it takes no signal meant for one. */
+    sigfillset( &all );
+    pthread_sigmask( SIG_BLOCK, &all, &saved );
+    pthread_attr_init( &attr );
+    pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
+    pthread_attr_setstacksize( &attr, 64 * 1024 );
+    if (pthread_create( &thread, &attr, server_death_watch, (void *)(uintptr_t)notify_port ))
+        ERR( "msync server watch thread not started\n" );
+    pthread_attr_destroy( &attr );
+    pthread_sigmask( SIG_SETMASK, &saved, NULL );
+}
+
 void msync_init(void)
 {
     struct stat st;
@@ -803,6 +878,8 @@ void msync_init(void)
         ERR("Failed to map tid shared memory");
         exit(1);
     }
+
+    watch_server_death();
 }
 
 static inline void signal_all( void *shm, unsigned int shm_idx )

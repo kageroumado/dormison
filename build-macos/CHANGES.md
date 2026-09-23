@@ -17,6 +17,13 @@ uses the section for `r<N>` as the GitHub release body.
   `Failed to send server register wait` lines, 7.9 GB, the game at 94 % CPU. A send that
   reports the server's port gone (`MACH_SEND_INVALID_DEST`) now prints one line and ends the
   thread, the way the socket path ends it on `EPIPE`; the last thread takes the process down.
+- A process whose wineserver has died ends within a second, also when every thread is parked.
+  A wait on one object sleeps on the object's shared-memory word and never sends the server
+  anything, so the dead-port check above never ran: `services.exe`, `winedevice.exe`,
+  `explorer.exe /desktop` and idle games stayed alive with no server, one of them at 5 % CPU,
+  and a harness that killed wineservers left 1 500 of them on this Mac. Each process now holds a
+  dead-name notification on the msync server's port in one parked thread and ends when it
+  fires. Gate: `bispectral/probes/server-death` (`run-idle.sh`).
 - wineserver no longer maps an object page at a stack-garbage hint. `get_shm` passed an
   uninitialized address to `mach_vm_map` with `VM_FLAGS_ANYWHERE`, which the kernel treats as
   the place to search from: usually harmless, sometimes `KERN_NO_SPACE` or
