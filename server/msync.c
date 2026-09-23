@@ -707,11 +707,20 @@ static void *get_shm( unsigned int idx )
     if (!shm_addrs[entry])
     {
         kern_return_t kr;
-        mach_vm_address_t address;
+        /* With VM_FLAGS_ANYWHERE the address passed in is the hint the kernel
+           searches upward from: stack garbage there is KERN_NO_SPACE or
+           KERN_INVALID_ARGUMENT, and a page the server then zeroes at that
+           garbage is a SIGSEGV in the server, or worse, a clobbered mapping. */
+        mach_vm_address_t address = 0;
 
         kr = mach_vm_map( mach_task_self(), (mach_vm_address_t *)&address, (mach_vm_size_t)pagesize, 0, VM_FLAGS_ANYWHERE,
                           MACH_PORT_NULL, 0, FALSE, VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_SHARE );
-        MACH_CHECK_ERROR( kr, "mach_vm_map" );
+        if (kr != KERN_SUCCESS)
+        {
+            fprintf( stderr, "msync: error: pid %ld: mach_vm_map of object page %d (%lu bytes) failed with %d: %s\n",
+                     (long)getpid(), entry, (unsigned long)pagesize, kr, mach_error_string( kr ) );
+            fatal_error( "could not map object shared memory\n" );
+        }
         memset( (void *)address, 0, pagesize );
 
         if (debug_level)

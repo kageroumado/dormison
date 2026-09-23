@@ -17,10 +17,15 @@ uses the section for `r<N>` as the GitHub release body.
   `Failed to send server register wait` lines, 7.9 GB, the game at 94 % CPU. A send that
   reports the server's port gone (`MACH_SEND_INVALID_DEST`) now prints one line and ends the
   thread, the way the socket path ends it on `EPIPE`; the last thread takes the process down.
-- wineserver maps the 64 MB tid shared memory after it holds the master socket's lock.
-  Every candidate a client spawned mapped it first and only then learned that a server was
-  already alive; a replacement server logged `mach_vm_map failed with 3: (os/kern) no space
-  available`. The failure line carries the pid, the size, the page size and the kernel's text.
+- wineserver no longer maps an object page at a stack-garbage hint. `get_shm` passed an
+  uninitialized address to `mach_vm_map` with `VM_FLAGS_ANYWHERE`, which the kernel treats as
+  the place to search from: usually harmless, sometimes `KERN_NO_SPACE` or
+  `KERN_INVALID_ARGUMENT`, after which the server zeroed a page at that garbage and died with
+  `wineserver crashed` — a playtest's `msync: error: mach_vm_map failed with 3: (os/kern) no space
+  available` under Subnautica 2, twice, and every client's flood after it. The hint is zero,
+  and a map that still fails ends the server with a line naming the pid, the page and the
+  kernel's text instead of touching the address. The 64 MB tid map is made after the master
+  socket's lock, so a candidate server that finds one alive exits without mapping it.
 - The run record's `renderer=` names wined3d only when it drew. Steam's overlay loads
   `d3d9.dll` into every game to hook it, which brings Wine's wined3d and opengl32 along, so a
   D3DMetal D3D12 game read `renderer=wined3d-gl`. wined3d is the answer when the bottle names
