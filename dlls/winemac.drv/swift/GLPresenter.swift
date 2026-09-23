@@ -163,7 +163,10 @@ final class GLViewPresenter: ViewPresenter {
         slot.acquired = false
         last = slot
         lock.unlock()
-        if onscreen.displaySyncEnabled != synced { onscreen.displaySyncEnabled = synced }
+        // The main thread attaches the view after the drawable exists: a swap before that
+        // has no layer to go to, and the refresh after the attach shows the slot kept above.
+        guard let layer = madeOnscreen else { return }
+        if layer.displaySyncEnabled != synced { layer.displaySyncEnabled = synced }
         encode(slot)
     }
 
@@ -191,7 +194,7 @@ final class GLViewPresenter: ViewPresenter {
     private func encode(_ slot: Slot) {
         encoding.lock()
         defer { encoding.unlock() }
-        guard onscreen.drawableSize.width >= 1, onscreen.drawableSize.height >= 1,
+        guard let layer = madeOnscreen, layer.drawableSize.width >= 1, layer.drawableSize.height >= 1,
               let commandBuffer = queue.makeCommandBuffer()
         else { return }
         lock.lock()

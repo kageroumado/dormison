@@ -34,24 +34,75 @@
 #include "sevo_provenance.h"
 #include "sevo_stats.h"
 #import <Metal/Metal.h>
+#include <os/lock.h>
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
 
-@implementation WineMetalLayer
+/* The runtime's weak references, which ARC code reaches through __weak; this file is not
+   ARC. NSView supports them. */
+extern id objc_loadWeakRetained(id *location);
+extern id objc_storeWeak(id *location, id obj);
 
-    @synthesize presenter, wineView;
+@implementation WineMetalLayer
+{
+    os_unfair_lock stateLock;
+    void* _presenter;
+    id _wineView;
+}
+
+    - (void) dealloc
+    {
+        objc_storeWeak(&_wineView, nil);
+        [super dealloc];
+    }
+
+    - (void*) presenter
+    {
+        void* value;
+
+        os_unfair_lock_lock(&stateLock);
+        value = _presenter;
+        os_unfair_lock_unlock(&stateLock);
+        return value;
+    }
+
+    - (void) setPresenter:(void*)value
+    {
+        os_unfair_lock_lock(&stateLock);
+        _presenter = value;
+        os_unfair_lock_unlock(&stateLock);
+    }
+
+    - (NSView*) wineView
+    {
+        return [objc_loadWeakRetained(&_wineView) autorelease];
+    }
+
+    - (void) setWineView:(NSView*)view
+    {
+        objc_storeWeak(&_wineView, view);
+    }
 
     /* D3DMetal draws into this layer and never tells the driver, so the only
      * moment winemac can learn a frame is ready is when a drawable is handed
      * out. Extending nextDrawable posts the event that makes
-     * client_surface_present() run for the matching client_surface. */
+     * client_surface_present() run for the matching client_surface.
+     *
+     * It runs on the renderer's thread while the main thread can take the view and its
+     * presenter away: the view comes through a weak reference and the presenter with a
+     * reference of this call's own, taken under the lock the view's dealloc clears it
+     * under. */
     - (id<CAMetalDrawable>) nextDrawable
     {
+        NSView* owner = [objc_loadWeakRetained(&_wineView) autorelease];
+        void* presenter;
+        id<CAMetalDrawable> drawable;
+
         /* CAMetalLayer's delegate is the WineMetalView holding it; that view's
          * superview is the client_surface's WineContentView, which carries the
          * client_surface pointer. */
-        NSView* owner = self.wineView ? self.wineView : (NSView*)self.delegate;
+        if (!owner) owner = (NSView*)self.delegate;
         if ([owner isKindOfClass:NSClassFromString(@"WineMetalView")])
         {
             NSView* view = owner;
@@ -76,10 +127,19 @@
 
         sevo_stats_note_drawable();
 
+        os_unfair_lock_lock(&stateLock);
+        presenter = _presenter;
+        if (presenter) sevo_presenter_retain(presenter);
+        os_unfair_lock_unlock(&stateLock);
+
         /* With the presenter the drawable is one of its textures: this
            layer is off screen, so its own drawables would never be shown. */
-        if (self.presenter)
-            return (id<CAMetalDrawable>)sevo_presenter_next_drawable(self.presenter);
+        if (presenter)
+        {
+            drawable = (id<CAMetalDrawable>)sevo_presenter_next_drawable(presenter);
+            sevo_presenter_release(presenter);
+            return drawable;
+        }
 
         return [super nextDrawable];
     }

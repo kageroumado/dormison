@@ -208,6 +208,16 @@ public func sevoPresenterNextDrawable(_ handle: UnsafeMutableRawPointer) -> Unsa
     return Unmanaged.passRetained(drawable).autorelease().toOpaque()
 }
 
+@_cdecl("sevo_presenter_retain")
+public func sevoPresenterRetain(_ handle: UnsafeMutableRawPointer) {
+    _ = Unmanaged<ViewPresenter>.fromOpaque(handle).retain()
+}
+
+@_cdecl("sevo_presenter_release")
+public func sevoPresenterRelease(_ handle: UnsafeMutableRawPointer) {
+    Unmanaged<ViewPresenter>.fromOpaque(handle).release()
+}
+
 @_cdecl("sevo_presenter_detach")
 public func sevoPresenterDetach(_ handle: UnsafeMutableRawPointer) {
     let presenter = Unmanaged<ViewPresenter>.fromOpaque(handle)
@@ -282,6 +292,14 @@ final class Presenter: @unchecked Sendable {
         DispatchQueue.main.async { live.forEach { $0.optionsChanged() } }
     }
 
+    /// The options and their generation as one reading, for a thread other than the one
+    /// that sets them: `config` holds strings, which a read racing a write can tear.
+    var optionsSnapshot: (generation: Int, config: PresenterConfig) {
+        optionsLock.lock()
+        defer { optionsLock.unlock() }
+        return (optionsGeneration, config)
+    }
+
     func setReadout(_ shown: Bool) {
         optionsLock.lock()
         showsReadout = shown
@@ -352,7 +370,7 @@ final class Presenter: @unchecked Sendable {
 
     /// The scaler the configuration asks for, built fresh for one view.
     /// A choice this engine cannot honor becomes plain resampling, said once.
-    func makeScaler() -> Scaler? {
+    func makeScaler(_ config: PresenterConfig) -> Scaler? {
         guard let device else { return nil }
         switch config.upscalerName {
         case "off", "lanczos", "passthrough":
@@ -485,7 +503,9 @@ class ViewPresenter: NSObject {
 
     private let pixelFormat: MTLPixelFormat
     private let contentsScale: CGFloat
+    /// Set once, on the main thread, and read from the render thread: under ``onscreenLock``.
     private var onscreenLayer: CAMetalLayer?
+    private let onscreenLock = NSLock()
 
     /// The final pass's Lanczos intermediates, one per on-screen drawable
     /// the layer can have in flight, indexed by the acquisition that took
@@ -505,7 +525,7 @@ class ViewPresenter: NSObject {
     /// another thread: such a `CAMetalLayer` joins the layer tree and draws
     /// its background, but nothing presented into it reaches the screen.
     var onscreen: CAMetalLayer {
-        if let onscreenLayer { return onscreenLayer }
+        if let made = madeOnscreen { return made }
         dispatchPrecondition(condition: .onQueue(.main))
         let layer = CAMetalLayer()
         layer.device = device
@@ -519,8 +539,18 @@ class ViewPresenter: NSObject {
         layer.pixelFormat = pixelFormat
         layer.contentsScale = contentsScale
         configure(layer)
+        onscreenLock.lock()
         onscreenLayer = layer
+        onscreenLock.unlock()
         return layer
+    }
+
+    /// The view's layer once the main thread has made it, and nil before, from any thread.
+    /// A path that can present before the view is attached asks this instead of ``onscreen``.
+    var madeOnscreen: CAMetalLayer? {
+        onscreenLock.lock()
+        defer { onscreenLock.unlock() }
+        return onscreenLayer
     }
 
     /// The upscaler or the filter changed: a subclass that can present its last
@@ -542,9 +572,10 @@ class ViewPresenter: NSObject {
         guard let device = shared.device, let finalPass = shared.finalPass else { return nil }
         self.device = device
         self.finalPass = finalPass
-        self.filter = shared.config.filter
-        self.scaler = shared.makeScaler()
-        self.builtFrom = shared.optionsGeneration
+        let options = shared.optionsSnapshot
+        self.filter = options.config.filter
+        self.scaler = shared.makeScaler(options.config)
+        self.builtFrom = options.generation
         self.pixelFormat = pixelFormat
         self.contentsScale = contentsScale
         super.init()
@@ -631,10 +662,11 @@ class ViewPresenter: NSObject {
     /// presenting thread, which is the only one that reads the chain.
     private func adoptOptions() {
         let shared = Presenter.shared
-        guard builtFrom != shared.optionsGeneration else { return }
-        builtFrom = shared.optionsGeneration
-        filter = shared.config.filter
-        scaler = shared.makeScaler()
+        let options = shared.optionsSnapshot
+        guard builtFrom != options.generation else { return }
+        builtFrom = options.generation
+        filter = options.config.filter
+        scaler = shared.makeScaler(options.config)
     }
 
     /// Counts the frame for the readout and remembers what it was scaled from and to.
@@ -656,7 +688,11 @@ class ViewPresenter: NSObject {
             readout = nil
             return
         }
-        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.updateReadout() }
+        // A timer outlives nothing: once its presenter is gone it ends itself.
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] timer in
+            guard let self else { return timer.invalidate() }
+            updateReadout()
+        }
         RunLoop.main.add(timer, forMode: .common)
         readoutTimer = timer
         updateReadout()
@@ -676,7 +712,7 @@ class ViewPresenter: NSObject {
             return
         }
         readout?.isHidden = false
-        let config = Presenter.shared.config
+        let config = Presenter.shared.optionsSnapshot.config
         let chain = scaler == nil && !["off", "lanczos", "passthrough"].contains(config.upscalerName)
             ? "\(config.upscalerName) (unavailable)" : config.upscalerName
         let engine = ProcessInfo.processInfo.environment["SEVO_ENGINE_NAME"] ?? "dormison"
@@ -686,7 +722,7 @@ class ViewPresenter: NSObject {
     }
 
     private func showReadout(_ text: String) {
-        guard Presenter.shared.showsReadout, let host = onscreenLayer else { return }
+        guard Presenter.shared.showsReadout, let host = madeOnscreen else { return }
         let layer: CATextLayer
         if let readout {
             layer = readout

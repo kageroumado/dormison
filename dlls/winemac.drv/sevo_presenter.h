@@ -84,6 +84,10 @@ extern void *sevo_presenter_next_drawable(void *presenter);
 /* Lets the handle go. A surface's presenter stops its display link here,
    on the calling thread, before the handle is released. */
 extern void sevo_presenter_detach(void *presenter);
+/* One more reference to the handle and its release: for a thread that uses a handle another
+   thread may detach meanwhile. */
+extern void sevo_presenter_retain(void *presenter);
+extern void sevo_presenter_release(void *presenter);
 
 /* The View menu's side. The upscaler and the final filter change for every presented view
    from its next frame; NULL leaves one as it is. */

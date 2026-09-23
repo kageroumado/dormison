@@ -25,13 +25,14 @@
 @interface WineMetalLayer : CAMetalLayer
 
 /* The presenter this layer's frames go to (sevo_presenter_attach), or NULL
-   when the layer is on screen itself. Set by the view that made the layer. */
+   when the layer is on screen itself. Set by the view that made the layer on the main
+   thread, read by the renderer's thread in nextDrawable: both under the layer's lock. */
 @property (nonatomic, assign) void* presenter;
 /* The Metal view this layer draws for. A layer that is the view's own
    backing layer has the view as its delegate; the presenter's renderer
    layer is not in the layer tree and has no delegate, so the view is named
    here for the presented event that unhides the client surface. */
-@property (nonatomic, assign) NSView* wineView;
+@property (nonatomic, assign) NSView* wineView;  /* held weakly */
 
 @end
 
