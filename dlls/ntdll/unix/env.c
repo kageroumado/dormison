@@ -827,7 +827,20 @@ static void init_locale(void)
  * KEY= with nothing after the sign removes the variable. Blank lines and
  * lines starting with # are skipped.
  */
-static void apply_env_file( const char *path )
+/* Keys that must be the same for every process of a wineserver: a process that disagrees
+   with the running server about its sync mode exits at start, and one that names another
+   prefix or server is not part of this bottle. Only the bottle's own file may set them. */
+static BOOL is_server_wide_key( const char *key )
+{
+    static const char * const keys[] = { "WINEMSYNC", "WINEESYNC", "WINEFSYNC", "WINEPREFIX",
+                                          "WINESERVER", "WINEARCH" };
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(keys); i++) if (!strcmp( key, keys[i] )) return TRUE;
+    return FALSE;
+}
+
+static void apply_env_file( const char *path, BOOL bottle_wide )
 {
     FILE *file;
     char line[4096];
@@ -835,14 +848,25 @@ static void apply_env_file( const char *path )
     if (!(file = fopen( path, "r" ))) return;
     while (fgets( line, sizeof(line), file ))
     {
-        char *p = line, *eq, *end;
+        char *p = line, *eq, *end, *key_end;
 
         while (*p == ' ' || *p == '\t') p++;
         if (!*p || *p == '#' || *p == '\n') continue;
         end = p + strlen( p );
         while (end > p && (end[-1] == '\n' || end[-1] == '\r')) *--end = 0;
         if (!(eq = strchr( p, '=' )) || eq == p) continue;
-        *eq++ = 0;
+        /* `KEY = value` names KEY, not "KEY ". */
+        for (key_end = eq; key_end > p && (key_end[-1] == ' ' || key_end[-1] == '\t'); key_end--) ;
+        if (key_end == p) continue;
+        *key_end = 0;
+        eq++;
+        while (*eq == ' ' || *eq == '\t') eq++;
+        if (!bottle_wide && is_server_wide_key( p ))
+        {
+            /* stderr directly: the debug channels are read after these files. */
+            fprintf( stderr, "sevo:env %s: %s is set for the whole bottle only; ignored\n", path, p );
+            continue;
+        }
         if (*eq) setenv( p, eq, 1 );
         else unsetenv( p );
     }
@@ -934,17 +958,17 @@ void load_sevo_env(void)
     if (!sevo_env_files_enabled()) return;
 
     asprintf( &path, "%s/.sevo/bottle.env", config_dir );
-    apply_env_file( path );
+    apply_env_file( path, TRUE );
     free( path );
 
     asprintf( &path, "%s/.sevo/debug.env", config_dir );
-    apply_env_file( path );
+    apply_env_file( path, FALSE );
     free( path );
 
     if (main_argc < 2) return;
     if ((path = sevo_program_file( main_argv[1] )))
     {
-        apply_env_file( path );
+        apply_env_file( path, FALSE );
         free( path );
     }
 }
