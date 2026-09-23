@@ -153,6 +153,10 @@ extern char final_filter_option[16];
    frame: `Mac Driver\FrameRate=Y` or SEVO_FPS=1. View > Show Frame Rate
    switches it while the game runs. */
 extern int frame_rate_on;
+/* The counter grows a frame-time graph of the last few seconds and the 1 % low under the
+   number: `Mac Driver\FrameRateGraph=Y` or SEVO_FPS_GRAPH=1, and View > Show Frame Time
+   Graph. On, it implies the counter. */
+extern int frame_graph_on;
 /* Traces the presenter's frames and the Metal view lifecycle to stderr:
    `Mac Driver\PresenterLog=Y` or SEVO_PRESENTER_LOG=1. */
 extern int presenter_log_on;

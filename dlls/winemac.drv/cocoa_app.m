@@ -122,29 +122,136 @@ static BOOL sevoReadoutShown;
 /* The frame-rate counter: a small capsule at the top right of the window the
    game presents into, in a child window of it, so it sits over a Metal layer,
    an OpenGL surface and a GDI picture alike and goes where the window goes.
-   It reads the process's own present counter twice a second. */
+   It reads the process's own present counter twice a second. With the graph
+   on it becomes a card: the number, the 1 % low and the slowest frame of the
+   last ten seconds, and every frame of the last five seconds drawn at its
+   frame time, read from the stats page's ring ten times a second. */
+@interface WineFrameTimeGraph : NSView
+{
+    /* Frame times in ms and when each frame ended, in seconds before now. */
+    float times[SEVO_STATS_RING_CAPACITY];
+    float ages[SEVO_STATS_RING_CAPACITY];
+    unsigned int count;
+    float top;
+}
+    - (void) setTimes:(const float*)frameTimes ages:(const float*)frameAges count:(unsigned int)n top:(float)ceiling;
+@end
+
 @interface WineFrameRateCounter : NSObject
 {
     NSPanel* panel;
     NSTextField* label;
+    NSTextField* detail;
+    WineFrameTimeGraph* graph;
     NSTimer* timer;
     NSWindow* host;
     unsigned long long lastFrames;
     CFAbsoluteTime lastTime;
+    BOOL graphShown;
+    unsigned int ticks;
 }
     - (void) show;
     - (void) hide;
+    - (void) setGraphShown:(BOOL)shown;
 @end
 
 static const CGFloat kFrameRateInset = 12;
 static const CGFloat kFrameRateHeight = 22;
 static const NSTimeInterval kFrameRateInterval = 0.5;
+/* The graph's card: the number's row, the detail row, the plot. */
+static const CGFloat kFrameGraphWidth = 220;
+static const CGFloat kFrameGraphPlotHeight = 48;
+static const CGFloat kFrameGraphHeight = 22 + 16 + 48 + 10;
+static const NSTimeInterval kFrameGraphInterval = 0.1;
+/* Seconds of frames the plot spans, and the window the 1 % low is taken over. */
+static const float kFrameGraphSpan = 5;
+static const float kFrameStatsSpan = 10;
+/* The plot's ceiling is at least a 30 fps frame, so a steady 60 sits a little above the
+   middle and a hitch reaches for the top. */
+static const float kFrameGraphMinimumTop = 1000.0f / 30;
+
+static int compare_floats(const void* a, const void* b)
+{
+    float x = *(const float*)a, y = *(const float*)b;
+    return (x > y) - (x < y);
+}
+
+@implementation WineFrameTimeGraph
+
+    - (BOOL) isOpaque { return NO; }
+
+    - (void) setTimes:(const float*)frameTimes ages:(const float*)frameAges count:(unsigned int)n top:(float)ceiling
+    {
+        count = MIN(n, (unsigned int)SEVO_STATS_RING_CAPACITY);
+        memcpy(times, frameTimes, count * sizeof(float));
+        memcpy(ages, frameAges, count * sizeof(float));
+        top = ceiling;
+        [self setNeedsDisplay:YES];
+    }
+
+    - (void) drawRect:(NSRect)dirty
+    {
+        NSRect bounds = [self bounds];
+        CGFloat width = NSWidth(bounds), height = NSHeight(bounds);
+        NSBezierPath *area, *line;
+        float guides[] = { 1000.0f / 60, 1000.0f / 30 };
+        unsigned int i;
+
+        if (top <= 0) return;
+
+        /* Guides at 60 and 30 fps, where they fall inside the plot. */
+        [[NSColor colorWithWhite:1 alpha:0.18] setFill];
+        for (i = 0; i < sizeof(guides) / sizeof(guides[0]); i++)
+        {
+            CGFloat y = floor(guides[i] / top * height);
+            if (y < height) NSRectFill(NSMakeRect(0, y, width, 1));
+        }
+
+        /* Each frame is a step as wide as it lasted and as tall as its frame time,
+           the newest at the right edge: a line along the steps over a faint fill. */
+        area = [NSBezierPath bezierPath];
+        line = [NSBezierPath bezierPath];
+        for (i = count; i-- > 0;)
+        {
+            CGFloat right = width - ages[i] / kFrameGraphSpan * width;
+            CGFloat left = width - (ages[i] + times[i] / 1000) / kFrameGraphSpan * width;
+            CGFloat y = MIN(height, times[i] / top * height);
+
+            if (right < 0) break;
+            if ([line isEmpty])
+            {
+                [area moveToPoint:NSMakePoint(right, 0)];
+                [line moveToPoint:NSMakePoint(right, y)];
+            }
+            else
+                [line lineToPoint:NSMakePoint(right, y)];
+            [area lineToPoint:NSMakePoint(right, y)];
+            [line lineToPoint:NSMakePoint(MAX(0, left), y)];
+            [area lineToPoint:NSMakePoint(MAX(0, left), y)];
+            if (left <= 0) break;
+        }
+        if ([line isEmpty]) return;
+        [area lineToPoint:NSMakePoint([area currentPoint].x, 0)];
+        [area closePath];
+        [[NSColor colorWithWhite:1 alpha:0.14] setFill];
+        [area fill];
+        [[NSColor colorWithWhite:1 alpha:0.92] setStroke];
+        [line setLineWidth:1.5];
+        [line setLineJoinStyle:NSLineJoinStyleRound];
+        [line stroke];
+    }
+
+@end
 
 @implementation WineFrameRateCounter
 
     - (void) dealloc
     {
         [self hide];
+        [label release];
+        [detail release];
+        [graph release];
+        [panel release];
         [super dealloc];
     }
 
@@ -153,7 +260,13 @@ static const NSTimeInterval kFrameRateInterval = 0.5;
         if (timer) return;
         lastFrames = sevo_stats_frame_count(NULL);
         lastTime = CFAbsoluteTimeGetCurrent();
-        timer = [[NSTimer timerWithTimeInterval:kFrameRateInterval target:self selector:@selector(tick:)
+        [self startTimer];
+    }
+
+    - (void) startTimer
+    {
+        timer = [[NSTimer timerWithTimeInterval:graphShown ? kFrameGraphInterval : kFrameRateInterval
+                                         target:self selector:@selector(tick:)
                                        userInfo:nil repeats:YES] retain];
         [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
     }
@@ -166,6 +279,19 @@ static const NSTimeInterval kFrameRateInterval = 0.5;
         [self detach];
     }
 
+    - (void) setGraphShown:(BOOL)shown
+    {
+        if (graphShown == shown) return;
+        graphShown = shown;
+        if (panel) [self layoutPanel];
+        if (timer)
+        {
+            [timer invalidate];
+            [timer release];
+            [self startTimer];
+        }
+    }
+
     - (void) detach
     {
         if (!host) return;
@@ -174,6 +300,14 @@ static const NSTimeInterval kFrameRateInterval = 0.5;
         [panel orderOut:nil];
         [host release];
         host = nil;
+    }
+
+    - (NSTextField*) makeLabelOfSize:(CGFloat)size weight:(NSFontWeight)weight
+    {
+        NSTextField* field = [[NSTextField labelWithString:@""] retain];
+        [field setFont:[NSFont monospacedDigitSystemFontOfSize:size weight:weight]];
+        [field setTextColor:[NSColor whiteColor]];
+        return field;
     }
 
     - (void) makePanel
@@ -197,17 +331,50 @@ static const NSTimeInterval kFrameRateInterval = 0.5;
         [backing setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
         [backing setState:NSVisualEffectStateActive];
         [backing setWantsLayer:YES];
-        [[backing layer] setCornerRadius:kFrameRateHeight / 2];
         [[backing layer] setMasksToBounds:YES];
         [backing setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
         [panel setContentView:backing];
 
-        label = [[NSTextField labelWithString:@""] retain];
-        [label setFont:[NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightSemibold]];
-        [label setTextColor:[NSColor whiteColor]];
-        [label setAlignment:NSTextAlignmentCenter];
-        [label setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin | NSViewMaxYMargin];
+        label = [self makeLabelOfSize:12 weight:NSFontWeightSemibold];
+        detail = [self makeLabelOfSize:10 weight:NSFontWeightRegular];
+        graph = [[WineFrameTimeGraph alloc] initWithFrame:NSZeroRect];
         [backing addSubview:label];
+        [backing addSubview:detail];
+        [backing addSubview:graph];
+        [self layoutPanel];
+    }
+
+    /* The capsule fits its number; the card is fixed, the number and detail left-aligned
+       over the plot. */
+    - (void) layoutPanel
+    {
+        NSView* backing = [panel contentView];
+        NSRect frame = [panel frame];
+        CGFloat inset = 10;
+
+        [label sizeToFit];
+        if (graphShown)
+        {
+            frame.size = NSMakeSize(kFrameGraphWidth, kFrameGraphHeight);
+            [[backing layer] setCornerRadius:12];
+            [label setAlignment:NSTextAlignmentLeft];
+            [label setFrame:NSMakeRect(inset, kFrameGraphHeight - 6 - 16, kFrameGraphWidth - 2 * inset, 16)];
+            [detail sizeToFit];
+            [detail setFrame:NSMakeRect(inset, kFrameGraphHeight - 6 - 16 - 14, kFrameGraphWidth - 2 * inset, 14)];
+            [graph setFrame:NSMakeRect(inset, 6, kFrameGraphWidth - 2 * inset, kFrameGraphPlotHeight)];
+        }
+        else
+        {
+            frame.size = NSMakeSize(ceil(NSWidth([label frame])) + kFrameRateHeight, kFrameRateHeight);
+            [[backing layer] setCornerRadius:kFrameRateHeight / 2];
+            [label setAlignment:NSTextAlignmentCenter];
+            [label setFrame:NSMakeRect(0, (kFrameRateHeight - NSHeight([label frame])) / 2,
+                                       frame.size.width, NSHeight([label frame]))];
+        }
+        [detail setHidden:!graphShown];
+        [graph setHidden:!graphShown];
+        [panel setFrame:frame display:NO];
+        [self place];
     }
 
     /* The window the process presents into, once a present has named it;
@@ -261,30 +428,89 @@ static const NSTimeInterval kFrameRateInterval = 0.5;
         [panel setFrame:frame display:YES];
     }
 
-    - (void) tick:(NSTimer*)unused
+    /* The rate since the last reading, from the counter the stats page keeps. A count that
+       went backwards switched source (presents to D3DMetal's drawables) and starts over. */
+    - (NSString*) rateText
     {
         unsigned long long frames = sevo_stats_frame_count(NULL);
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         double elapsed = now - lastTime;
-        NSString* text;
-        NSRect frame;
+        NSString* text = nil;
 
-        [self attachTo:[self presentedWindow]];
-        if (!host || elapsed <= 0) return;
-
-        text = [NSString stringWithFormat:@"%.0f fps", (frames - lastFrames) / elapsed];
+        if (elapsed > 0 && frames >= lastFrames)
+            text = [NSString stringWithFormat:@"%.0f fps", (frames - lastFrames) / elapsed];
         lastFrames = frames;
         lastTime = now;
-        if ([text isEqualToString:[label stringValue]]) return;
+        return text;
+    }
 
+    /* Reads the ring: fills the plot and writes the detail row. */
+    - (void) updateGraph
+    {
+        static unsigned int stamps[SEVO_STATS_RING_CAPACITY];
+        static float times[SEVO_STATS_RING_CAPACITY], ages[SEVO_STATS_RING_CAPACITY];
+        static float recent[SEVO_STATS_RING_CAPACITY];
+        unsigned int n = sevo_stats_recent_frames(stamps, SEVO_STATS_RING_CAPACITY), frames = 0, kept = 0, i;
+        float top = kFrameGraphMinimumTop, slowest = 0, sum = 0;
+        unsigned int lows;
+        NSString* text;
+
+        if (n < 2)
+        {
+            [graph setTimes:times ages:ages count:0 top:top];
+            [detail setStringValue:@"no frames yet"];
+            return;
+        }
+        /* Ages count back from the newest frame rather than the clock, which keeps the plot
+           still while the game is paused rather than scrolling it empty. */
+        for (i = 1; i < n; i++)
+        {
+            float frame = (uint32_t)(stamps[i] - stamps[i - 1]) / 1000.0f;
+            float age = (uint32_t)(stamps[n - 1] - stamps[i]) / 1e6f;
+
+            if (age > kFrameStatsSpan) continue;
+            recent[kept++] = frame;
+            if (age <= kFrameGraphSpan)
+            {
+                times[frames] = frame;
+                ages[frames] = age;
+                frames++;
+                if (frame > top) top = frame;
+            }
+        }
+        [graph setTimes:times ages:ages count:frames top:MIN(top * 1.1f, 250)];
+
+        if (!kept)
+        {
+            [detail setStringValue:@""];
+            return;
+        }
+        /* The 1 % low is the rate of the slowest one per cent of frames, averaged. */
+        qsort(recent, kept, sizeof(float), compare_floats);
+        slowest = recent[kept - 1];
+        lows = MAX(1u, kept / 100);
+        for (i = kept - lows; i < kept; i++) sum += recent[i];
+        text = [NSString stringWithFormat:@"1%% low %.0f · slowest %.1f ms", 1000 * lows / sum, slowest];
+        [detail setStringValue:text];
+    }
+
+    - (void) tick:(NSTimer*)unused
+    {
+        NSString* text = nil;
+        CGFloat before;
+
+        [self attachTo:[self presentedWindow]];
+        if (!host) return;
+
+        /* The number keeps its half-second cadence when the graph runs faster. */
+        if (!graphShown || ++ticks % 5 == 0) text = [self rateText];
+        if (graphShown) [self updateGraph];
+        if (!text || [text isEqualToString:[label stringValue]]) return;
+
+        before = NSWidth([label frame]);
         [label setStringValue:text];
-        [label sizeToFit];
-        frame = [panel frame];
-        frame.size.width = ceil(NSWidth([label frame])) + kFrameRateHeight;
-        [panel setFrame:frame display:NO];
-        [label setFrame:NSMakeRect(0, (kFrameRateHeight - NSHeight([label frame])) / 2,
-                                   NSWidth(frame), NSHeight([label frame]))];
-        [self place];
+        if (!graphShown) [self layoutPanel];
+        else if (before == 0) [self place];
     }
 
 @end
@@ -880,6 +1106,9 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         item = [view addItemWithTitle:@"Show Frame Rate" action:@selector(sevoToggleFrameRate:) keyEquivalent:@"f"];
         [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
         [item setTarget:self];
+        item = [view addItemWithTitle:@"Show Frame Time Graph" action:@selector(sevoToggleFrameGraph:) keyEquivalent:@"g"];
+        [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
+        [item setTarget:self];
         item = [view addItemWithTitle:@"Show Picture Details" action:@selector(sevoToggleReadout:) keyEquivalent:@"i"];
         [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
         [item setTarget:self];
@@ -902,6 +1131,8 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
             [menuItem setState:!strcasecmp(final_filter_option, [[menuItem representedObject] UTF8String]) ? NSControlStateValueOn : NSControlStateValueOff];
         else if (action == @selector(sevoToggleFrameRate:))
             [menuItem setState:frame_rate_on ? NSControlStateValueOn : NSControlStateValueOff];
+        else if (action == @selector(sevoToggleFrameGraph:))
+            [menuItem setState:frame_rate_on && frame_graph_on ? NSControlStateValueOn : NSControlStateValueOff];
         else if (action == @selector(sevoToggleReadout:))
         {
             [menuItem setState:sevoReadoutShown ? NSControlStateValueOn : NSControlStateValueOff];
@@ -975,6 +1206,7 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
     {
         frame_rate_on = shown;
         if (shown && !sevoFrameRateCounter) sevoFrameRateCounter = [[WineFrameRateCounter alloc] init];
+        [sevoFrameRateCounter setGraphShown:frame_graph_on];
         if (shown) [sevoFrameRateCounter show];
         else [sevoFrameRateCounter hide];
     }
@@ -983,6 +1215,23 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
     {
         [self sevoSetFrameRateShown:!frame_rate_on];
         [self sevoStoreSetting:@"fps" value:frame_rate_on ? @"on" : @"off"];
+    }
+
+    /* The graph comes with the counter: turning it on shows both, turning it off leaves the
+       number. */
+    - (void) sevoToggleFrameGraph:(NSMenuItem*)sender
+    {
+        BOOL on = !(frame_rate_on && frame_graph_on);
+
+        frame_graph_on = on;
+        if (on && !frame_rate_on)
+        {
+            [self sevoSetFrameRateShown:YES];
+            [self sevoStoreSetting:@"fps" value:@"on"];
+        }
+        else
+            [sevoFrameRateCounter setGraphShown:on];
+        [self sevoStoreSetting:@"fps-graph" value:on ? @"on" : @"off"];
     }
 
     - (void) sevoToggleReadout:(NSMenuItem*)sender

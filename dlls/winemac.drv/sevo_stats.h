@@ -28,6 +28,8 @@
 #define SEVO_STATS_MAGIC     0x5345564f53545331ULL
 #define SEVO_STATS_VERSION   1
 #define SEVO_STATS_PAGE_SIZE 4096
+/* Frame timestamps the page holds: what is left of the page after the fields before it. */
+#define SEVO_STATS_RING_CAPACITY 994
 
 /* Which present path the frame counter belongs to. Both fire once per frame,
    so either gives the same rate; the presenter wins because it owns the
@@ -74,6 +76,17 @@ struct sevo_stats_page
        window then answers nothing; this is the one field that stops. Zero on
        a page from an engine that does not write it. */
     uint64_t main_beat_ns;
+    /* When each of the newest frames was counted, in microseconds since start_ns, wrapping
+       at 2^32 (71 minutes; the difference of two neighbors is still exact). The frames are
+       the ones `frames`/`drawables` count for the rate: the presenter's when it presents,
+       otherwise D3DMetal's drawables when it takes any, otherwise the driver's presents.
+       Frame n is in ring[n % ring_capacity]; ring_head is the number written so far, and
+       the newest slot may still be being written, so a reader stops one short of it. A page
+       from an engine without the ring has ring_capacity 0. */
+    uint64_t ring_head;
+    uint32_t ring_capacity;
+    uint32_t ring_reserved;
+    uint32_t ring[SEVO_STATS_RING_CAPACITY];
 };
 
 /* Names the process for the page it will make. Called once, before any
@@ -92,5 +105,8 @@ extern void sevo_stats_note_main_beat(void);
 extern unsigned long long sevo_stats_frame_count(unsigned long long *window_id);
 /* The first window number a present path can name; later calls are ignored. */
 extern void sevo_stats_note_window(unsigned long long window_id);
+/* Copies the newest frame timestamps the ring holds, at most `max`, oldest first, into
+   `out` (microseconds since the page was made, wrapping); returns how many. */
+extern unsigned int sevo_stats_recent_frames(unsigned int *out, unsigned int max);
 
 #endif  /* __WINE_SEVO_STATS_H */

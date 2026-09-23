@@ -32,6 +32,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,11 +60,17 @@ struct stats_page
     uint32_t         appid;
     char             exe[32];
     _Atomic uint64_t main_beat_ns;
+    _Atomic uint64_t ring_head;
+    uint32_t         ring_capacity;
+    uint32_t         ring_reserved;
+    _Atomic uint32_t ring[SEVO_STATS_RING_CAPACITY];
 };
 
 _Static_assert(sizeof(struct stats_page) == sizeof(struct sevo_stats_page),
                "the written page and the documented page are one layout");
 _Static_assert(sizeof(struct stats_page) <= SEVO_STATS_PAGE_SIZE, "the page fits its page");
+_Static_assert(offsetof(struct stats_page, ring_head) == 104 && offsetof(struct stats_page, ring) == 120,
+               "the app reads the ring at these offsets");
 
 static struct stats_page *_Atomic page;
 static pthread_once_t page_once = PTHREAD_ONCE_INIT;
@@ -171,11 +178,22 @@ static void open_page(void)
     mapped->start_ns = uptime_ns();
     atomic_store_explicit(&mapped->main_beat_ns, mapped->start_ns, memory_order_relaxed);
     memcpy(mapped->exe, process_exe, sizeof(mapped->exe));
+    mapped->ring_capacity = SEVO_STATS_RING_CAPACITY;
     /* Last, and with release ordering: the magic is what says the rest of
        the page is there to be read. */
     atomic_store_explicit(&mapped->magic, SEVO_STATS_MAGIC, memory_order_release);
     atomic_store_explicit(&page, mapped, memory_order_release);
     atexit(close_page);
+}
+
+/* Notes one counted frame in the ring. Relaxed: the reader tolerates a slot it reads while it
+   is written by stopping one short of the head. */
+static void push_frame(struct stats_page *current_page, uint64_t now)
+{
+    uint64_t index = atomic_fetch_add_explicit(&current_page->ring_head, 1, memory_order_relaxed);
+    uint32_t micros = (uint32_t)((now - current_page->start_ns) / 1000);
+
+    atomic_store_explicit(&current_page->ring[index % SEVO_STATS_RING_CAPACITY], micros, memory_order_relaxed);
 }
 
 /* The Steam app this process belongs to, 0 when it is not a game's. */
@@ -194,6 +212,7 @@ void sevo_stats_note_present(unsigned int source)
 {
     struct stats_page *current_page;
     unsigned int current;
+    uint64_t now;
 
     pthread_once(&page_once, open_page);
     if (!(current_page = atomic_load_explicit(&page, memory_order_acquire))) return;
@@ -206,8 +225,14 @@ void sevo_stats_note_present(unsigned int source)
     if (current > source) return;
     if (current < source) atomic_store_explicit(&current_page->source, source, memory_order_relaxed);
 
-    atomic_store_explicit(&current_page->last_present_ns, uptime_ns(), memory_order_relaxed);
+    now = uptime_ns();
+    atomic_store_explicit(&current_page->last_present_ns, now, memory_order_relaxed);
     atomic_fetch_add_explicit(&current_page->frames, 1, memory_order_relaxed);
+    /* The ring follows the count the rate is read from: the presenter's frames, else
+       D3DMetal's drawables, which push_frame takes in sevo_stats_note_drawable. */
+    if (source == SEVO_STATS_SOURCE_PRESENTER
+        || !atomic_load_explicit(&current_page->drawables, memory_order_relaxed))
+        push_frame(current_page, now);
 }
 
 void sevo_stats_note_drawable(void)
@@ -217,6 +242,8 @@ void sevo_stats_note_drawable(void)
     pthread_once(&page_once, open_page);
     if (!(current_page = atomic_load_explicit(&page, memory_order_acquire))) return;
     atomic_fetch_add_explicit(&current_page->drawables, 1, memory_order_relaxed);
+    if (atomic_load_explicit(&current_page->source, memory_order_relaxed) != SEVO_STATS_SOURCE_PRESENTER)
+        push_frame(current_page, uptime_ns());
 }
 
 void sevo_stats_note_main_beat(void)
@@ -249,4 +276,24 @@ unsigned long long sevo_stats_frame_count(unsigned long long *window_id)
     if (window_id) *window_id = atomic_load_explicit(&current_page->window_id, memory_order_relaxed);
     drawables = atomic_load_explicit(&current_page->drawables, memory_order_relaxed);
     return drawables ? drawables : atomic_load_explicit(&current_page->frames, memory_order_relaxed);
+}
+
+unsigned int sevo_stats_recent_frames(unsigned int *out, unsigned int max)
+{
+    struct stats_page *current_page = atomic_load_explicit(&page, memory_order_acquire);
+    uint64_t head, first, index;
+    unsigned int count = 0;
+
+    if (!current_page || !max) return 0;
+    /* One short of the head, where a slot may still be being written, and a few short of a
+       full ring at the tail, where the next frames overwrite the oldest slots. */
+    head = atomic_load_explicit(&current_page->ring_head, memory_order_relaxed);
+    if (head < 2) return 0;
+    head -= 1;
+    first = head > SEVO_STATS_RING_CAPACITY - 8 ? head - (SEVO_STATS_RING_CAPACITY - 8) : 0;
+    if (head - first > max) first = head - max;
+    for (index = first; index < head; index++)
+        out[count++] = atomic_load_explicit(&current_page->ring[index % SEVO_STATS_RING_CAPACITY],
+                                            memory_order_relaxed);
+    return count;
 }

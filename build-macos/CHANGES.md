@@ -24,6 +24,13 @@ uses the section for `r<N>` as the GitHub release body.
   and a harness that killed wineservers left 1 500 of them on this Mac. Each process now holds a
   dead-name notification on the msync server's port in one parked thread and ends when it
   fires. Gate: `bispectral/probes/server-death` (`run-idle.sh`).
+- The frame-rate counter can show how the frames were paced, not only how many there were.
+  View › Show Frame Time Graph (⌥⌘G, `Mac Driver\FrameRateGraph=Y`, `SEVO_FPS_GRAPH=1`)
+  turns the capsule into a card: the rate, the 1 % low and the slowest frame of the last ten
+  seconds, and every frame of the last five seconds drawn at the time it took. Its source is
+  a ring of the last 994 frame timestamps in the stats page, after the fields it had
+  (`sevo_stats.h`), which the app also reads to keep a trace of every frame of a run
+  (`sevo perf`). An app that predates the ring reads the page as before.
 - wineserver no longer maps an object page at a stack-garbage hint. `get_shm` passed an
   uninitialized address to `mach_vm_map` with `VM_FLAGS_ANYWHERE`, which the kernel treats as
   the place to search from: usually harmless, sometimes `KERN_NO_SPACE` or
