@@ -182,8 +182,8 @@ final class MPVHookScaler: Scaler {
             let hookedSize = sizes[hooked]!
             let width = spec.width.map { evaluate($0, sizes: sizes) } ?? hookedSize.x
             let height = spec.height.map { evaluate($0, sizes: sizes) } ?? hookedSize.y
-            let outputWidth = max(1, Int(width.rounded()))
-            let outputHeight = max(1, Int(height.rounded()))
+            let outputWidth = Self.textureSide(width, otherwise: hookedSize.x)
+            let outputHeight = Self.textureSide(height, otherwise: hookedSize.y)
             guard let output = output(at: index, width: outputWidth, height: outputHeight) else { return nil }
 
             uniforms.removeAll(keepingCapacity: true)
@@ -275,6 +275,17 @@ final class MPVHookScaler: Scaler {
         texture.label = "\(name) pass \(index)"
         outputs[index] = texture
         return texture
+    }
+
+    /// The largest texture side Metal makes on every Apple GPU.
+    private static let largestTextureSide: Float = 16384
+
+    /// A pass's output side from its size expression. A package's expression can come out
+    /// infinite, not a number or past what Metal makes, and converting any of those to an
+    /// integer traps: those take the hooked texture's side instead.
+    private static func textureSide(_ value: Float, otherwise fallback: Float) -> Int {
+        let side = value.isFinite && value >= 1 && value <= largestTextureSide ? value : fallback
+        return Int(min(largestTextureSide, max(1, side.isFinite ? side : 1)).rounded())
     }
 
     /// mpv's size expressions: reverse Polish over numbers and `NAME.w` /
