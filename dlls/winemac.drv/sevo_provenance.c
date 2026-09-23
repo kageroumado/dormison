@@ -300,14 +300,28 @@ static int module_loaded(const char *name)
     return module_loaded_wow32(name);
 }
 
+/* Whether wined3d resident in the process is the renderer that drew.
+   D3DMetal, DXMT and DXVK each supply their own d3d DLLs, so a title that
+   loaded one of them for d3d11/d3d12 rendered with it. wined3d beside it is
+   Steam's doing: the overlay (gameoverlayrenderer64.dll) loads d3d9.dll into
+   every game to hook it, and Wine's d3d9 drags wined3d and opengl32 in with
+   it. wined3d is the answer when the configuration names it or names no
+   renderer, and when the process holds neither d3d11.dll nor d3d12.dll: a
+   D3D9-or-older title in a D3DMetal or DXMT bottle really is on wined3d. */
+static int wined3d_answered(void)
+{
+    if (!module_loaded("wined3d.dll")) return 0;
+    if (!strcmp(cfg_renderer, "wined3d") || !strcmp(cfg_renderer, "auto") ||
+        !strcmp(cfg_renderer, "unknown"))
+        return 1;
+    return !module_loaded("d3d11.dll") && !module_loaded("d3d12.dll");
+}
+
 /* The renderer that actually answered, from the modules the process loaded.
-   D3DMetal, DXMT and DXVK each supply their own d3d DLLs and never load
-   Wine's wined3d; a title that fell to wined3d — a D3D9 game in a bottle whose
-   overrides only cover d3d10core/d3d11, say — is the one case the configured
-   name gets wrong. When wined3d is resident, name its display back end. */
+   When wined3d drew, name its display back end. */
 static void actual_renderer(char *out, size_t size)
 {
-    if (module_loaded("wined3d.dll"))
+    if (wined3d_answered())
     {
         if (module_loaded("opengl32.dll")) snprintf(out, size, "wined3d-gl");
         else if (module_loaded("winevulkan.dll") || module_loaded("vulkan-1.dll"))

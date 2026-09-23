@@ -21,6 +21,11 @@ uses the section for `r<N>` as the GitHub release body.
   Every candidate a client spawned mapped it first and only then learned that a server was
   already alive; a replacement server logged `mach_vm_map failed with 3: (os/kern) no space
   available`. The failure line carries the pid, the size, the page size and the kernel's text.
+- The run record's `renderer=` names wined3d only when it drew. Steam's overlay loads
+  `d3d9.dll` into every game to hook it, which brings Wine's wined3d and opengl32 along, so a
+  D3DMetal D3D12 game read `renderer=wined3d-gl`. wined3d is the answer when the bottle names
+  it or names no renderer, or when neither `d3d11.dll` nor `d3d12.dll` is loaded. Found with
+  the Black Myth: Wukong benchmark.
 
 ## r15
 
