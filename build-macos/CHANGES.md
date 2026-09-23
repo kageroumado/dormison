@@ -54,6 +54,13 @@ uses the section for `r<N>` as the GitHub release body.
   display on with nothing on screen. It now declares activity only for the process that owns
   the foreground window. A program that turned the screen saver off holds the display only
   while it is the active app. `sevo holds` names what holds the display on a Mac.
+- On M3 and later, a D3D12 game's frame goes on screen only once the game has finished
+  drawing it. D3DMetal's Metal 4 queue tells the drawable when its work is done
+  (`signalOnCommandQueue:`), and the presenter answered with nothing, so its final pass
+  could sample a half-drawn frame. The renderer's queue now signals a shared event and the
+  present waits for it. Checked on an M3 Pro with D3DMetal 4.0 beta 2: without r16's
+  selector answers the samples end with `waitOnCommandQueue:` unrecognized within seconds;
+  with them every present waits for the signal, at 120 fps.
 - wineserver no longer maps an object page at a stack-garbage hint. `get_shm` passed an
   uninitialized address to `mach_vm_map` with `VM_FLAGS_ANYWHERE`, which the kernel treats as
   the place to search from: usually harmless, sometimes `KERN_NO_SPACE` or

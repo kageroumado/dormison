@@ -827,6 +827,23 @@ final class MetalViewPresenter: ViewPresenter {
     private var nextDrawableID = 0
     private var fallbackQueue: MTLCommandQueue?
 
+    /// Signaled by a Metal 4 renderer queue when its work on a drawable is done
+    /// (``SevoDrawable/signalOnCommandQueue(_:)``), one value per drawable; the direct
+    /// present waits for that value before its final pass samples the slot.
+    private lazy var readyEvent: MTLSharedEvent? = device.makeSharedEvent()
+    private var readyValue: UInt64 = 0
+    private var loggedDirectPresent = false
+
+    /// The event and the next value a renderer queue signals for a drawable, or nil on a
+    /// device that makes no shared event.
+    func nextReadySignal() -> (event: MTLSharedEvent, value: UInt64)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let event = readyEvent else { return nil }
+        readyValue += 1
+        return (event, readyValue)
+    }
+
     init?(rendererLayer: CAMetalLayer) {
         self.rendererLayer = rendererLayer
         super.init(pixelFormat: rendererLayer.pixelFormat, contentsScale: rendererLayer.contentsScale)
@@ -1020,6 +1037,13 @@ final class MetalViewPresenter: ViewPresenter {
     func presentDirectly(_ proxy: SevoDrawable, presentReal: (CAMetalDrawable) -> Void) {
         guard let queue = fallbackQueue ?? device.makeCommandQueue(), let commandBuffer = queue.makeCommandBuffer() else { return }
         fallbackQueue = queue
+        // The renderer's own queue is not this one: without its signal the final pass could
+        // sample a slot the renderer is still drawing.
+        if let ready = proxy.readySignal { commandBuffer.encodeWaitForEvent(ready.event, value: ready.value) }
+        if !loggedDirectPresent, Presenter.shared.tracing {
+            loggedDirectPresent = true
+            log("direct present " + (proxy.readySignal == nil ? "with no signal from the renderer's queue" : "waits for the renderer's signal"))
+        }
         present(proxy, in: commandBuffer, presentReal: presentReal)
         commandBuffer.commit()
     }
@@ -1116,6 +1140,10 @@ final class SevoDrawable: NSObject, CAMetalDrawable {
         presenter.presentDirectly(self) { $0.present(afterMinimumDuration: duration) }
     }
 
+    /// What the renderer's queue signals when its work on this drawable is done: set by
+    /// ``signalOnCommandQueue(_:)``, waited for by the direct present.
+    private(set) var readySignal: (event: MTLSharedEvent, value: UInt64)?
+
     /// The private QuartzCore methods `-[_MTL4CommandQueue waitForDrawable:]`
     /// and `signalDrawable:` re-send to the drawable, with the queue as the
     /// argument and without asking `respondsToSelector:`. D3DMetal's D3D12
@@ -1126,13 +1154,20 @@ final class SevoDrawable: NSObject, CAMetalDrawable {
     /// makes a shared event (`newSharedEvent`) that the queue signals once
     /// its work on the drawable is done, and `waitOnCommandQueue:` has a
     /// queue wait on that event, so a queue starts after the drawable's
-    /// previous present completed. The presenter's slot lifetime already
-    /// gives that ordering: a slot returns to the free list only when its
-    /// presenting command buffer has completed, so `nextDrawable` hands out
-    /// only slots with nothing left to wait on, and both calls return at once.
+    /// previous present completed. The presenter's slot lifetime already gives the
+    /// wait's ordering: a slot returns to the free list only when its presenting command
+    /// buffer has completed, so `nextDrawable` hands out only slots with nothing left to
+    /// wait on, and `waitOnCommandQueue:` returns at once. The signal is the renderer's
+    /// promise that the frame is drawn: the queue signals the presenter's shared event,
+    /// and the present waits for it.
     @objc func waitOnCommandQueue(_ queue: Any?) {}
 
-    @objc func signalOnCommandQueue(_ queue: Any?) {}
+    @objc func signalOnCommandQueue(_ queue: Any?) {
+        guard #available(macOS 26.0, *), let queue = queue as? any MTL4CommandQueue,
+              let signal = presenter.nextReadySignal() else { return }
+        queue.signalEvent(signal.event, value: signal.value)
+        readySignal = signal
+    }
 }
 
 /// The smallest window the picture readout is drawn in, in points. The line is 36 points tall
