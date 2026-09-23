@@ -24,8 +24,7 @@ uses the section for `r<N>` as the GitHub release body.
   `wineserver crashed` — a playtest's `msync: error: mach_vm_map failed with 3: (os/kern) no space
   available` under Subnautica 2, twice, and every client's flood after it. The hint is zero,
   and a map that still fails ends the server with a line naming the pid, the page and the
-  kernel's text instead of touching the address. The 64 MB tid map is made after the master
-  socket's lock, so a candidate server that finds one alive exits without mapping it.
+  kernel's text instead of touching the address.
 - The run record's `renderer=` names wined3d only when it drew. Steam's overlay loads
   `d3d9.dll` into every game to hook it, which brings Wine's wined3d and opengl32 along, so a
   D3DMetal D3D12 game read `renderer=wined3d-gl`. wined3d is the answer when the bottle names
