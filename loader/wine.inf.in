@@ -1,4 +1,4 @@
-;; .INF script for the basic Wine configuration
+﻿;; .INF script for the basic Wine configuration
 ;; Version: @PACKAGE_STRING@
 ;;
 ;; This should be run through setupapi:
@@ -220,6 +220,7 @@ Mci32Str="Software\Microsoft\Windows NT\CurrentVersion\MCI32"
 CurrentVersion="Software\Microsoft\Windows\CurrentVersion"
 CurrentVersionNT="Software\Microsoft\Windows NT\CurrentVersion"
 FontSubStr="Software\Microsoft\Windows NT\CurrentVersion\FontSubstitutes"
+FontReplStr="Software\Wine\Fonts\Replacements"
 Control="System\CurrentControlSet\Control"
 
 [Classes]
@@ -520,6 +521,23 @@ HKLM,%FontSubStr%,"Times New Roman CE,238",,"Times New Roman,238"
 HKLM,%FontSubStr%,"Times New Roman CYR,204",,"Times New Roman,204"
 HKLM,%FontSubStr%,"Times New Roman Greek,161",,"Times New Roman,161"
 HKLM,%FontSubStr%,"Times New Roman TUR,162",,"Times New Roman,162"
+HKCU,%FontReplStr%,"Meiryo",,"IPAPGothic"
+HKCU,%FontReplStr%,"Meiryo UI",,"IPAPGothic"
+HKCU,%FontReplStr%,"MS Gothic",,"IPAGothic"
+HKCU,%FontReplStr%,"MS Mincho",,"Hiragino Mincho ProN W3"
+HKCU,%FontReplStr%,"MS PGothic",,"IPAPGothic"
+HKCU,%FontReplStr%,"MS PMincho",,"Hiragino Mincho ProN W3"
+HKCU,%FontReplStr%,"MS UI Gothic",,"IPAPGothic"
+HKCU,%FontReplStr%,"Yu Gothic",,"IPAPGothic"
+HKCU,%FontReplStr%,"Yu Gothic UI",,"IPAPGothic"
+HKCU,%FontReplStr%,"Yu Mincho",,"Hiragino Mincho ProN W3"
+HKCU,%FontReplStr%,"ＭＳ ゴシック",,"IPAGothic"
+HKCU,%FontReplStr%,"ＭＳ Ｐゴシック",,"IPAPGothic"
+HKCU,%FontReplStr%,"ＭＳ 明朝",,"Hiragino Mincho ProN W3"
+HKCU,%FontReplStr%,"ＭＳ Ｐ明朝",,"Hiragino Mincho ProN W3"
+HKCU,%FontReplStr%,"メイリオ",,"IPAPGothic"
+HKCU,%FontReplStr%,"游ゴシック",,"IPAPGothic"
+HKCU,%FontReplStr%,"游明朝",,"Hiragino Mincho ProN W3"
 HKLM,System\CurrentControlSet\Hardware Profiles\Current\Software\Fonts,"LogPixels",0x10003,0x00000060
 
 [MCI]

@@ -49,6 +49,15 @@ for a in x86_64-unix x86_64-windows i386-windows; do
 done
 cp -R "$STAGE/share/wine" "$OUT/wine/share/wine"
 
+# --- the IPA fonts, beside wine's own: win32u scans share/wine/fonts at every
+# boot, and the Replacements wine.inf writes point the Japanese family names
+# at IPAGothic and IPAPGothic. The license rides with the faces it covers. ---
+echo "==> IPA fonts"
+"$HERE/fetch-fonts.sh" | sed 's/^/    /'
+for f in ipag.ttf ipagp.ttf IPA_Font_License_Agreement_v1.0.txt; do
+    cp "$ROOT/deps/fonts/IPAfont00303/$f" "$OUT/wine/share/wine/fonts/$f"
+done
+
 # --- strip the PE builds: install-lib leaves full debug info, 1.3 GB of it ---
 echo "==> stripping PE modules"
 for f in "$OUT"/wine/lib/wine/x86_64-windows/*.dll "$OUT"/wine/lib/wine/x86_64-windows/*.exe; do

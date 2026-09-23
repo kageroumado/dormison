@@ -35,6 +35,14 @@ uses the section for `r<N>` as the GitHub release body.
   Frame Rate) could never come in front of it. It stays at the normal level, and while it is
   key the bar and the Dock auto-hide: the bar slides in when the pointer reaches the top edge.
   Displays a game captured are covered as before. Found with KAMITSUBAKI CITY REGENERATE.
+- The Japanese font families a Windows program asks for resolve to Japanese faces. The engine
+  ships IPAGothic and IPAPGothic (IPA Font License v1.0) in `share/wine/fonts`, and wine.inf
+  maps MS Gothic, MS PGothic, MS UI Gothic, Meiryo, Meiryo UI, Yu Gothic and Yu Gothic UI
+  onto them — MS Gothic fixed pitch, the rest proportional — and MS Mincho, MS PMincho and
+  Yu Mincho onto the Mac's Hiragino Mincho ProN, under their English and Japanese names
+  (`ＭＳ ゴシック`, `メイリオ`, `游明朝`, …). A bottle without them laid Arial out at the
+  fixed-pitch advances a Gothic face would have, and the text overlapped. Found with
+  Wonderful Everyday (BGI.exe).
 
 ## r15
 

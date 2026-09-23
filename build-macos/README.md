@@ -159,6 +159,35 @@ Run a few games and the DirectX 12 samples against an engine before
 installing it over the one the app runs; install with the client stopped,
 keeping the previous file beside the new one.
 
+## Fonts
+
+`share/wine/fonts` in the engine holds wine's own faces (from `fonts/` in this
+repository, built by `make install-lib`) plus two the build does not produce:
+`ipag.ttf` (IPAGothic, fixed pitch) and `ipagp.ttf` (IPAPGothic,
+proportional), from the IPA fonts 003.03 archive that
+`build-macos/fetch-fonts.sh` downloads into `deps/fonts/` under a pinned URL
+and sha256. `package-engine.sh` runs the script and copies the two faces with
+`IPA_Font_License_Agreement_v1.0.txt` beside them; the IPA Font License v1.0
+allows redistribution of the unmodified faces when that text comes along.
+win32u scans the directory at every boot (`load_file_system_fonts` in
+`dlls/win32u/font.c`), so a face there needs no registry entry. What makes a
+Windows family name land on it is `HKCU\Software\Wine\Fonts\Replacements`,
+written by the `[Fonts]` section of `loader/wine.inf.in`: MS Gothic reads
+IPAGothic, the proportional Gothic families (MS PGothic, MS UI Gothic, Meiryo,
+Yu Gothic) read IPAPGothic, and the Mincho families read the Mac's
+`Hiragino Mincho ProN W3`, which win32u enumerates from CoreText under that
+name, one family per weight. A replacement is skipped when the bottle has a
+real font of that name, so a game that installs its own MS Gothic keeps it.
+The inf carries a UTF-8 byte order mark because setupapi reads an inf with no
+mark in the bottle's ANSI code page, which would garble the Japanese names.
+
+To add a face: extend `fetch-fonts.sh` (or a sibling script) with the
+archive, its sha256 and its license, add the copy to `package-engine.sh`, and
+add one `HKCU,%FontReplStr%,"<Windows name>",,"<family as win32u enumerates
+it>"` line per name to `[Fonts]`. The exact family string comes from
+`bispectral/probes/fontsubst` (`probe.exe enum` lists what a bottle sees;
+`probe.exe` shows what each Japanese family name resolves to).
+
 ## msync
 
 `msync-src/` is CrossOver 26.3's msync (six files, LGPL) and
