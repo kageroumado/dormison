@@ -769,7 +769,7 @@ extern void *libd3dshared_load_addr, *libd3dshared_code_end;
         "jb " __ASM_LOCAL_LABEL("jmp_sysv_" #name) "\n\t" \
         "movq " __ASM_NAME("libd3dshared_code_end") "@GOTPCREL(%rip), %rax\n\t" \
         "cmpq (%rax), %rcx\n\t" \
-        "ja " __ASM_LOCAL_LABEL("jmp_sysv_" #name) "\n\t" \
+        "jae " __ASM_LOCAL_LABEL("jmp_sysv_" #name) "\n\t" \
         "pop %rcx\n\t" \
         "pop %rax\n\t" \
         "jmp " __ASM_NAME("msthunk_" #name) "\n\t" \

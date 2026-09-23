@@ -1686,8 +1686,12 @@ static NSView* wine_content_view_of(NSWindow* window)
     - (CGFloat) presentationScale
     {
         NSSize wine = [self wineContentSize];
+        CGFloat scale;
+
         if (!self.presentationScaled || wine.width < 1) return 1;
-        return NSWidth([wineContentView frame]) / wine.width;
+        /* A content view laid out at zero width would make every point divided by this infinite. */
+        scale = NSWidth([wineContentView frame]) / wine.width;
+        return scale > 0 ? scale : 1;
     }
 
     /* The real frame and the frame Wine believes in share a top-left corner:
