@@ -31,6 +31,23 @@ uses the section for `r<N>` as the GitHub release body.
   a ring of the last 994 frame timestamps in the stats page, after the fields it had
   (`sevo_stats.h`), which the app also reads to keep a trace of every frame of a run
   (`sevo perf`). An app that predates the ring reads the page as before.
+- A healthy game is no longer offered to be ended as "not responding" when it destroyed its
+  own window rather than answering a close: a request that left the queue unanswered counts
+  as settled, and the sheet leaves when its window does.
+- Two presenter races that could end a game are closed: an OpenGL game's first frame could
+  arrive before its view was attached and stop the process, and a D3DMetal game recreating
+  its swapchain could ask a presenter the main thread had just freed for a drawable. The
+  upscaler chosen from the View menu mid-game is read as one snapshot.
+- wineserver reuses every freed sync object from a stack rather than scanning live objects
+  from the last one freed, which made each creation slower the more objects a game held.
+  Both sides' object page tables are allocated once, so no thread reads one while another
+  moves it, and a page that cannot be mapped ends the process with a line saying so.
+- A program's own env file (`.sevo/apps/<exe>.env`, `debug.env`) can no longer set
+  `WINEMSYNC`, `WINEESYNC`, `WINEPREFIX`, `WINESERVER` or `WINEARCH`: a process that
+  disagrees with the running wineserver about its sync mode exits at start. `bottle.env`
+  still can. `KEY = value` names `KEY`.
+- A shader package whose pass size works out infinite, not a number or past 16384 pixels
+  takes the hooked texture's size instead of ending the game.
 - wineserver no longer maps an object page at a stack-garbage hint. `get_shm` passed an
   uninitialized address to `mach_vm_map` with `VM_FLAGS_ANYWHERE`, which the kernel treats as
   the place to search from: usually harmless, sometimes `KERN_NO_SPACE` or
