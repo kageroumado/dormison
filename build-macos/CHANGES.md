@@ -3,6 +3,16 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r16
+
+- A D3D12 game with the upscaler on no longer ends 6–45 seconds in with "unrecognized
+  selector `waitOnCommandQueue:`" on an M3 or later. D3DMetal's D3D12 present path has the
+  command queue wait for and signal the drawable; a Metal 4 queue, which D3DMetal gets on
+  Apple GPU family 9 hardware, re-sends both as the private QuartzCore methods
+  `waitOnCommandQueue:` and `signalOnCommandQueue:` to whatever `nextDrawable` returned. The
+  presenter's drawable answers both; a leased slot's previous present has already completed,
+  so each returns at once. Found in the 2026-09-22 retest, on both of its D3D12 titles.
+
 ## r15
 
 - A program whose window has stopped taking messages is said so, as Windows says it: a close

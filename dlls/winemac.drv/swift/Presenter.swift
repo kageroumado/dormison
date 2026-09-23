@@ -1079,6 +1079,24 @@ final class SevoDrawable: NSObject, CAMetalDrawable {
     func present(afterMinimumDuration duration: CFTimeInterval) {
         presenter.presentDirectly(self) { $0.present(afterMinimumDuration: duration) }
     }
+
+    /// The private QuartzCore methods `-[_MTL4CommandQueue waitForDrawable:]`
+    /// and `signalDrawable:` re-send to the drawable, with the queue as the
+    /// argument and without asking `respondsToSelector:`. D3DMetal's D3D12
+    /// present path (`D3DMCommandQueueWorker::DoPresent`) calls those two
+    /// queue methods; on a Metal 4 queue, which D3DMetal gets on Apple GPU
+    /// family 9 hardware (M3 and later), both are tail jumps to these
+    /// selectors. On a real `CAMetalDrawable`, `signalOnCommandQueue:` lazily
+    /// makes a shared event (`newSharedEvent`) that the queue signals once
+    /// its work on the drawable is done, and `waitOnCommandQueue:` has a
+    /// queue wait on that event, so a queue starts after the drawable's
+    /// previous present completed. The presenter's slot lifetime already
+    /// gives that ordering: a slot returns to the free list only when its
+    /// presenting command buffer has completed, so `nextDrawable` hands out
+    /// only slots with nothing left to wait on, and both calls return at once.
+    @objc func waitOnCommandQueue(_ queue: Any?) {}
+
+    @objc func signalOnCommandQueue(_ queue: Any?) {}
 }
 
 /// The smallest window the picture readout is drawn in, in points. The line is 36 points tall
