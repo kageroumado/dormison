@@ -390,8 +390,51 @@ struct msync_shm
     int multiple_waiters;
 };
 
-static unsigned int last_allocated_idx = 1;
-static unsigned int last_destroyed_idx = UINT32_MAX;
+/* The highest index ever handed out; a new object with no freed slot to reuse goes above it. */
+static unsigned int highest_allocated_idx = 1;
+
+/* Indices whose last reference went, for create to reuse: the message pump drops references
+   and the main thread creates objects, so the stack has a lock. An index the stack cannot
+   take is never reused, which costs 16 bytes of a page and nothing else. */
+static pthread_mutex_t freed_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned int *freed_indices;
+static unsigned int freed_count, freed_capacity;
+
+static void note_freed_index( unsigned int shm_idx )
+{
+    pthread_mutex_lock( &freed_lock );
+    if (freed_count == freed_capacity)
+    {
+        unsigned int capacity = freed_capacity ? freed_capacity * 2 : 1024;
+        unsigned int *grown = realloc( freed_indices, capacity * sizeof(*grown) );
+        if (grown)
+        {
+            freed_indices = grown;
+            freed_capacity = capacity;
+        }
+    }
+    if (freed_count < freed_capacity) freed_indices[freed_count++] = shm_idx;
+    pthread_mutex_unlock( &freed_lock );
+}
+
+/* A freed index whose object is still free, or UINT32_MAX when there is none. */
+static unsigned int take_freed_index(void)
+{
+    unsigned int shm_idx = UINT32_MAX;
+
+    pthread_mutex_lock( &freed_lock );
+    while (freed_count)
+    {
+        unsigned int candidate = freed_indices[--freed_count];
+        if (!__atomic_load_n( &((struct msync_shm *)get_shm( candidate ))->refcount, __ATOMIC_SEQ_CST ))
+        {
+            shm_idx = candidate;
+            break;
+        }
+    }
+    pthread_mutex_unlock( &freed_lock );
+    return shm_idx;
+}
 
 static inline void destroy_all_internal( unsigned int shm_idx )
 {
@@ -406,7 +449,7 @@ static inline void destroy_all_internal( unsigned int shm_idx )
 
     refcount = __atomic_sub_fetch( &obj->refcount, 1, __ATOMIC_SEQ_CST );
 
-    if (!refcount) last_destroyed_idx = shm_idx;
+    if (!refcount) note_freed_index( shm_idx );
 }
 
 /*
@@ -734,18 +777,18 @@ static unsigned int msync_alloc_shm( int low, int high, enum msync_type type )
     unsigned int shm_idx;
     struct msync_shm *shm;
 
-    shm_idx = min( last_destroyed_idx, last_allocated_idx + 1 );
-
-    for(;;)
-    {
+    if ((shm_idx = take_freed_index()) != UINT32_MAX)
         shm = get_shm( shm_idx );
-        if (!__atomic_load_n( &shm->refcount, __ATOMIC_SEQ_CST ))
-            break;
-
-        shm_idx++;
+    else
+    {
+        /* Nothing above the highest index handed out is in use; the loop only guards it. */
+        for (shm_idx = highest_allocated_idx + 1;; shm_idx++)
+        {
+            shm = get_shm( shm_idx );
+            if (!__atomic_load_n( &shm->refcount, __ATOMIC_SEQ_CST )) break;
+        }
+        highest_allocated_idx = shm_idx;
     }
-
-    last_allocated_idx = shm_idx;
 
     assert(shm);
     shm->low = low;
