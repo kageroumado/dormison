@@ -5,7 +5,7 @@
  * discrete path: write into an upload heap, then copy into a second allocation that is
  * the same physical memory. The device supports the unified path — a CUSTOM heap in pool
  * L0 with write-back pages takes CPU writes the GPU then reads — and skipping the copy is
- * worth 27-107% of a bandwidth-bound frame, measured.
+ * a large share of a bandwidth-bound frame.
  *
  * The answer comes from one vtable entry that every device of the process shares, so one
  * device of our own is enough to reach it. This lives here because winemac.drv is loaded

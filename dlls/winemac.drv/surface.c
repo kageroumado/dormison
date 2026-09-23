@@ -75,11 +75,11 @@ static CGDataProviderRef data_provider_create(size_t size, void **bits)
     return provider;
 }
 
-/* The DIB of a surface the presenter reads, shared by the CGDataProvider
-   and the presenter's Metal buffer: it is unmapped when the last of the two
-   lets go, in whichever order they finish. The surface is destroyed on the
-   program's thread while a blit the presenter encoded may still be reading
-   the pages. */
+/* The DIB of a surface the presenter reads, shared by the CGDataProvider and
+   the presenter: the presenter copies from it at each flush, and on the main
+   thread when a refresh fills a new frame texture, so the surface can be
+   destroyed on the program's thread while the presenter still holds it. It is
+   unmapped when the last of the two lets go. */
 struct page_bits
 {
     void   *memory;
@@ -101,10 +101,9 @@ static void page_bits_release_presenter(void *info)
     page_bits_release(info, NULL, 0);
 }
 
-/* The DIB of a surface the presenter reads: page-aligned and a whole number
-   of pages, as Metal requires of memory it wraps in a buffer without
-   copying. The page is the host's 16 KB one, whatever page size this
-   process is told it has. The provider holds one reference on the pages. */
+/* The DIB of a surface the presenter reads, mapped as whole host pages (16 KB,
+   whatever page size this process is told it has). The provider holds one
+   reference on the pages. */
 static CGDataProviderRef page_data_provider_create(size_t size, void **bits, struct page_bits **pages)
 {
     const size_t page = 16384;

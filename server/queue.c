@@ -665,9 +665,8 @@ static void set_foreground_input( struct desktop *desktop, struct process *proce
 
     /* A process that clipped the cursor and is only now taking the foreground
        — a game that grabs the mouse before its window is up — keeps its clip.
-       Every other change of foreground releases it. Without this the game's
-       own activation threw the clip away and nothing asked for it again, so
-       mouse-look never held the pointer. The clip is handed on after the new
+       Every other change of foreground releases it: the game's own activation
+       must not, because it never asks for the clip again. The clip is handed on after the new
        foreground is recorded, because that is the thread the driver's clip
        message has to reach. */
     keeps_clip = desktop->clip_pid && desktop->clip_pid == process->id;

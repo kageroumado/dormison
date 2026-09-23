@@ -3893,10 +3893,9 @@ int sevo_env_budget( const char *name, int fallback, int max )
 
 /* How long NtWaitForAlertByThreadId looks at its own word before parking, in
  * YieldProcessor iterations. SEVO_WAIT_SPIN sets it; the default, 0, parks on the first
- * look, as Wine does. An iteration is 0.38 ns under Rosetta on an M1 Max, so 5200 is two
- * microseconds: the shortest look that catches a ping-pong reply every time, where a park
- * and its wake cost four to eight times the cycles of the whole spin. It stays a choice
- * because no game has yet run faster for it and a 16-thread lock pays 8-35 % more cycles. */
+ * look, as Wine does. A look of a couple of microseconds catches a ping-pong reply that a
+ * park and its wake would cost several times more to receive; it stays a choice because
+ * heavily contended locks pay for the spin in cycles and games have not run faster for it. */
 #ifndef SEVO_WAIT_SPIN_DEFAULT
 #define SEVO_WAIT_SPIN_DEFAULT 0
 #endif

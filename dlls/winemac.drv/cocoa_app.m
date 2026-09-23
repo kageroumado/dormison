@@ -1018,9 +1018,9 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
        found in this process's own window list. Asking the window server
        which window is under a point costs a round trip per call, and
        GetCursorPos is polled every frame by games and by Steam's overlay
-       thread: with WindowServer busy, that round trip was most of the
-       main thread's time. Two scaled windows overlapping at the point is
-       settled by the key window, then the higher level. */
+       thread, so the lookup stays in this process. Two scaled windows
+       overlapping at the point is settled by the key window, then the
+       higher level. */
     - (CGPoint) winePointFromScreenPoint:(CGPoint)point
     {
         NSPoint cocoaPoint = [self flippedMouseLocation:NSPointFromCGPoint(point)];
@@ -1970,9 +1970,9 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         {
             /* A confinement rect has to be tied to a window of ours that is in
                front, and a game that calls ClipCursor before its window
-               activates has none — the first thing many of them do. Keep the
-               rect so the activation applies it; dropped, mouse-look stayed
-               dead for the life of the process. */
+               activates has none — the first thing many of them do. The rect
+               is kept so the activation applies it: such a game never asks
+               again. */
             deferredClipRect = rect;
             hasDeferredClip = TRUE;
             return FALSE;
