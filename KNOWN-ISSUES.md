@@ -4,6 +4,24 @@ Games and behaviors that do not work under Dormison as of the release named, wit
 known. Each entry moves out when a release fixes it; each will also feed the shared
 compatibility database once that exists.
 
+## Every D3D12 game ends 6–45 s in with the upscaler on, on an M3 or later — r15, fixed in r16
+
+`-[WineMacSwift.SevoDrawable waitOnCommandQueue:]: unrecognized selector` in the Wine log, the
+game gone. On Apple GPU family 9 hardware D3DMetal drives a Metal 4 command queue, whose
+`waitForDrawable:` and `signalDrawable:` re-send `waitOnCommandQueue:` and
+`signalOnCommandQueue:` to the presenter's drawable; r15's drawable answered neither. D3D11
+games and every Mac up to the M2 are unaffected. Until r16: the upscaler off for the game
+(`sevo app config <appid> upscaler off`, or Settings › Games).
+
+## A game freezes black and the Wine log grows by tens of MB a second — r15, fixed in r16
+
+`msync: error: mach_vm_map failed with 3` then `wineserver crashed` in the log, then every
+process repeating `err:sync:server_register_wait Failed to send server register wait:
+0x10000003`. The server mapped a shared-memory page from an uninitialized address hint and
+died; its clients retried against the dead server without bound. `sevo client stop`, then
+end the leftover game process (`kill -9`), then `sevo client start`; the log file
+(`~/Library/Logs/Sevoflurane-wine.log`) can be truncated.
+
 ## HuniePop (Steam 339800) — black window in most launches — r15
 
 Unity 4.2.2, 32-bit, Direct3D 9. The game loads for about 150 s (its own x87 audio decoding
