@@ -157,6 +157,8 @@ extern int frame_rate_on;
    number: `Mac Driver\FrameRateGraph=Y` or SEVO_FPS_GRAPH=1, and View > Show Frame Time
    Graph. On, it implies the counter. */
 extern int frame_graph_on;
+/* The app became active or resigned: the display hold follows it. Main thread. */
+extern void macdrv_note_app_active(int active);
 /* Traces the presenter's frames and the Metal view lifecycle to stderr:
    `Mac Driver\PresenterLog=Y` or SEVO_PRESENTER_LOG=1. */
 extern int presenter_log_on;

@@ -434,6 +434,17 @@ static BOOL load_mapping_settings( struct dinput_device *This, LPDIACTIONFORMATW
     return mapped > 0;
 }
 
+/* Whether the foreground window belongs to this process. */
+static BOOL process_is_foreground(void)
+{
+    HWND foreground = GetForegroundWindow();
+    DWORD pid = 0;
+
+    if (!foreground) return FALSE;
+    GetWindowThreadProcessId( foreground, &pid );
+    return pid == GetCurrentProcessId();
+}
+
 void queue_event( IDirectInputDevice8W *iface, int index, DWORD data, DWORD time, DWORD seq )
 {
     static ULONGLONG notify_ms = 0;
@@ -443,7 +454,10 @@ void queue_event( IDirectInputDevice8W *iface, int index, DWORD data, DWORD time
     ULONGLONG time_ms = GetTickCount64();
     int next_pos;
 
-    if (time_ms - notify_ms > 1000)
+    /* Device input is user activity for the host only while this process is in front: a
+       program reading a controller in the background, a drifting stick under a client whose
+       windows are hidden, would otherwise keep the host's display awake indefinitely. */
+    if (time_ms - notify_ms > 1000 && process_is_foreground())
     {
         PostMessageW(GetDesktopWindow(), WM_WINE_NOTIFY_ACTIVITY, 0, 0);
         notify_ms = time_ms;

@@ -674,6 +674,39 @@ struct macdrv_thread_data *macdrv_init_thread_data(void)
 }
 
 
+/* The one display hold this process takes: a program that turned the screen saver off,
+   while it is the active app. The request is remembered across activation, and the hold is
+   released when the program goes to the background, so a process that asked once and never
+   asked again cannot keep the host's display awake from behind other windows. */
+static pthread_mutex_t display_hold_lock = PTHREAD_MUTEX_INITIALIZER;
+static BOOL screensaver_off_requested;
+static BOOL process_is_active;
+
+static void update_display_hold(void)
+{
+    static IOPMAssertionID assertion = kIOPMNullAssertionID;
+    BOOL want;
+
+    pthread_mutex_lock(&display_hold_lock);
+    want = screensaver_off_requested && process_is_active;
+    if (want && assertion == kIOPMNullAssertionID)
+        IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep, kIOPMAssertionLevelOn,
+                                    CFSTR("Wine Process requesting no screen saver"), &assertion);
+    else if (!want && assertion != kIOPMNullAssertionID)
+    {
+        IOPMAssertionRelease(assertion);
+        assertion = kIOPMNullAssertionID;
+    }
+    pthread_mutex_unlock(&display_hold_lock);
+}
+
+/* The Cocoa app became active or resigned; called on the main thread. */
+void macdrv_note_app_active(int active)
+{
+    process_is_active = active;
+    update_display_hold();
+}
+
 /***********************************************************************
  *              SystemParametersInfo (MACDRV.@)
  */
@@ -710,23 +743,8 @@ BOOL macdrv_SystemParametersInfo( UINT action, UINT int_param, void *ptr_param, 
         break;
 
     case SPI_SETSCREENSAVEACTIVE:
-        {
-            static IOPMAssertionID powerAssertion = kIOPMNullAssertionID;
-            if (int_param)
-            {
-                if (powerAssertion != kIOPMNullAssertionID)
-                {
-                    IOPMAssertionRelease(powerAssertion);
-                    powerAssertion = kIOPMNullAssertionID;
-                }
-            }
-            else if (powerAssertion == kIOPMNullAssertionID)
-            {
-                IOPMAssertionCreateWithName( kIOPMAssertionTypePreventUserIdleDisplaySleep, kIOPMAssertionLevelOn,
-                                             CFSTR("Wine Process requesting no screen saver"),
-                                             &powerAssertion);
-            }
-        }
+        screensaver_off_requested = !int_param;
+        update_display_hold();
         break;
     }
     return FALSE;

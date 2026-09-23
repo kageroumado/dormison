@@ -48,6 +48,12 @@ uses the section for `r<N>` as the GitHub release body.
   still can. `KEY = value` names `KEY`.
 - A shader package whose pass size works out infinite, not a number or past 16384 pixels
   takes the hooked texture's size instead of ending the game.
+- A program in the background no longer keeps the Mac's display awake. DirectInput declared
+  user activity to macOS for every controller event of any process that read one, at most
+  once a second: a drifting stick under the Steam client, whose windows are hidden, held the
+  display on with nothing on screen. It now declares activity only for the process that owns
+  the foreground window. A program that turned the screen saver off holds the display only
+  while it is the active app. `sevo holds` names what holds the display on a Mac.
 - wineserver no longer maps an object page at a stack-garbage hint. `get_shm` passed an
   uninitialized address to `mach_vm_map` with `VM_FLAGS_ANYWHERE`, which the kernel treats as
   the place to search from: usually harmless, sometimes `KERN_NO_SPACE` or

@@ -3008,6 +3008,7 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         NSNumber* displayID;
         NSDictionary* modesToRealize = [latentDisplayModes autorelease];
 
+        macdrv_note_app_active(1);
         latentDisplayModes = [[NSMutableDictionary alloc] init];
         for (displayID in modesToRealize)
         {
@@ -3046,6 +3047,7 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         macdrv_event* event;
         WineEventQueue* queue;
 
+        macdrv_note_app_active(0);
         [self invalidateGotFocusEvents];
 
         event = macdrv_create_event(APP_DEACTIVATED, nil);
