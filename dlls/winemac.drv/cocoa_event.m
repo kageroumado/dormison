@@ -295,10 +295,10 @@ static const OSType WineHotKeySignature = 'Wine';
                 [[event retain] autorelease];
                 [events removeObjectAtIndex:index];
 
+                __atomic_store_n(&event->event->taken, 1, __ATOMIC_RELAXED);
                 if (event->event->deliver == INT_MAX ||
                     __atomic_sub_fetch(&event->event->deliver, 1, __ATOMIC_RELAXED) >= 0)
                 {
-                    __atomic_store_n(&event->event->taken, 1, __ATOMIC_RELAXED);
                     ret = event;
                     break;
                 }
@@ -322,6 +322,11 @@ static const OSType WineHotKeySignature = 'Wine';
         indexes = [events indexesOfObjectsPassingTest:^BOOL(id obj, NSUInteger idx, BOOL *stop){
             MacDrvEvent* event = obj;
             return block(event->event);
+        }];
+        /* Nobody will answer a discarded request, and nobody is waiting for it either:
+           the not-responding watch reads this as settled. */
+        [events enumerateObjectsAtIndexes:indexes options:0 usingBlock:^(id obj, NSUInteger idx, BOOL *stop){
+            __atomic_store_n(&((MacDrvEvent*)obj)->event->taken, 1, __ATOMIC_RELAXED);
         }];
 
         [events removeObjectsAtIndexes:indexes];

@@ -3084,7 +3084,9 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         macdrv_retain_event(event);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kUnansweredRequestSeconds * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            WineWindow* host = window.isVisible ? window : [self frontWineWindow];
+            /* Over the window that was asked, while it is still there; a Quit names no
+               window and goes over the front one. */
+            WineWindow* host = window ? (window.isVisible ? window : nil) : [self frontWineWindow];
 
             if (!__atomic_load_n(&event->taken, __ATOMIC_RELAXED) && !unansweredAlert && host)
                 [self offerToEndProgramOver:host waitingOn:event];
@@ -3108,9 +3110,11 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         macdrv_retain_event(event);
         unansweredAlert = [alert retain];
 
-        /* The program answering is the better ending: the sheet leaves by itself. */
+        /* The program answering is the better ending: the sheet leaves by itself, and so
+           it does when its window goes away under it. */
         timer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer* t){
-            if (__atomic_load_n(&event->taken, __ATOMIC_RELAXED) && window.attachedSheet == alert.window)
+            BOOL settled = __atomic_load_n(&event->taken, __ATOMIC_RELAXED) || !window.isVisible;
+            if (settled && window.attachedSheet == alert.window)
                 [window endSheet:alert.window returnCode:NSAlertFirstButtonReturn];
         }];
         [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
