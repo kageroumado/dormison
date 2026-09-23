@@ -1112,11 +1112,40 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
                     [window setLevel:newLevel];
             }
         }
+
+        [self updatePresentationOptionsForActive:active];
     }
 
     - (void) adjustWindowLevels
     {
         [self adjustWindowLevels:[NSApp isActive]];
+    }
+
+    /* A fullscreen-style window sits at the normal level while the displays
+       are uncaptured, where the menu bar would lie over its top strip. While
+       such a window is key on the active space and the app is active, the bar
+       and the Dock auto-hide: the bar is under the game and slides in over it
+       when the pointer reaches the top edge, so View and the rest stay
+       reachable. AppKit raises on AutoHideMenuBar without AutoHideDock. */
+    - (void) updatePresentationOptionsForActive:(BOOL)active
+    {
+        NSWindow* key = [NSApp keyWindow];
+        NSApplicationPresentationOptions options = NSApplicationPresentationDefault;
+
+        if (active && [key isKindOfClass:[WineWindow class]] && [(WineWindow*)key isFullscreen] &&
+            [key isOnActiveSpace])
+            options = NSApplicationPresentationAutoHideMenuBar | NSApplicationPresentationAutoHideDock;
+
+        if ([NSApp presentationOptions] == options) return;
+        [NSApp setPresentationOptions:options];
+        if (presentation_log_on)
+            fprintf(stderr, "sevo:presentation %p menubar=%s\n", key,
+                    options == NSApplicationPresentationDefault ? "shown" : "autohide");
+    }
+
+    - (void) updatePresentationOptions
+    {
+        [self updatePresentationOptionsForActive:[NSApp isActive]];
     }
 
     - (void) updateFullscreenWindows

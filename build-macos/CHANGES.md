@@ -26,6 +26,11 @@ uses the section for `r<N>` as the GitHub release body.
   D3DMetal D3D12 game read `renderer=wined3d-gl`. wined3d is the answer when the bottle names
   it or names no renderer, or when neither `d3d11.dll` nor `d3d12.dll` is loaded. Found with
   the Black Myth: Wukong benchmark.
+- A game covering the screen with a borderless window keeps the menu bar reachable. The
+  window sat above the status level, where the process's own menu bar (View › Upscaler, Show
+  Frame Rate) could never come in front of it. It stays at the normal level, and while it is
+  key the bar and the Dock auto-hide: the bar slides in when the pointer reaches the top edge.
+  Displays a game captured are covered as before. Found with KAMITSUBAKI CITY REGENERATE.
 
 ## r15
 

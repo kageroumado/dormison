@@ -2029,18 +2029,20 @@ static NSView* wine_content_view_of(NSWindow* window)
         else
             level = NSNormalWindowLevel;
 
+        /* A fullscreen-style window (borderless, covering the screen) keeps the
+           level above while the displays are uncaptured, so the process's own
+           menu bar stays reachable over it: the controller auto-hides the bar
+           while such a window is key, and it slides in at the top edge. Above
+           the status level the bar could never come in front of the game. */
         if (active)
         {
             BOOL captured;
 
             captured = (fullscreen || [self screen]) && [[WineApplicationController sharedController] areDisplaysCaptured];
 
-            if (captured || fullscreen)
+            if (captured)
             {
-                if (captured)
-                    level = CGShieldingWindowLevel() + 1; /* Need +1 or we don't get mouse moves */
-                else
-                    level = NSStatusWindowLevel + 1;
+                level = CGShieldingWindowLevel() + 1; /* Need +1 or we don't get mouse moves */
 
                 if (self.floating)
                     level++;
@@ -3829,6 +3831,8 @@ static NSView* wine_content_view_of(NSWindow* window)
         if (event)
             [self flagsChanged:event];
 
+        [controller updatePresentationOptions];
+
         if (causing_becomeKeyWindow == self) return;
 
         [controller windowGotFocus:self];
@@ -3939,6 +3943,8 @@ static NSView* wine_content_view_of(NSWindow* window)
     - (void)windowDidResignKey:(NSNotification *)notification
     {
         macdrv_event* event;
+
+        [[WineApplicationController sharedController] updatePresentationOptions];
 
         if (causing_becomeKeyWindow) return;
 
