@@ -12,6 +12,11 @@ uses the section for `r<N>` as the GitHub release body.
   `waitOnCommandQueue:` and `signalOnCommandQueue:` to whatever `nextDrawable` returned. The
   presenter's drawable answers both; a leased slot's previous present has already completed,
   so each returns at once. Found in the 2026-09-22 retest, on both of its D3D12 titles.
+- A game whose wineserver has died ends instead of filling the log. Every waiting thread
+  retried its register-wait message against the dead server's port without bound: 27 million
+  `Failed to send server register wait` lines, 7.9 GB, the game at 94 % CPU. A send that
+  reports the server's port gone (`MACH_SEND_INVALID_DEST`) now prints one line and ends the
+  thread, the way the socket path ends it on `EPIPE`; the last thread takes the process down.
 
 ## r15
 

@@ -237,6 +237,19 @@ static inline void drop_wait_interest( void **objs_shm, void *alert_obj_shm, int
         drop_waiter_interest( (struct event *)alert_obj_shm );
 }
 
+/* MACH_SEND_INVALID_DEST from a send to server_port means the server's receive
+ * right is gone: the wineserver process died. The port was looked up once in
+ * msync_init, so no replacement server is reachable from this process, and a
+ * caller that retried would spin on the same error for as long as it lived.
+ * The thread ends the way the socket path ends it when the server closes the
+ * connection (send_request on EPIPE); the last thread takes the process down. */
+static void abort_if_server_gone( mach_msg_return_t mr )
+{
+    if (mr != MACH_SEND_INVALID_DEST) return;
+    ERR( "msync server is gone (the wineserver died); this thread ends\n" );
+    abort_thread( 0 );
+}
+
 static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, const int *objs,
                                 void **objs_shm, int alert_obj, void *alert_obj_shm, int count )
 {
@@ -273,6 +286,7 @@ static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, cons
 
     if (mr != MACH_MSG_SUCCESS)
     {
+        abort_if_server_gone( mr );
         ERR("Failed to send server register wait: %#x\n", mr);
         /* The server never saw this registration, so there is nothing to remove. */
         drop_wait_interest( objs_shm, alert_obj ? alert_obj_shm : NULL, count );
@@ -310,7 +324,10 @@ static inline void server_remove_wait( unsigned int msgh_id, const int *objs, vo
                      0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
 
     if (mr != MACH_MSG_SUCCESS)
+    {
+        abort_if_server_gone( mr );
         ERR("Failed to send server remove wait: %#x\n", mr);
+    }
 }
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -713,7 +730,10 @@ void msync_close( int obj )
                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0);
 
     if (mr != MACH_MSG_SUCCESS)
+    {
+        abort_if_server_gone( mr );
         ERR( "Failed to send message to server to close msync object %d: %#x\n", obj, mr );
+    }
 }
 
 void msync_init(void)
@@ -789,6 +809,7 @@ static inline void signal_all( void *shm, unsigned int shm_idx )
 {
     __thread static mach_msg_header_t send_header;
     struct event *event_obj = (struct event *)shm;
+    mach_msg_return_t mr;
 
     SEVO_STAT( signal_all_calls );
     __ulock_wake( UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL, shm, 0 );
@@ -802,9 +823,13 @@ static inline void signal_all( void *shm, unsigned int shm_idx )
     send_header.msgh_size = sizeof(send_header);
     send_header.msgh_remote_port = server_port;
 
-    if (mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
-                   MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 ) != MACH_MSG_SUCCESS)
+    mr = mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
+                    MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+    if (mr != MACH_MSG_SUCCESS)
+    {
+        abort_if_server_gone( mr );
         SEVO_STAT( signal_all_send_failures );
+    }
 }
 
 NTSTATUS msync_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
