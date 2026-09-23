@@ -283,6 +283,8 @@ typedef struct
 
 static void **shm_addrs;
 static int shm_addrs_size;  /* length of the allocated shm_addrs array */
+/* Object pages the table can name: at 16 bytes an object, 67 million objects on 16 KB pages. */
+#define MSYNC_SHM_PAGES_MAX 65536
 
 static void send_shm_to_client( mach_map_message_t *message )
 {
@@ -596,8 +598,11 @@ void msync_init_shm(void)
 
     pagesize = (long)vm_kernel_page_size;
 
-    shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
-    shm_addrs_size = 128;
+    /* Allocated once and never moved: the pump thread reads it while the main thread adds
+       pages. Untouched entries cost no memory until a page of objects lands there. */
+    shm_addrs = calloc( MSYNC_SHM_PAGES_MAX, sizeof(shm_addrs[0]) );
+    if (!shm_addrs) fatal_error( "msync: no memory for the object page table\n" );
+    shm_addrs_size = MSYNC_SHM_PAGES_MAX;
 
     kr = mach_vm_map( mach_task_self(), (mach_vm_address_t *)&shm_tid_map, shm_tid_size, 0, VM_FLAGS_ANYWHERE,
                       MACH_PORT_NULL, 0, FALSE, VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_SHARE );
@@ -693,16 +698,7 @@ static void *get_shm( unsigned int idx )
     int offset = (idx * 16) % pagesize;
 
     if (entry >= shm_addrs_size)
-    {
-        int new_size = max(shm_addrs_size * 2, entry + 1);
-
-        if (!(shm_addrs = realloc( shm_addrs, new_size * sizeof(shm_addrs[0]) )))
-            fprintf( stderr, "msync: couldn't expand shm_addrs array to size %d\n", entry + 1 );
-
-        memset( shm_addrs + shm_addrs_size, 0, (new_size - shm_addrs_size) * sizeof(shm_addrs[0]) );
-
-        shm_addrs_size = new_size;
-    }
+        fatal_error( "msync: object page %d is past the %d the table holds\n", entry, shm_addrs_size );
 
     if (!shm_addrs[entry])
     {

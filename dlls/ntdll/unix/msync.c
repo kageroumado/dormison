@@ -586,6 +586,8 @@ int do_msync(void)
 static const mach_vm_size_t shm_tid_size = 64 * 1024 * 1024; /* 64 MB to index 24 bit tids */
 static void **shm_addrs;
 static int shm_addrs_size;  /* length of the allocated shm_addrs array */
+/* Object pages the table can name: at 16 bytes an object, 67 million objects on 16 KB pages. */
+#define MSYNC_SHM_PAGES_MAX 65536
 static long pagesize;
 
 typedef struct
@@ -626,7 +628,7 @@ static void *request_shm_from_server( int entry, int tid )
     if (kr != KERN_SUCCESS)
     {
         ERR( "Failed to insert right into reply port: %s\n", mach_error_string( kr ) );
-        mach_port_deallocate( mach_task_self(), reply_port );
+        mach_port_mod_refs( mach_task_self(), reply_port, MACH_PORT_RIGHT_RECEIVE, -1 );
         return NULL;
     }
 
@@ -660,10 +662,14 @@ static void *request_shm_from_server( int entry, int tid )
             ERR( "Failed to map shm entry: %u: %d (%s)\n", receive_message.descriptor.name, kr, mach_error_string( kr ) );
             map_address = 0;
         }
+        /* Only a received reply carries a descriptor; the buffer is this thread's, and after
+           a failed receive it still names the previous call's port. */
+        mach_port_deallocate( mach_task_self(), receive_message.descriptor.name );
     }
 
+    /* The port holds a send right and the receive right: both go. */
     mach_port_deallocate( mach_task_self(), reply_port );
-    mach_port_deallocate( mach_task_self(), receive_message.descriptor.name );
+    mach_port_mod_refs( mach_task_self(), reply_port, MACH_PORT_RIGHT_RECEIVE, -1 );
     return (void *)map_address;
 }
 
@@ -679,19 +685,20 @@ static void *get_shm_slow( unsigned int idx )
 
     if (entry >= shm_addrs_size)
     {
-        int new_size = max(shm_addrs_size * 2, entry + 1);
-
-        if (!(shm_addrs = realloc( shm_addrs, new_size * sizeof(shm_addrs[0]) )))
-            ERR("Failed to grow shm_addrs array to size %d.\n", shm_addrs_size);
-        memset( shm_addrs + shm_addrs_size, 0, (new_size - shm_addrs_size) * sizeof(shm_addrs[0]) );
-        shm_addrs_size = new_size;
+        ERR("Object page %d is past the %d the table holds; the process ends.\n", entry, shm_addrs_size);
+        abort_process( 1 );
     }
 
     if (!shm_addrs[entry])
     {
         void *addr = request_shm_from_server( entry, 0 );
+        /* Every object on the page lives there: without it the caller would read and write
+           at an offset from address zero. */
         if (!addr)
-            ERR("Failed to map page %d (offset %#lx).\n", entry, entry * pagesize);
+        {
+            ERR("Failed to map page %d (offset %#lx); the process ends.\n", entry, entry * pagesize);
+            abort_process( 1 );
+        }
 
         TRACE("Mapping page %d at %p.\n", entry, addr);
 
@@ -840,7 +847,10 @@ void msync_init(void)
     }
 
     if (stat( config_dir, &st ) == -1)
+    {
         ERR("Cannot stat %s\n", config_dir);
+        exit(1);
+    }
 
     if (st.st_ino != (unsigned long)st.st_ino)
         snprintf( message_port_name, 28, "wine-%lx%08lx-msync", (unsigned long)((unsigned long long)st.st_ino >> 32), (unsigned long)st.st_ino );
@@ -849,8 +859,10 @@ void msync_init(void)
 
     pagesize = (long)vm_kernel_page_size;
 
-    shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
-    shm_addrs_size = 128;
+    /* Allocated once and never moved: get_shm reads it without the lock. Untouched entries
+       cost no memory until a page of objects lands there. */
+    shm_addrs = calloc( MSYNC_SHM_PAGES_MAX, sizeof(shm_addrs[0]) );
+    shm_addrs_size = shm_addrs ? MSYNC_SHM_PAGES_MAX : 0;
 
     /* Bootstrap mach wineserver communication */
 
@@ -917,7 +929,8 @@ NTSTATUS msync_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
     do
     {
         current = semaphore->count;
-        if (count + current > semaphore->max)
+        /* Subtracted rather than added: count + current wraps for a count near 2^32. */
+        if (current > (ULONG)semaphore->max || count > (ULONG)semaphore->max - current)
             return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
 
     } while (__sync_val_compare_and_swap( &semaphore->count, current, count + current ) != current);
