@@ -53,6 +53,9 @@ bool right_option_is_alt = false;
 bool left_command_is_ctrl = false;
 bool right_command_is_ctrl = false;
 BOOL allow_software_rendering = FALSE;
+/* Off, a program's tray icon stays in explorer's own tray window rather than
+   becoming a status item in the Mac menu bar. */
+BOOL status_items = TRUE;
 bool allow_immovable_windows = true;
 bool use_confinement_cursor_clipping = true;
 bool cursor_clipping_locks_windows = true;
@@ -381,6 +384,9 @@ static void setup_options(void)
         WARN("Both Command keys have been mapped to Control. There is no way to "
              "send an Alt key to Windows applications. Consider enabling "
              "LeftOptionIsAlt or RightOptionIsAlt.\n");
+
+    if (!get_config_key(hkey, NULL, "StatusItems", buffer, sizeof(buffer)))
+        status_items = IS_OPTION_TRUE(buffer[0]);
 
     if (!get_config_key(hkey, appkey, "AllowSoftwareRendering", buffer, sizeof(buffer)))
         allow_software_rendering = IS_OPTION_TRUE(buffer[0]);

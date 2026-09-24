@@ -251,6 +251,10 @@ LRESULT macdrv_NotifyIcon(HWND hwnd, UINT msg, NOTIFYICONDATAW *data)
     BOOL ret = FALSE;
     struct tray_icon *icon;
 
+    /* -1 hands the call back to explorer, which keeps the icon in its own
+       tray window. */
+    if (!status_items) return -1;
+
     switch (msg)
     {
     case NIM_ADD:

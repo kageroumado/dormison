@@ -87,6 +87,11 @@ uses the section for `r<N>` as the GitHub release body.
   (`ＭＳ ゴシック`, `メイリオ`, `游明朝`, …). A bottle without them laid Arial out at the
   fixed-pitch advances a Gothic face would have, and the text overlapped. Found with
   Wonderful Everyday (BGI.exe).
+- A program's tray icon can stay out of the Mac menu bar. With `Mac Driver\StatusItems=N`
+  the driver declines every tray call, and explorer keeps the icon in its own tray window,
+  which `Explorer\ShowSystray=N` keeps hidden. Sevoflurane sets it in its bottle, so Steam's
+  icon never appears: it showed from the client's start until the app ended explorer once
+  Steam was up.
 
 ## r15
 
