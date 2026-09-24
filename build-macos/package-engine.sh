@@ -1,8 +1,9 @@
 #!/bin/bash
 # Assemble a Sevoflurane engine directory from a wine `make install-lib` staging tree,
 # in the layout the live engine uses. Everything that is not wine itself — the ~95
-# dependency dylibs, the renderer bundles, D3DMetal, gecko/mono, the dock shim — is
-# copied from the live engine, which stays read-only.
+# dependency dylibs, the DXMT and DXVK bundles, gecko/mono, the dock shim — is copied from
+# the live engine, which stays read-only. D3DMetal is not: the app places the user's own
+# copy of Apple's toolkit into each engine it runs.
 #
 # usage: package-engine.sh <version>   e.g. dormison-r1
 #
@@ -69,7 +70,9 @@ done
 
 # --- dependency dylibs, from the live engine (built by MacPorts, not rebuilt here) ---
 find "$LIVE/wine/lib" -maxdepth 1 -name '*.dylib' -exec cp -a {} "$OUT/wine/lib/" \;
-cp -R "$LIVE/wine/lib/external" "$OUT/wine/lib/external"
+# lib/external is where the app places the user's own D3DMetal (Apple's Game Porting
+# Toolkit, which may not be redistributed): the engine ships the folder empty.
+mkdir -p "$OUT/wine/lib/external"
 
 # --- the server, native when build-native-server.sh has built it: it runs no
 # guest code, so it is the one process that need not be translated. Its
@@ -188,7 +191,7 @@ for so in atidxx64 d3d10 d3d11 d3d12 dxgi nvapi64 nvngx-on-metalfx; do
 done
 
 # --- renderer bundles, verbatim ---
-for d in dxmt dxvk d3dmetal; do
+for d in dxmt dxvk; do
     [ -d "$LIVE/$d" ] && cp -R "$LIVE/$d" "$OUT/$d"
 done
 

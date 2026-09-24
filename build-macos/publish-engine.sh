@@ -97,6 +97,14 @@ echo "==> staging $ENGINE_DIR → $STAGE"
 [ ! -e "$STAGE" ] || rm -rf "$STAGE"
 cp -Rp "$ENGINE_DIR" "$STAGE"
 
+# --- Apple's D3DMetal never ships: the Game Porting Toolkit may not be redistributed, and
+# the app places the user's own copy into each engine. An engine directory the app has
+# run carries it, so the staged copy is cleared of it and checked. ---
+rm -rf "$STAGE/d3dmetal" "$STAGE/wine/lib/external/D3DMetal.framework" "$STAGE/wine/lib/external/libd3dshared.dylib"
+if find "$STAGE" \( -name 'D3DMetal*' -o -name 'libd3dshared*' \) -not -type l | grep -q .; then
+    echo "D3DMetal files remain in $STAGE — refusing to pack"; exit 1
+fi
+
 # --- Developer ID: every Mach-O in the staged copy, timestamped ---
 is_macho() {
     local magic
