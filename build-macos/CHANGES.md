@@ -92,6 +92,11 @@ uses the section for `r<N>` as the GitHub release body.
   which `Explorer\ShowSystray=N` keeps hidden. Sevoflurane sets it in its bottle, so Steam's
   icon never appears: it showed from the client's start until the app ended explorer once
   Steam was up.
+- On M3 and later, a D3D12 game with the upscaler on no longer flashes stale frames. D3DMetal's
+  Metal 4 queue presents the drawable itself, and the presenter put the real drawable on screen
+  with its own `present` before the command buffer holding the final pass was committed; a
+  drawable presented that way waits only for work already scheduled, so the screen showed what
+  it last held. It is presented through that buffer now. Found in the 2026-09-25 retest.
 
 ## r15
 

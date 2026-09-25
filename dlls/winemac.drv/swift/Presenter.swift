@@ -1033,8 +1033,14 @@ final class MetalViewPresenter: ViewPresenter {
     /// A present called on the drawable itself rather than on a command
     /// buffer: the chain is encoded into a buffer of the presenter's own,
     /// which nothing orders after the renderer's work. This is the fallback
-    /// for renderers the hook does not see.
-    func presentDirectly(_ proxy: SevoDrawable, presentReal: (CAMetalDrawable) -> Void) {
+    /// for renderers the hook does not see, and the path D3DMetal's Metal 4
+    /// queue takes on M3 and later.
+    ///
+    /// The real drawable is presented through that buffer, never with its own
+    /// `present`: a drawable presented directly waits only for the buffers
+    /// already scheduled, and the final pass that draws it is not yet, so the
+    /// screen showed whatever the drawable last held.
+    func presentDirectly(_ proxy: SevoDrawable, presentReal: (CAMetalDrawable, MTLCommandBuffer) -> Void) {
         guard let queue = fallbackQueue ?? device.makeCommandQueue(), let commandBuffer = queue.makeCommandBuffer() else { return }
         fallbackQueue = queue
         // The renderer's own queue is not this one: without its signal the final pass could
@@ -1044,7 +1050,7 @@ final class MetalViewPresenter: ViewPresenter {
             loggedDirectPresent = true
             log("direct present " + (proxy.readySignal == nil ? "with no signal from the renderer's queue" : "waits for the renderer's signal"))
         }
-        present(proxy, in: commandBuffer, presentReal: presentReal)
+        present(proxy, in: commandBuffer) { real in presentReal(real, commandBuffer) }
         commandBuffer.commit()
     }
 
@@ -1129,15 +1135,15 @@ final class SevoDrawable: NSObject, CAMetalDrawable {
     }
 
     func present() {
-        presenter.presentDirectly(self) { $0.present() }
+        presenter.presentDirectly(self) { real, buffer in buffer.present(real) }
     }
 
     func present(at presentationTime: CFTimeInterval) {
-        presenter.presentDirectly(self) { $0.present(at: presentationTime) }
+        presenter.presentDirectly(self) { real, buffer in buffer.present(real, atTime: presentationTime) }
     }
 
     func present(afterMinimumDuration duration: CFTimeInterval) {
-        presenter.presentDirectly(self) { $0.present(afterMinimumDuration: duration) }
+        presenter.presentDirectly(self) { real, buffer in buffer.present(real, afterMinimumDuration: duration) }
     }
 
     /// What the renderer's queue signals when its work on this drawable is done: set by
