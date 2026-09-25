@@ -1015,7 +1015,7 @@ NTSTATUS msync_release_mutex_obj( int obj, LONG *prev_count )
     if (mutex->tid != GetCurrentThreadId())
         return STATUS_MUTANT_NOT_OWNED;
 
-    if (prev_count) *prev_count = mutex->count;
+    if (prev_count) *prev_count = 1 - mutex->count;
 
     if (!--mutex->count)
     {
