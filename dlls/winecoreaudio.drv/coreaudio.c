@@ -456,14 +456,26 @@ static OSStatus ca_capture_cb(void *user, AudioUnitRenderActionFlags *flags,
     }
 
     if(stream->playing){
+        UINT32 got_frames = list.mBuffers[0].mDataByteSize / stream->fmt->nBlockAlign;
+
         if(list.mBuffers[0].mData == stream->wrap_buffer){
+            BYTE *src = stream->wrap_buffer;
+
+            /* A HAL period longer than the capture ring overruns it within
+             * this one callback: only the newest ring's worth is kept, as an
+             * overrun across callbacks keeps it. */
+            if(got_frames > stream->cap_bufsize_frames){
+                TRACE("dropping %u of %u captured frames\n", got_frames - stream->cap_bufsize_frames, got_frames);
+                src += (got_frames - stream->cap_bufsize_frames) * stream->fmt->nBlockAlign;
+                got_frames = stream->cap_bufsize_frames;
+            }
             ca_wrap_buffer(stream->cap_buffer,
                     cap_wri_offs_frames * stream->fmt->nBlockAlign,
                     stream->cap_bufsize_frames * stream->fmt->nBlockAlign,
-                    stream->wrap_buffer, list.mBuffers[0].mDataByteSize);
+                    src, got_frames * stream->fmt->nBlockAlign);
         }
 
-        stream->cap_held_frames += list.mBuffers[0].mDataByteSize / stream->fmt->nBlockAlign;
+        stream->cap_held_frames += got_frames;
         if(stream->cap_held_frames > stream->cap_bufsize_frames){
             stream->cap_offs_frames += stream->cap_held_frames % stream->cap_bufsize_frames;
             stream->cap_offs_frames %= stream->cap_bufsize_frames;
