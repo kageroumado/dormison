@@ -2074,6 +2074,7 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
     if (previous == hwnd)
     {
         if (prev) *prev = hwnd;
+        ret = TRUE;
         goto done;
     }
 
@@ -2104,9 +2105,13 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
             previous = wine_server_ptr_handle( reply->previous );
     }
     SERVER_END_REQ;
-    if (!ret) return FALSE;
+    if (!ret)
+    {
+        if (!(winflags & WIN_IS_IN_ACTIVATION)) win_set_flags( hwnd, 0, WIN_IS_IN_ACTIVATION );
+        return FALSE;
+    }
     if (prev) *prev = previous;
-    if (previous == hwnd) goto done;
+    if (previous == hwnd) goto clear_flags;
 
     if (hwnd)
     {
@@ -2179,7 +2184,8 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
     }
 
 clear_flags:
-    win_set_flags(hwnd, 0, WIN_IS_IN_ACTIVATION);
+    /* a nested activation leaves the flag to the call that set it */
+    if (!(winflags & WIN_IS_IN_ACTIVATION)) win_set_flags(hwnd, 0, WIN_IS_IN_ACTIVATION);
 
 done:
     if (hwnd)
