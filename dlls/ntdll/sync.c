@@ -852,13 +852,18 @@ struct futex_queue
     ULONGLONG enrollments;
 };
 
-/* One bucket per cache line: two addresses that hash apart should not make their
- * waiters write to the same line. */
-struct DECLSPEC_ALIGN(64) futex_bucket
+/* One bucket per 128 bytes: two addresses that hash apart should not make their
+ * waiters write to the same line. This x86_64 code runs under Rosetta on Apple
+ * silicon, whose cache line is 128 bytes; on x86 it covers the pair of 64-byte
+ * lines the adjacent-line prefetcher fetches together. */
+#define FUTEX_BUCKET_ALIGN 128
+
+struct DECLSPEC_ALIGN(FUTEX_BUCKET_ALIGN) futex_bucket
 {
     struct futex_queue queue;
-    char padding[64 - sizeof(struct futex_queue) % 64];
+    char padding[FUTEX_BUCKET_ALIGN - sizeof(struct futex_queue) % FUTEX_BUCKET_ALIGN];
 };
+C_ASSERT( sizeof(struct futex_bucket) == FUTEX_BUCKET_ALIGN );
 
 static struct futex_bucket futex_buckets[256];
 
