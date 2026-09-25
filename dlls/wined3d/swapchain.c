@@ -101,8 +101,54 @@ void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
     }
 }
 
+/* The Mac driver's presenter shows a window's OpenGL drawable and scales the
+ * picture to the window itself. The driver marks such a window with the first
+ * property; wined3d then puts the back buffer into the drawable at its own
+ * size, top left, and names that size in the second, as MAKELONG(width,
+ * height), for the driver to take only that part: the upscaler starts from
+ * the frame the program drew, at the program's resolution. */
+static const WCHAR presenter_gl_prop[] = L"__wine_sevo_gl_presenter";
+static const WCHAR presenter_source_prop[] = L"__wine_sevo_gl_source";
+
+static void swapchain_gl_publish_presenter_source(struct wined3d_swapchain *swapchain, HWND window, UINT_PTR source)
+{
+    if (swapchain->presenter_source_window == window && swapchain->presenter_source == source)
+        return;
+    if (swapchain->presenter_source && swapchain->presenter_source_window)
+        RemovePropW(swapchain->presenter_source_window, presenter_source_prop);
+    if (source)
+        SetPropW(window, presenter_source_prop, (HANDLE)source);
+    swapchain->presenter_source_window = window;
+    swapchain->presenter_source = source;
+}
+
+/* The destination of a present that stretches the back buffer over a whole
+ * window the presenter shows: the back buffer's own size at the top left. Any
+ * other destination is returned as it is. */
+static const RECT *swapchain_gl_presenter_dst_rect(struct wined3d_swapchain *swapchain,
+        const RECT *src_rect, const RECT *dst_rect, RECT *unscaled)
+{
+    LONG width = src_rect->right - src_rect->left, height = src_rect->bottom - src_rect->top;
+    HWND window = swapchain->win_handle;
+    UINT_PTR source = 0;
+    RECT client;
+
+    if (swapchain->state.desc.windowed && GetPropW(window, presenter_gl_prop)
+            && GetClientRect(window, &client) && EqualRect(dst_rect, &client)
+            && width > 0 && height > 0 && width <= client.right && height <= client.bottom
+            && (width != client.right || height != client.bottom))
+    {
+        SetRect(unscaled, 0, 0, width, height);
+        dst_rect = unscaled;
+        source = MAKELONG(width, height);
+    }
+    swapchain_gl_publish_presenter_source(swapchain, window, source);
+    return dst_rect;
+}
+
 void wined3d_swapchain_gl_cleanup(struct wined3d_swapchain_gl *swapchain_gl)
 {
+    swapchain_gl_publish_presenter_source(&swapchain_gl->s, NULL, 0);
     wined3d_swapchain_cleanup(&swapchain_gl->s);
 }
 
@@ -629,6 +675,7 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
     const struct wined3d_gl_info *gl_info;
     struct wined3d_context_gl *context_gl;
     struct wined3d_context *context;
+    RECT unscaled;
 
     context = context_acquire(swapchain->device, swapchain->front_buffer, 0);
     context_gl = wined3d_context_gl(context);
@@ -659,7 +706,8 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
         if (gl_info->supported[ARB_FRAMEBUFFER_SRGB])
             gl_info->gl_ops.gl.p_glDisable(GL_FRAMEBUFFER_SRGB);
 
-        swapchain_blit(swapchain, context, src_rect, dst_rect);
+        swapchain_blit(swapchain, context, src_rect,
+                swapchain_gl_presenter_dst_rect(swapchain, src_rect, dst_rect, &unscaled));
         if (swapchain->device->context_count > 1)
         {
             WARN_(d3d_perf)("Multiple contexts, calling glFinish() to enforce ordering.\n");

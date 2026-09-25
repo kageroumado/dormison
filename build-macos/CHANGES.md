@@ -24,6 +24,33 @@ uses the section for `r<N>` as the GitHub release body.
   rectangle at the top of the screen: clicks landed up to 33 pt away from the buttons
   (Megabonk). The sequence is read from the 2026-09-22 capture, not reproduced;
   `WINEDEBUG=+macdrv` names each placement the driver now passes on.
+- A movie in an MPEG-1 or MPEG-2 program stream (`.mpg`, `.vob`) plays, with its sound.
+  The engine's GStreamer had the parsers and decoders for both streams but no demuxer for
+  the container, so DirectShow's MPEG-1 splitter and Media Foundation's source both failed
+  on the file: a visual novel's opening movie, which is often such a file played through
+  DirectShow, stayed silent or was skipped. `mpegpsdemux` is now bundled (about 100 KB,
+  nothing new behind it). Found with Wonderful Everyday (BGI) in the 2026-09-22 retest.
+- The upscaler gets a Direct3D 9 game's own frame when the game runs on wined3d (OpenGL) in
+  a window larger than its picture. wined3d stretched the back buffer over the whole client
+  area with a linear filter before the presenter saw it, so a visual novel drawing 800×600
+  into a screen-sized window handed the upscaler a 1728×1117 picture that was already
+  scaled, and View › Upscaler changed nothing visible. A window the presenter shows is now
+  marked (`__wine_sevo_gl_presenter`); wined3d puts the frame into its drawable at the back
+  buffer's size and names that size (`__wine_sevo_gl_source`), and the driver hands the
+  presenter only that part. The `sevo:presenter gl source` line gives the game's own size.
+  Found with Wonderful Everyday (BGI, 32-bit) in the 2026-09-22 retest.
+- A fullscreen game holds the cursor during mouse-look: while the cursor is hidden, a clip
+  to the whole screen the game's window covers keeps it one point inside the edges, where
+  the menu bar and the Dock revealed as the camera turned. Upstream treats a clip covering
+  every screen as no clip, which on Windows changes nothing and on a Mac lets the pointer
+  reach the edges macOS reveals things at. Found with Subnautica 2 and the Wukong benchmark in
+  the 2026-09-25 retests.
+- Unity games built on Mono from 2018.4 to 2020.3 start. Mono's JIT reads a TLS value
+  inline through `%gs`, which on macOS is the pthread TSD, where the TEB's TLS slots read as
+  zero: TABS and Aka Manto faulted on `[null+0x10]` about 170 times and ended in 3–4 s.
+  TlsAlloc now hands out indexes in the expansion array, whose pointer each thread mirrors
+  at `%gs:0x1780`, as CrossOver does. `bispectral/mono-shape/tlsprobe` shows every inlined
+  read matching `TlsGetValue`, where none did.
 
 ## r16
 

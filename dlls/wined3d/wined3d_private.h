@@ -4137,6 +4137,11 @@ struct wined3d_swapchain
     struct wined3d_swapchain_state state;
     HWND win_handle;
     HDC dc;
+
+    /* The window and the size last published as the frame's size for the
+       presenter of a GL drawable; 0 while nothing is. */
+    HWND presenter_source_window;
+    UINT_PTR presenter_source;
 };
 
 void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);

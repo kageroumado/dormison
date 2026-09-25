@@ -126,14 +126,18 @@ done
 # Upstream ships universal binaries and the engine runs x86_64, so each file
 # is thinned on the way in. Install names are already @rpath-relative and the
 # plugins carry an @loader_path/.. rpath, which is why libraries land flat in
-# wine/lib and plugins one directory below it: nothing needs rewriting. ---
+# wine/lib and plugins one directory below it: nothing needs rewriting.
+# mpegpsdemux reads MPEG-1 and MPEG-2 program streams (.mpg, .vob), the
+# movies of DirectShow-era visual novels; the parsers and decoders behind it
+# (mpegvideoparse, mpegaudioparse, mpg123, avdec_mpeg2video) are here for
+# other files already. ---
 GST="$ROOT/gstreamer"
 if [ -d "$GST/lib/gstreamer-1.0" ]; then
     echo "==> GStreamer plugins and libraries"
     GST_PLUGINS="coreelements typefindfunctions audioconvert audioresample \
 videoconvertscale videofilter app playback isomp4 audioparsers videoparsersbad \
 wavparse id3demux avi matroska vpx opus vorbis ogg flac mpg123 theora asf \
-applemedia deinterlace libav"
+mpegpsdemux applemedia deinterlace libav"
     queue=""
     for p in $GST_PLUGINS; do
         f="$GST/lib/gstreamer-1.0/libgst$p.dylib"

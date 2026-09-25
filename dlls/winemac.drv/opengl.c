@@ -97,6 +97,7 @@ struct gl_presented
     GLuint          ring_fbo;
     GLuint          front, back, depth;
     GLuint          ring[SEVO_GL_RING];
+    SIZE            ring_size;      /* of the ring's surfaces: the buffers', or the part wined3d drew */
     BOOL            drawn;
 };
 
@@ -1455,6 +1456,15 @@ static BOOL create_context(struct macdrv_context *context, CGLContextObj share, 
 }
 
 
+/* wined3d's side of a presented drawable (dlls/wined3d/swapchain.c): the
+   driver marks the window with the first property, and wined3d then draws a
+   frame smaller than the client area at its own size, top left, naming that
+   size in the second as MAKELONG(width, height). */
+static const WCHAR presenter_gl_prop[] =
+    {'_','_','w','i','n','e','_','s','e','v','o','_','g','l','_','p','r','e','s','e','n','t','e','r',0};
+static const WCHAR presenter_source_prop[] =
+    {'_','_','w','i','n','e','_','s','e','v','o','_','g','l','_','s','o','u','r','c','e',0};
+
 /**********************************************************************
  *              presented_format
  *
@@ -1491,6 +1501,7 @@ static void presented_init(struct gl_drawable *gl)
     opengl_drawable_map_buffer(&gl->base, GL_RIGHT, 0);
 
     macdrv_view_attach_presenter(client->cocoa_view, presented->presenter);
+    NtUserSetProp(gl->base.client->hwnd, presenter_gl_prop, (HANDLE)1);
     TRACE("drawable %s is the presenter's %p\n", debugstr_opengl_drawable(&gl->base), presented->presenter);
 }
 
@@ -1531,16 +1542,34 @@ static void presented_delete_ring(struct gl_presented *presented)
 {
     funcs->p_glDeleteTextures(SEVO_GL_RING, presented->ring);
     memset(presented->ring, 0, sizeof(presented->ring));
+    presented->ring_size.cx = presented->ring_size.cy = 0;
 }
 
-/* A new ring from the presenter at the buffers' size, each surface wrapped
-   in a rectangle texture. With a context of the share group current. */
-static BOOL presented_create_ring(struct gl_presented *presented, CGLContextObj cglcontext)
+/* The part of the back buffer that holds the frame: the size wined3d names
+   when it drew a smaller frame than the buffers, else the whole buffers. */
+static SIZE presented_source_size(const struct gl_drawable *gl)
+{
+    const struct gl_presented *presented = &gl->presented;
+    UINT_PTR source = (UINT_PTR)NtUserGetProp(gl->base.client->hwnd, presenter_source_prop);
+    SIZE size = presented->size;
+    LONG width = LOWORD(source), height = HIWORD(source);
+
+    if (width >= 1 && height >= 1 && width <= size.cx && height <= size.cy)
+    {
+        size.cx = width;
+        size.cy = height;
+    }
+    return size;
+}
+
+/* A new ring from the presenter at `size`, each surface wrapped in a
+   rectangle texture. With a context of the share group current. */
+static BOOL presented_create_ring(struct gl_presented *presented, SIZE size, CGLContextObj cglcontext)
 {
     int i;
 
     presented_delete_ring(presented);
-    if (!sevo_presenter_gl_resize(presented->presenter, presented->size.cx, presented->size.cy)) return FALSE;
+    if (!sevo_presenter_gl_resize(presented->presenter, size.cx, size.cy)) return FALSE;
 
     funcs->p_glGenTextures(SEVO_GL_RING, presented->ring);
     for (i = 0; i < SEVO_GL_RING; i++)
@@ -1549,7 +1578,7 @@ static BOOL presented_create_ring(struct gl_presented *presented, CGLContextObj 
         CGLError err;
 
         funcs->p_glBindTexture(GL_TEXTURE_RECTANGLE, presented->ring[i]);
-        err = CGLTexImageIOSurface2D(cglcontext, GL_TEXTURE_RECTANGLE, GL_RGBA, presented->size.cx, presented->size.cy,
+        err = CGLTexImageIOSurface2D(cglcontext, GL_TEXTURE_RECTANGLE, GL_RGBA, size.cx, size.cy,
                                      GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, surface, 0);
         if (err != kCGLNoError)
         {
@@ -1558,6 +1587,7 @@ static BOOL presented_create_ring(struct gl_presented *presented, CGLContextObj 
             return FALSE;
         }
     }
+    presented->ring_size = size;
     return TRUE;
 }
 
@@ -1664,12 +1694,16 @@ static void presented_present(struct gl_drawable *gl, BOOL swap, int interval)
     struct gl_presented *presented = &gl->presented;
     LONG width = presented->size.cx, height = presented->size.cy;
     struct presented_saved_state state;
+    SIZE source;
     int slot;
 
     if (!presented->fbo) return;
 
+    source = presented_source_size(gl);
     presented_save_state(&state);
-    if (!presented->ring[0] && !presented_create_ring(presented, CGLGetCurrentContext()))
+    if (presented->ring[0] && (presented->ring_size.cx != source.cx || presented->ring_size.cy != source.cy))
+        presented_delete_ring(presented);
+    if (!presented->ring[0] && !presented_create_ring(presented, source, CGLGetCurrentContext()))
     {
         ERR("drawable %s has no surfaces to present into\n", debugstr_opengl_drawable(&gl->base));
         presented_restore_state(&state);
@@ -1681,7 +1715,9 @@ static void presented_present(struct gl_drawable *gl, BOOL swap, int interval)
     {
         funcs->p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, presented->ring_fbo);
         funcs->p_glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_RECTANGLE, presented->ring[slot], 0);
-        funcs->p_glBlitFramebuffer(0, 0, width, height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        /* The frame is the buffers' top left: rows height - source.cy up to height. */
+        funcs->p_glBlitFramebuffer(0, height - source.cy, source.cx, height, 0, source.cy, source.cx, 0,
+                                   GL_COLOR_BUFFER_BIT, GL_NEAREST);
     }
     else WARN("drawable %s: every surface is in flight, frame dropped\n", debugstr_opengl_drawable(&gl->base));
 
@@ -1732,6 +1768,7 @@ static void presented_destroy(struct gl_drawable *gl)
         CGLReleaseContext(presented->owner);
     }
 
+    NtUserRemoveProp(gl->base.client->hwnd, presenter_gl_prop);
     macdrv_view_detach_presenter(client->cocoa_view, presented->presenter);
     presented->presenter = NULL;
 }
