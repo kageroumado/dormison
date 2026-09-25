@@ -188,15 +188,18 @@ struct semaphore
 };
 C_ASSERT(sizeof(struct semaphore) == 16);
 
+/* signaled and reset_gen together are one 8-byte-aligned 64-bit word, signaled in the
+ * low half; every reset adds one to reset_gen in the same atomic write. */
 struct event
 {
     int signaled;
-    int unused;
+    unsigned int reset_gen;
     unsigned short msync_type;
     unsigned short refcount;
     int multiple_waiters;
 };
 C_ASSERT(sizeof(struct event) == 16);
+C_ASSERT(FIELD_OFFSET(struct event, reset_gen) == sizeof(int));
 
 struct mutex
 {
@@ -965,6 +968,55 @@ NTSTATUS msync_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION *info )
     return STATUS_SUCCESS;
 }
 
+static inline uint64_t *event_word( struct event *event )
+{
+    return (uint64_t *)&event->signaled;
+}
+
+/* Clears the signaled half and counts the reset; returns the previous signaled state. */
+static inline LONG reset_event_word( struct event *event )
+{
+    uint64_t *word = event_word( event );
+    uint64_t current = __atomic_load_n( word, __ATOMIC_SEQ_CST ), reset;
+
+    do reset = (current & 0xffffffff00000000ull) + ((uint64_t)1 << 32);
+    while (!__atomic_compare_exchange_n( word, &current, reset, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
+    return (LONG)(unsigned int)current;
+}
+
+/* Takes a signaled auto event for WaitAll and returns the reset count it was taken at. */
+static inline BOOL take_event_word( struct event *event, unsigned int *gen )
+{
+    uint64_t *word = event_word( event );
+    uint64_t current = __atomic_load_n( word, __ATOMIC_SEQ_CST );
+
+    do if (!(unsigned int)current) return FALSE;
+    while (!__atomic_compare_exchange_n( word, &current, current & 0xffffffff00000000ull, 0,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
+    *gen = current >> 32;
+    return TRUE;
+}
+
+/* Puts back an auto event taken at reset count gen, only while it is still unsignaled
+ * and unreset: a set in between already signaled it, and a reset in between stands. */
+static inline void untake_event_word( struct event *event, unsigned int gen )
+{
+    uint64_t expected = (uint64_t)gen << 32;
+
+    __atomic_compare_exchange_n( event_word( event ), &expected, expected | 1, 0,
+                                 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
+}
+
+/* Returns one count taken from a semaphore, unless releases in between refilled it. */
+static inline void untake_semaphore( struct semaphore *semaphore )
+{
+    int current = __atomic_load_n( &semaphore->count, __ATOMIC_SEQ_CST );
+
+    while (current < semaphore->max &&
+           !__atomic_compare_exchange_n( &semaphore->count, &current, current + 1, 0,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
+}
+
 NTSTATUS msync_set_event_obj( int obj, LONG *prev_state )
 {
     struct event *event = get_shm( obj );
@@ -983,7 +1035,7 @@ NTSTATUS msync_reset_event_obj( int obj, LONG *prev_state )
     struct event *event = get_shm( obj );
     LONG current;
 
-    current = __atomic_exchange_n( &event->signaled, 0, __ATOMIC_SEQ_CST );
+    current = reset_event_word( event );
 
     if (prev_state) *prev_state = current;
 
@@ -1005,7 +1057,7 @@ NTSTATUS msync_pulse_event_obj( int obj, LONG *prev_state )
      * side is the better thing to do... */
     sched_yield();
 
-    __atomic_store_n( &event->signaled, 0, __ATOMIC_SEQ_CST );
+    reset_event_word( event );
 
     if (prev_state) *prev_state = current;
 
@@ -1222,10 +1274,8 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
          *
          * The idea is basically just to wait in sequence on every object in the
          * set. Then when we're done, try to grab them all in a tight loop. If
-         * that fails, release any resources we've grabbed (and yes, we can
-         * reliably do this—it's just mutexes and semaphores that we have to
-         * put back, and in both cases we just put back 1), and if any of that
-         * fails we start over.
+         * that fails, put back what this attempt took (mutexes, semaphores
+         * and auto events) and start over.
          *
          * What makes this inherently bad is that we might temporarily grab a
          * resource incorrectly. Hopefully it'll be quick (and hey, it won't
@@ -1236,7 +1286,14 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
          * were blocking on object B, then B becomes available and someone grabs
          * A before we can, then they might have grabbed A before B became
          * signaled. In either case anyone who tries to wait on A or B will be
-         * waiting for an instant while we put things back. */
+         * waiting for an instant while we put things back.
+         *
+         * The grant has no common serialization point with competing operations:
+         * the readiness scan, the takes and the recheck after them are separate
+         * atomic operations, so WaitAll can grant a set of states that never held
+         * at one instant. Putting back never lifts a semaphore past its maximum or
+         * undoes a reset. The promoted-object authority in
+         * Research/wine-engine/33 section E is the design that closes this. */
 
         NTSTATUS status = STATUS_SUCCESS;
         unsigned int attempts = 0;
@@ -1248,6 +1305,8 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
             /* Bit i is set once this attempt consumed objs[i]; a mutex
              * consumed from the abandoned state also sets was_abandoned. */
             uint64_t taken, was_abandoned;
+            /* The reset count each taken auto event was taken at. */
+            unsigned int taken_gen[MAXIMUM_WAIT_OBJECTS];
 
 tryagain:
             taken = was_abandoned = 0;
@@ -1367,15 +1426,38 @@ tryagain:
                 case MSYNC_AUTO_SERVER:
                 {
                     struct event *event = (struct event *)objs_shm[i];
-                    if (!__sync_val_compare_and_swap( &event->signaled, 1, 0 ))
+                    if (!take_event_word( event, &taken_gen[i] ))
                         goto tooslow;
                     taken |= (uint64_t)1 << i;
                     break;
                 }
                 default:
-                    /* If a manual-reset event changed between there and
-                     * here, it's shouldn't be a problem. */
+                    /* Manual events are rechecked once the takes are done. */
                     break;
+                }
+            }
+
+            /* Every mutex is still ours and every manual event still signaled, or the
+             * attempt is put back. */
+            for (i = 0; i < count; i++)
+            {
+                BOOL held = TRUE;
+
+                switch (((struct event *)objs_shm[i])->msync_type)
+                {
+                case MSYNC_MUTEX:
+                    held = __atomic_load_n( &((struct mutex *)objs_shm[i])->tid, __ATOMIC_SEQ_CST ) == current_tid;
+                    break;
+                case MSYNC_MANUAL_EVENT:
+                case MSYNC_MANUAL_SERVER:
+                    held = __atomic_load_n( &((struct event *)objs_shm[i])->signaled, __ATOMIC_SEQ_CST ) != 0;
+                    break;
+                }
+                if (!held)
+                {
+                    SEVO_STAT( waitall_readiness_failures );
+                    i = count;
+                    goto tooslow;
                 }
             }
 
@@ -1410,23 +1492,20 @@ tooslow:
                 case MSYNC_MUTEX:
                 {
                     struct mutex *mutex = (struct mutex *)objs_shm[i];
-                    int restored = (was_abandoned & ((uint64_t)1 << i)) ? ~0 : 0;
-                    __atomic_store_n( &mutex->tid, restored, __ATOMIC_SEQ_CST );
+                    int restored = (was_abandoned & ((uint64_t)1 << i)) ? ~0 : 0, tid = current_tid;
+                    /* a mutex the server abandoned since the take stays abandoned */
+                    __atomic_compare_exchange_n( &mutex->tid, &tid, restored, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
                     break;
                 }
                 case MSYNC_SEMAPHORE:
                 {
-                    struct semaphore *semaphore = (struct semaphore *)objs_shm[i];
-                    __sync_fetch_and_add( &semaphore->count, 1 );
+                    untake_semaphore( (struct semaphore *)objs_shm[i] );
                     break;
                 }
                 case MSYNC_AUTO_EVENT:
                 case MSYNC_AUTO_SERVER:
-                {
-                    struct event *event = (struct event *)objs_shm[i];
-                    __atomic_store_n( &event->signaled, 1, __ATOMIC_SEQ_CST );
+                    untake_event_word( (struct event *)objs_shm[i], taken_gen[i] );
                     break;
-                }
                 }
                 signal_all( objs_shm[i], objs[i] );
             }

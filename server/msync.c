@@ -818,7 +818,7 @@ struct msync *create_msync( int low, int high, enum msync_type type )
 struct msync_event
 {
     int signaled;
-    int unused;
+    unsigned int reset_gen;  /* with signaled, one 64-bit word; each reset adds one */
     unsigned short msync_type;
     unsigned short refcount;
     int multiple_waiters;
@@ -835,8 +835,12 @@ void msync_set_event( struct msync *msync )
 void msync_reset_event( struct msync *msync )
 {
     struct msync_event *event = get_shm( msync->shm_idx );
+    uint64_t *word = (uint64_t *)&event->signaled;
+    uint64_t current = __atomic_load_n( word, __ATOMIC_SEQ_CST ), reset;
 
-    __atomic_store_n( &event->signaled, 0, __ATOMIC_SEQ_CST );
+    /* the reset count lets a client WaitAll putting back a taken auto event see this reset */
+    do reset = (current & 0xffffffff00000000ull) + ((uint64_t)1 << 32);
+    while (!__atomic_compare_exchange_n( word, &current, reset, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
 }
 
 struct mutex
