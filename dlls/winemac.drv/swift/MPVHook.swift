@@ -133,7 +133,8 @@ final class MPVHookScaler: Scaler {
                     }
                     let state = try device.makeComputePipelineState(function: function)
                     let threads = MTLSize(width: sizes[2], height: sizes[3], depth: 1)
-                    guard threads.width * threads.height <= state.maxTotalThreadsPerThreadgroup else {
+                    let total = threads.width.multipliedReportingOverflow(by: threads.height)
+                    guard !total.overflow, total.partialValue <= state.maxTotalThreadsPerThreadgroup else {
                         log("package \(graph.name) pass \(spec.function): \(threads.width)x\(threads.height) threads exceed \(state.maxTotalThreadsPerThreadgroup)")
                         return nil
                     }
@@ -231,8 +232,8 @@ final class MPVHookScaler: Scaler {
                     encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 0)
                 }
                 let groups = MTLSize(
-                    width: (outputWidth + block.width - 1) / block.width,
-                    height: (outputHeight + block.height - 1) / block.height, depth: 1)
+                    width: Self.blocks(covering: outputWidth, of: block.width),
+                    height: Self.blocks(covering: outputHeight, of: block.height), depth: 1)
                 encoder.dispatchThreadgroups(groups, threadsPerThreadgroup: threads)
                 encoder.endEncoding()
             }
@@ -286,6 +287,12 @@ final class MPVHookScaler: Scaler {
     private static func textureSide(_ value: Float, otherwise fallback: Float) -> Int {
         let side = value.isFinite && value >= 1 && value <= largestTextureSide ? value : fallback
         return Int(min(largestTextureSide, max(1, side.isFinite ? side : 1)).rounded())
+    }
+
+    /// Blocks of `block` pixels that cover `side` pixels. Divides before it adds, so a
+    /// package's block size as large as `Int.max` still answers 1.
+    private static func blocks(covering side: Int, of block: Int) -> Int {
+        side / block + (side % block == 0 ? 0 : 1)
     }
 
     /// mpv's size expressions: reverse Polish over numbers and `NAME.w` /
