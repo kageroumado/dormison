@@ -80,16 +80,19 @@ struct macdrv_context
 };
 
 /* A window drawable the presenter shows. Its buffers are renderbuffers of
-   a framebuffer object, in the context's share group (Apple's OpenGL keeps
-   framebuffer objects there too, so one serves every context sharing with
-   the one that made it). A swap copies the back buffer into an IOSurface of
-   the presenter's ring, top row first, and into the front buffer. The helper
-   framebuffers keep that copy away from the draw and read buffer state of
-   the one the program sees. */
+   a framebuffer object, in the share group of the context that made them
+   current (Apple's OpenGL keeps framebuffer objects there too, so one serves
+   every context sharing with the one that made it). A context of another
+   group that makes the drawable current gets the objects made again in its
+   own. A swap copies the back buffer into an IOSurface of the presenter's
+   ring, top row first, and into the front buffer. The helper framebuffers
+   keep that copy away from the draw and read buffer state of the one the
+   program sees. */
 struct gl_presented
 {
     void           *presenter;      /* sevo_presenter_attach_gl handle; NULL for a drawable on a view */
     CGLContextObj   owner;          /* a context of the share group the objects live in */
+    CGLShareGroupObj group;         /* that share group */
     SIZE            size;           /* of the buffers; 0x0 until a context first needs them */
     GLuint          fbo;            /* front at attachment 0, back at 1, depth and stencil */
     GLuint          front_fbo;
@@ -1591,31 +1594,69 @@ static BOOL presented_create_ring(struct gl_presented *presented, SIZE size, CGL
     return TRUE;
 }
 
+/* Deletes the drawable's objects in a context of their share group made for
+   that: the caller can be a thread with no context, or with one of another
+   group. The presenter's surfaces stay, and so do the frames still reading
+   them; the next present wraps a new ring. */
+static void presented_delete_objects(struct gl_drawable *gl)
+{
+    struct gl_presented *presented = &gl->presented;
+    CGLContextObj previous = CGLGetCurrentContext(), scratch = NULL;
+    GLuint fbos[4] = { presented->fbo, presented->front_fbo, presented->back_fbo, presented->ring_fbo };
+    GLuint buffers[3] = { presented->front, presented->back, presented->depth };
+
+    if (!presented->fbo) return;
+
+    if (CGLCreateContext(CGLGetPixelFormat(presented->owner), presented->owner, &scratch) == kCGLNoError && scratch)
+    {
+        CGLSetCurrentContext(scratch);
+        funcs->p_glDeleteTextures(SEVO_GL_RING, presented->ring);
+        funcs->p_glDeleteFramebuffers(4, fbos);
+        funcs->p_glDeleteRenderbuffers(3, buffers);
+        funcs->p_glFlush();
+        CGLSetCurrentContext(previous);
+        CGLReleaseContext(scratch);
+    }
+    else WARN("no context to delete the objects of drawable %s in\n", debugstr_opengl_drawable(&gl->base));
+    CGLReleaseContext(presented->owner);
+
+    presented->owner = NULL;
+    presented->group = NULL;
+    presented->fbo = presented->front_fbo = presented->back_fbo = presented->ring_fbo = 0;
+    presented->front = presented->back = presented->depth = 0;
+    presented->size.cx = presented->size.cy = 0;
+    memset(presented->ring, 0, sizeof(presented->ring));
+    presented->ring_size.cx = presented->ring_size.cy = 0;
+}
+
 /**********************************************************************
  *              presented_update
  *
  * Makes the drawable's buffers, or gives them the client area's size, with
- * `context` current. A drawable whose objects live in another share group
+ * `context` current. A context outside the share group the objects live in
  * (a core profile context after a legacy one, which cannot share on macOS)
- * keeps them there; that context draws to nothing.
+ * has them deleted there and made again in its own, black like a new
+ * window's; the framebuffer name opengl32 binds for framebuffer 0 follows.
  */
 static void presented_update(struct gl_drawable *gl, struct macdrv_context *context)
 {
     const pixel_format *pf = get_pixel_format(gl->base.format, FALSE);
     struct gl_presented *presented = &gl->presented;
+    CGLShareGroupObj group = CGLGetShareGroup(context->cglcontext);
     struct presented_saved_state state;
     SIZE size = gl->base.virtual_size;
     GLenum depth_format, status;
 
     if (size.cx < 1) size.cx = 1;
     if (size.cy < 1) size.cy = 1;
-    if (presented->fbo && presented->size.cx == size.cx && presented->size.cy == size.cy) return;
 
-    if (presented->fbo && !funcs->p_glIsFramebuffer(presented->fbo))
+    if (presented->fbo && presented->group != group)
     {
-        FIXME("drawable %s belongs to another share group than context %p\n", debugstr_opengl_drawable(&gl->base), context);
-        return;
+        WARN("drawable %s moves from share group %p to %p of context %p\n", debugstr_opengl_drawable(&gl->base),
+             presented->group, group, context);
+        presented_delete_objects(gl);
     }
+    if (presented->fbo && presented->size.cx == size.cx && presented->size.cy == size.cy) return;
 
     presented_save_state(&state);
 
@@ -1624,6 +1665,7 @@ static void presented_update(struct gl_drawable *gl, struct macdrv_context *cont
         GLuint fbos[4], buffers[3];
 
         CGLRetainContext((presented->owner = context->cglcontext));
+        presented->group = group;
         funcs->p_glGenFramebuffers(4, fbos);
         funcs->p_glGenRenderbuffers(3, buffers);
         presented->fbo = fbos[0];
@@ -1693,17 +1735,18 @@ static void presented_present(struct gl_drawable *gl, BOOL swap, int interval)
     struct macdrv_client_surface *client = impl_from_client_surface(gl->base.client);
     struct gl_presented *presented = &gl->presented;
     LONG width = presented->size.cx, height = presented->size.cy;
+    CGLContextObj current = CGLGetCurrentContext();
     struct presented_saved_state state;
     SIZE source;
     int slot;
 
-    if (!presented->fbo) return;
+    if (!presented->fbo || !current || CGLGetShareGroup(current) != presented->group) return;
 
     source = presented_source_size(gl);
     presented_save_state(&state);
     if (presented->ring[0] && (presented->ring_size.cx != source.cx || presented->ring_size.cy != source.cy))
         presented_delete_ring(presented);
-    if (!presented->ring[0] && !presented_create_ring(presented, source, CGLGetCurrentContext()))
+    if (!presented->ring[0] && !presented_create_ring(presented, source, current))
     {
         ERR("drawable %s has no surfaces to present into\n", debugstr_opengl_drawable(&gl->base));
         presented_restore_state(&state);
@@ -1738,9 +1781,8 @@ static void presented_present(struct gl_drawable *gl, BOOL swap, int interval)
     }
 }
 
-/* The drawable's objects are deleted in a context of their share group made
-   for that: the last release can come from a thread with no context, or with
-   one of another group. */
+/* The last release can come from a thread with no context, or with one of
+   another group: presented_delete_objects makes its own. */
 static void presented_destroy(struct gl_drawable *gl)
 {
     struct macdrv_client_surface *client = impl_from_client_surface(gl->base.client);
@@ -1748,25 +1790,7 @@ static void presented_destroy(struct gl_drawable *gl)
 
     if (!presented->presenter) return;
 
-    if (presented->fbo)
-    {
-        CGLContextObj previous = CGLGetCurrentContext(), scratch = NULL;
-        GLuint fbos[4] = { presented->fbo, presented->front_fbo, presented->back_fbo, presented->ring_fbo };
-        GLuint buffers[3] = { presented->front, presented->back, presented->depth };
-
-        if (CGLCreateContext(CGLGetPixelFormat(presented->owner), presented->owner, &scratch) == kCGLNoError && scratch)
-        {
-            CGLSetCurrentContext(scratch);
-            presented_delete_ring(presented);
-            funcs->p_glDeleteFramebuffers(4, fbos);
-            funcs->p_glDeleteRenderbuffers(3, buffers);
-            funcs->p_glFlush();
-            CGLSetCurrentContext(previous);
-            CGLReleaseContext(scratch);
-        }
-        else WARN("no context to delete the objects of drawable %s in\n", debugstr_opengl_drawable(&gl->base));
-        CGLReleaseContext(presented->owner);
-    }
+    presented_delete_objects(gl);
 
     NtUserRemoveProp(gl->base.client->hwnd, presenter_gl_prop);
     macdrv_view_detach_presenter(client->cocoa_view, presented->presenter);
