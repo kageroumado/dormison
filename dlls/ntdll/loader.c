@@ -4125,6 +4125,12 @@ void WINAPI LdrShutdownThread(void)
     }
     RtlProcessFlsData( NtCurrentTeb()->FlsSlots, 2 );
     NtCurrentTeb()->FlsSlots = NULL;
+#ifdef __x86_64__  /* macOS-specific hack */
+    /* The TSD slot the mirror uses is in pthread_key_create's range, so a
+     * freed pointer must not stay behind in it. */
+    if (NtCurrentTeb()->Instrumentation[0])
+        ((TEB *)NtCurrentTeb()->Instrumentation[0])->TlsExpansionSlots = NULL;
+#endif
     RtlFreeHeap( GetProcessHeap(), 0, NtCurrentTeb()->TlsExpansionSlots );
     NtCurrentTeb()->TlsExpansionSlots = NULL;
     RtlReleasePebLock();
@@ -4569,6 +4575,26 @@ static void release_address_space(void)
  * Attach to all the loaded dlls.
  * If this is the first time, perform the full process initialization.
  */
+#if defined(__x86_64__) && !defined(__arm64ec__)
+/* Mono's Windows x64 JIT (Unity 2018.4 to 2020.3) reads a TLS index inline, as
+ * %gs:[0x1480 + 8*i] (TEB->TlsSlots) below 64 and through %gs:[0x1780]
+ * (TEB->TlsExpansionSlots) above. On macOS %gs is the pthread TSD, whose TEB
+ * offsets hold only what is mirrored there (Instrumentation[0] is its base), so
+ * the inline slots read as zero. The expansion array never moves, so it is
+ * allocated up front and its pointer mirrored once per thread, and TlsAlloc is
+ * kept off the 64 inline slots (loader_init). */
+static void mirror_tls_expansion_slots(void)
+{
+    TEB *teb = NtCurrentTeb();
+
+    if (!teb->Instrumentation[0] || teb->WowTebOffset) return;
+    if (!teb->TlsExpansionSlots)
+        teb->TlsExpansionSlots = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY,
+                8 * sizeof(teb->Peb->TlsExpansionBitmapBits) * sizeof(void *) );
+    ((TEB *)teb->Instrumentation[0])->TlsExpansionSlots = teb->TlsExpansionSlots;
+}
+#endif
+
 void loader_init( CONTEXT *context, void **entry )
 {
     OBJECT_ATTRIBUTES staging_event_attr;
@@ -4605,6 +4631,12 @@ void loader_init( CONTEXT *context, void **entry )
         /* TLS index 0 is always reserved, and wow64 reserves extra TLS entries */
         RtlSetBits( peb->TlsBitmap, 0, NtCurrentTeb()->WowTebOffset ? WOW64_TLS_MAX_NUMBER : 1 );
         RtlSetBits( peb->TlsBitmap, NTDLL_TLS_ERRNO, 1 );
+#if defined(__x86_64__) && !defined(__arm64ec__)
+        /* Every TlsAlloc index lands in the expansion array, which
+         * mirror_tls_expansion_slots makes reachable through %gs. */
+        if (NtCurrentTeb()->Instrumentation[0] && !NtCurrentTeb()->WowTebOffset)
+            RtlSetBits( peb->TlsBitmap, 0, TLS_MINIMUM_AVAILABLE );
+#endif
 
         if (!(tls_dirs = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY, tls_module_count * sizeof(*tls_dirs) )))
             NtTerminateProcess( GetCurrentProcess(), STATUS_NO_MEMORY );
@@ -4666,6 +4698,9 @@ void loader_init( CONTEXT *context, void **entry )
         arm64ec_thread_init();
 #endif
 
+#if defined(__x86_64__) && !defined(__arm64ec__)
+        mirror_tls_expansion_slots();
+#endif
         if (NtCurrentTeb()->SkipThreadAttach)
         {
             RtlLeaveCriticalSection( &loader_section );
@@ -4689,6 +4724,9 @@ void loader_init( CONTEXT *context, void **entry )
         NtClose( staging_event );
     }
 
+#if defined(__x86_64__) && !defined(__arm64ec__)
+    mirror_tls_expansion_slots();
+#endif
     NtCurrentTeb()->FlsSlots = fls_alloc_data();
 
     if (!attach_done)  /* first time around */
