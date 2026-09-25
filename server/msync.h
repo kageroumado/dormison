@@ -42,7 +42,7 @@ struct msync
 };
 
 extern struct msync *create_msync( int low, int high, enum msync_type type );
-extern void msync_grab_object( struct msync *msync );
+extern int msync_grab_object( struct msync *msync );
 extern void msync_destroy( struct msync *msync );
 extern void msync_set_event( struct msync *msync );
 extern void msync_reset_event( struct msync *msync );

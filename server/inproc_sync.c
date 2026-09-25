@@ -386,9 +386,12 @@ static int get_obj_inproc_sync( struct object *obj, int *type )
     if (sync->ops == &inproc_sync_ops)
     {
         struct inproc_sync *inproc = (struct inproc_sync *)sync;
-        msync_grab_object( inproc->msync );
-        *type = inproc->type;
-        shm_idx = (int)inproc->msync->shm_idx;
+        if (msync_grab_object( inproc->msync ))
+        {
+            *type = inproc->type;
+            shm_idx = (int)inproc->msync->shm_idx;
+        }
+        else set_error( STATUS_INSUFFICIENT_RESOURCES );
     }
 
     release_object( sync );
@@ -455,7 +458,12 @@ DECL_HANDLER(get_inproc_sync_fd)
 
     reply->access = get_handle_access( current->process, req->handle );
 
-    if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0) set_error( STATUS_NOT_IMPLEMENTED );
+    if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0)
+    {
+        /* the client falls back to the server for NOT_IMPLEMENTED, which an inproc
+           sync that refused another reference cannot serve, so that error is kept */
+        if (get_error() != STATUS_INSUFFICIENT_RESOURCES) set_error( STATUS_NOT_IMPLEMENTED );
+    }
     else
     {
         if (do_msync()) reply->shm_idx = (unsigned int)fd;

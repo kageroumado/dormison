@@ -867,11 +867,20 @@ void msync_abandon_mutexes( thread_id_t tid )
     }
 }
 
-void msync_grab_object( struct msync *msync )
+/* Take one more shared reference for a client. The count is 16 bits wide in the
+   16-byte object layout, so a full count refuses the reference: a wrap to zero
+   would free the index under its live users. */
+int msync_grab_object( struct msync *msync )
 {
     struct msync_shm *obj = get_shm( msync->shm_idx );
+    unsigned short refcount = __atomic_load_n( &obj->refcount, __ATOMIC_SEQ_CST );
 
-    __atomic_fetch_add( &obj->refcount, 1, __ATOMIC_SEQ_CST );
+    do
+    {
+        if (refcount == USHRT_MAX) return 0;
+    } while (!__atomic_compare_exchange_n( &obj->refcount, &refcount, refcount + 1, 0,
+                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
+    return 1;
 }
 
 #else /* __APPLE__ */
