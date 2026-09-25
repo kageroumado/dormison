@@ -86,6 +86,14 @@ gh auth status >/dev/null 2>&1 || { echo "gh is not signed in"; exit 1; }
 gh release view "$VERSION" --repo "$ENGINE_REPO" >/dev/null 2>&1 && { echo "release $VERSION exists on $ENGINE_REPO"; exit 1; }
 [ -e "$TARBALL" ] && { echo "$TARBALL exists — refusing to overwrite"; exit 1; }
 WINE_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["wine"])' "$ENGINE_DIR/engine-info.json")"
+# The build names itself from DORMISON_VERSION or CHANGES.md's top heading
+# (configure.ac, the dlls/ntdll/unix/version.c rule); a build made before that
+# heading was written reports the previous release and is not this one.
+BUILD_ID="$("$ENGINE_DIR/wine/bin/wine" --version 2>/dev/null || true)"
+case "$BUILD_ID" in
+    *"$NAME "*|*"$NAME") ;;
+    *) echo "the engine's wine --version is '$BUILD_ID', expected it to name $NAME — rebuild with DORMISON_VERSION=$NAME or the $VERSION heading in CHANGES.md"; exit 1 ;;
+esac
 
 # --- stage a copy: the installed engine stays what the app runs ---
 # cp reads with read(2). rsync maps each source file, and the kernel kills a

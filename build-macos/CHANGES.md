@@ -3,6 +3,28 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r17
+
+- `wine --version` names the release, `dormison-r17 (Staging)`, where it printed the distance
+  from the last tag (`r15-32-ge4e4545136c` on r16). The build reads the name from
+  `DORMISON_VERSION`, then from the top `## r<N>` heading of this file, and only then from
+  `git describe`. `publish-engine.sh` refuses an engine whose `wine --version` names another
+  release.
+- Music and every other program playing through the same output keep playing while a game
+  does. winecoreaudio shrank the device's IO buffer to each stream's period, and the HAL runs
+  the device at the smallest size any process asks for, so every client rendered more often
+  with less slack; it now only ever grows the size. A stream's volume is a gain on its own
+  AudioUnit, where it was written to the device's volume, which is the Mac's output volume.
+  `SEVO_COREAUDIO_DEVICE_BUFFER=1` restores both device-wide writes, for an A/B; the dropout
+  itself is not yet measured against it.
+- A window the program moves or resizes while it answers a frame change from macOS goes
+  where the program put it. The driver skipped every placement made during that answer, so
+  a Unity game switching to "Fullscreen Window" stayed at the 1728×1084 frame macOS had
+  clamped it to under the menu bar while Wine placed the mouse by the program's 1728×1117
+  rectangle at the top of the screen: clicks landed up to 33 pt away from the buttons
+  (Megabonk). The sequence is read from the 2026-09-22 capture, not reproduced;
+  `WINEDEBUG=+macdrv` names each placement the driver now passes on.
+
 ## r16
 
 - A D3D12 game with the upscaler on no longer ends 6–45 seconds in with "unrecognized

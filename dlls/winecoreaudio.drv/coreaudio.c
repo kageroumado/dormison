@@ -763,6 +763,46 @@ static HRESULT set_device_period_frame_size(AudioDeviceID dev_id, EDataFlow flow
     return S_OK;
 }
 
+/* SEVO_COREAUDIO_DEVICE_BUFFER=1 restores stock winecoreaudio's device-wide writes for an A/B:
+ * a stream sets the device's buffer frame size to its period, and the stream volume is written
+ * to the device's volume controls. */
+static BOOL device_wide_settings(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        const char *value = getenv("SEVO_COREAUDIO_DEVICE_BUFFER");
+        enabled = value && value[0] == '1';
+    }
+    return enabled;
+}
+
+/* The HAL runs a device's IO cycle at the smallest buffer frame size any process asks of it,
+ * so a stream that shrinks it shortens the cycle for every other program playing through the
+ * device: Music renders more often, with less slack, and drops out while a translated game
+ * keeps the CPU busy. A stream therefore only grows the size, which changes nothing for the
+ * other programs; when its period is shorter than the device's cycle, the render callback asks
+ * for more frames at a time and the AudioUnit takes them from the stream's buffer, which holds
+ * several periods. */
+static HRESULT request_device_period_frame_size(AudioDeviceID dev_id, EDataFlow flow,
+                                                unsigned int period_frames)
+{
+    unsigned int current_frames;
+
+    if (device_wide_settings())
+        return set_device_period_frame_size(dev_id, flow, period_frames);
+
+    if (FAILED(get_device_period_frame_size(dev_id, flow, &current_frames)))
+        return S_OK;
+    if (period_frames <= current_frames)
+    {
+        TRACE("device buffer frame size %u covers the period of %u frames\n", current_frames, period_frames);
+        return S_OK;
+    }
+    return set_device_period_frame_size(dev_id, flow, period_frames);
+}
+
 static HRESULT get_device_sample_rate(AudioDeviceID dev_id, EDataFlow flow,
                                       unsigned int *n_samples_per_sec)
 {
@@ -827,7 +867,7 @@ static NTSTATUS unix_create_stream(void *args)
 
     stream->period_frames = max(min_period_frames, min(stream->period_frames, max_period_frames));
     stream->period = muldiv(stream->period_frames, 10000000, stream->fmt->nSamplesPerSec);
-    if (FAILED(params->result = set_device_period_frame_size(stream->dev_id, stream->flow, stream->period_frames)))
+    if (FAILED(params->result = request_device_period_frame_size(stream->dev_id, stream->flow, stream->period_frames)))
         goto end;
 
     stream->bufsize_frames = muldiv(params->duration, stream->fmt->nSamplesPerSec, 10000000);
@@ -1884,10 +1924,8 @@ static NTSTATUS unix_get_prop_value(void *args)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS unix_set_volumes(void *args)
+static void set_device_volumes(struct coreaudio_stream *stream, const struct set_volumes_params *params)
 {
-    struct set_volumes_params *params = args;
-    struct coreaudio_stream *stream = handle_get_stream(params->stream);
     Float32 level = params->master_volume;
     OSStatus sc;
     UINT32 i;
@@ -1913,6 +1951,37 @@ static NTSTATUS unix_set_volumes(void *args)
             WARN("Couldn't set channel #%u volume: %x\n", i, (int)sc);
         }
     }
+}
+
+/* A stream's volume is a gain on its own AudioUnit, so it scales this stream alone; the
+ * device's volume is the Mac's output volume, which Music and every other program play at.
+ * The AUHAL unit has one gain for all channels, so it takes the loudest channel's volume: a
+ * stream that sets its channels to different volumes plays all of them at that one. */
+static NTSTATUS unix_set_volumes(void *args)
+{
+    struct set_volumes_params *params = args;
+    struct coreaudio_stream *stream = handle_get_stream(params->stream);
+    Float32 gain = 0.0f;
+    OSStatus sc;
+    UINT32 i;
+
+    if (device_wide_settings())
+    {
+        set_device_volumes(stream, params);
+        return STATUS_SUCCESS;
+    }
+
+    /* The unit's gain acts on its output element: a capture stream records at the device's level. */
+    if (stream->flow != eRender)
+        return STATUS_SUCCESS;
+
+    for (i = 0; i < stream->fmt->nChannels; ++i)
+        gain = max(gain, params->session_volumes[i] * params->volumes[i]);
+    gain *= params->master_volume;
+
+    sc = AudioUnitSetParameter(stream->unit, kHALOutputParam_Volume, kAudioUnitScope_Global, 0, gain, 0);
+    if (sc != noErr)
+        WARN("Couldn't set the unit's volume: %x\n", (int)sc);
 
     return STATUS_SUCCESS;
 }

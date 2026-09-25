@@ -1646,6 +1646,26 @@ BOOL macdrv_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *styl
 
 
 /***********************************************************************
+ *              frame_change_overridden
+ *
+ * Whether the program answered a Cocoa frame change with a rectangle of its own: its visible
+ * rectangle is not the content rectangle Cocoa reported. A live resize is left to the resize
+ * query, which has already asked the program for its size.
+ */
+static BOOL frame_change_overridden(const macdrv_event *event, const struct window_rects *rects)
+{
+    RECT reported;
+
+    if (event->type != WINDOW_FRAME_CHANGED || event->window_frame_changed.in_resize) return FALSE;
+    reported = rect_from_cgrect(event->window_frame_changed.frame);
+    if (EqualRect(&reported, &rects->visible)) return FALSE;
+    TRACE("Cocoa reported %s, the program placed %s\n", wine_dbgstr_rect(&reported),
+          wine_dbgstr_rect(&rects->visible));
+    return TRUE;
+}
+
+
+/***********************************************************************
  *              WindowPosChanged   (MACDRV.@)
  */
 void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
@@ -1675,11 +1695,15 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
             hide_window(data);
     }
 
-    /* check if we are currently processing an event relevant to this window */
+    /* A position that echoes the Cocoa event being handled is already the Cocoa frame. One the
+       program set instead, from inside its answer to that event, is its own placement and goes
+       to Cocoa like any other: otherwise the window stays where Cocoa put it while Wine places
+       the mouse by the program's rectangle. */
     if (!thread_data || !thread_data->current_event ||
         !data->cocoa_window || thread_data->current_event->window != data->cocoa_window ||
         (thread_data->current_event->type != WINDOW_FRAME_CHANGED &&
-         thread_data->current_event->type != WINDOW_DID_UNMINIMIZE))
+         thread_data->current_event->type != WINDOW_DID_UNMINIMIZE) ||
+        frame_change_overridden(thread_data->current_event, &data->rects))
     {
         sync_window_position(data, swp_flags, &old_rects);
         if (data->cocoa_window)
