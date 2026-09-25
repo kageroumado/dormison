@@ -6967,21 +6967,46 @@ static BOOL is_apple_silicon(void)
 /* CW HACK 18947: a write into another process's code through
    mach_vm_write() is invisible to Rosetta, which keeps executing the
    translation it already has. Dropping and restoring the executable bit on
-   the written pages, from inside the target, makes it translate them again. */
+   the written pages, from inside the target, makes it translate them again.
+   The range is walked region by region so each executable region keeps its
+   own current protection; the temporary one is the same access without
+   execute (PAGE_EXECUTE_READ -> PAGE_READONLY, and so on). */
 static void toggle_executable_pages_for_rosetta( HANDLE process, void *addr, SIZE_T size )
 {
-    MEMORY_BASIC_INFORMATION info;
-    SIZE_T ret;
+    char *ptr = addr, *end = ptr + size;
 
-    if (!is_apple_silicon()) return;
-    if (NtQueryVirtualMemory( process, addr, MemoryBasicInformation, &info, sizeof(info), &ret )) return;
-    if (info.AllocationProtect & 0xf0)
+    if (!size || !is_apple_silicon()) return;
+    while (ptr < end)
     {
-        DWORD origprot, noexec = info.AllocationProtect & ~0xf0;
+        MEMORY_BASIC_INFORMATION info;
+        DWORD prot, noexec, old;
+        char *region_end;
+        void *base;
+        SIZE_T len, ret;
+        NTSTATUS status;
 
-        if (!noexec) noexec = PAGE_NOACCESS;
-        NtProtectVirtualMemory( process, &addr, &size, noexec, &origprot );
-        NtProtectVirtualMemory( process, &addr, &size, origprot, &noexec );
+        if ((status = NtQueryVirtualMemory( process, ptr, MemoryBasicInformation, &info, sizeof(info), &ret )))
+        {
+            WARN( "query %p failed %#x\n", ptr, (int)status );
+            return;
+        }
+        region_end = (char *)info.BaseAddress + info.RegionSize;
+        if (region_end <= ptr) return;
+        if (region_end > end) region_end = end;
+
+        prot = info.Protect;
+        if (info.State == MEM_COMMIT && (prot & 0xf0))
+        {
+            noexec = ((prot & 0xf0) >> 4) | (prot & ~0xff);
+            base = ptr;
+            len = region_end - ptr;
+            if ((status = NtProtectVirtualMemory( process, &base, &len, noexec, &old )))
+                WARN( "%p-%p to %#x failed %#x\n", ptr, region_end, (int)noexec, (int)status );
+            else if ((status = NtProtectVirtualMemory( process, &base, &len, prot, &old )))
+                ERR( "%p-%p left at %#x, restoring %#x failed %#x\n",
+                     base, (char *)base + len, (int)noexec, (int)prot, (int)status );
+        }
+        ptr = region_end;
     }
 }
 #endif
