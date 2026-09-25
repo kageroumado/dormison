@@ -3,6 +3,41 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r18
+
+Fixes from the 2026-09-26 sync, runtime and graphics reviews.
+
+- A write into another process's memory that spans pages with different protections leaves
+  each page's protection as it was. The Rosetta code-invalidation step restored the first
+  page's allocation protection over the whole range, so a data page could lose write access
+  or gain execute. It now walks the range region by region and also invalidates memory that
+  was allocated RW and later made executable.
+- `ReleaseMutex` / `NtReleaseMutant` on an msync mutex reports NT's previous count (-1 at
+  depth two, 0 at depth one), where it reported the recursion depth.
+- WaitForMultipleObjects with WaitAll no longer lifts a semaphore past its maximum or undoes
+  a ResetEvent when it backs out of a partial grant, and it rechecks manual events and
+  mutexes after taking the set. It can still grant a set whose members were never signaled
+  at the same instant; the fix for that is a wineserver-owned commit (research doc 33 §E).
+- A terminated thread's handle is signaled once its Mach thread is gone. wineserver passed
+  the Mach thread port name to `kill()` as a PID, so it could report a live thread dead.
+- An msync object wakes its waiters again when the wake call is interrupted, and an object
+  with 65,535 client references refuses another rather than wrapping its shared count.
+- The TLS slot Mono reads at `%gs:0x1780` is Darwin pthread key 752; ntdll now reserves that
+  key at startup, so a native library can no longer receive it and overwrite the pointer.
+- D3DMetal's module tokens follow the module's reference count, so a toolkit
+  `GetProcAddress` keeps working after one of several `FreeLibrary` calls.
+- Audio capture holds only the newest ring's worth of frames when CoreAudio delivers more
+  than the capture ring holds, where it wrote past the end of the ring.
+- An OpenGL frame the presenter is refreshing can no longer be handed back to the game for
+  drawing, and a window that switches from a legacy to a core-profile context gets new
+  framebuffers in the new context's namespace, where it bound names from the old one.
+- The native FPS overlay counts the presenter's frames once the presenter is the source, as
+  the app and the frame graph do.
+- Activating the window that is already active reports success; the staging import returned
+  an uninitialized value there.
+- An allocation retried after native views are released searches the normal address range;
+  the staging allocator retried over an empty range when no upper limit was given.
+
 ## r17
 
 - `wine --version` names the release, `dormison-r17 (Staging)`, where it printed the distance
