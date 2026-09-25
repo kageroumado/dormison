@@ -386,6 +386,27 @@ int send_thread_signal( struct thread *thread, int sig )
     return (ret != -1);
 }
 
+/* check whether a thread's Mach thread still exists; unix_tid is a thread port
+   name in the client task's namespace, so the right is taken from that task */
+int is_unix_thread_alive( struct thread *thread )
+{
+    mach_port_t process_port = get_process_port( thread->process );
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    mach_msg_type_name_t type;
+    mach_port_t port;
+    kern_return_t ret;
+
+    if (thread->unix_pid == -1 || !process_port) return 0;
+    if (mach_port_extract_right( process_port, thread->unix_tid,
+                                 MACH_MSG_TYPE_COPY_SEND, &port, &type )) return 0;
+    /* the name of an exited thread is a dead name, which extracts as MACH_PORT_DEAD */
+    if (!MACH_PORT_VALID( port )) return 0;
+    ret = thread_info( port, THREAD_BASIC_INFO, (thread_info_t)&info, &count );
+    mach_port_deallocate( mach_task_self(), port );
+    return ret == KERN_SUCCESS;
+}
+
 /* read data from a process memory space */
 int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t size, char *dest )
 {

@@ -470,6 +470,12 @@ static int read_process_memory_ptrace( struct thread *thread, client_ptr_t ptr, 
     return !len;
 }
 
+/* check whether a thread's Unix thread still exists */
+int is_unix_thread_alive( struct thread *thread )
+{
+    return !kill( thread->unix_tid, 0 );
+}
+
 /* read data from a process memory space */
 int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t size, char *dest )
 {

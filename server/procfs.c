@@ -125,6 +125,12 @@ int send_thread_signal( struct thread *thread, int sig )
     return (ret == sizeof(kill));
 }
 
+/* check whether a thread's Unix thread still exists */
+int is_unix_thread_alive( struct thread *thread )
+{
+    return !kill( thread->unix_tid, 0 );
+}
+
 /* read data from a process memory space */
 int read_process_memory( struct process *process, client_ptr_t ptr, size_t size, char *dest )
 {

@@ -1574,7 +1574,7 @@ static void check_terminated( void *arg )
     assert( thread->state == TERMINATED );
 
     /* don't wake up until the thread is really dead, to avoid race conditions */
-    if (thread->unix_tid != -1 && !kill( thread->unix_tid, 0 ))
+    if (thread->unix_tid != -1 && is_unix_thread_alive( thread ))
     {
         thread->exit_poll = add_timeout_user( -TICKS_PER_SEC / 1000, check_terminated, thread );
         return;
