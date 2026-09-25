@@ -26,8 +26,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
+#include <string.h>
 #include <sys/mman.h>
 #ifdef HAVE_SYS_STAT_H
 # include <sys/stat.h>
@@ -61,7 +64,9 @@
 
 #define UL_COMPARE_AND_WAIT_SHARED  0x3
 #define ULF_WAKE_ALL                0x00000100
+#define ULF_NO_ERRNO                0x01000000
 extern int __ulock_wake( uint32_t operation, void *addr, uint64_t wake_value );
+extern int __ulock_wait( uint32_t operation, void *addr, uint64_t value, uint32_t timeout_us );
 
 
 #define MACH_CHECK_ERROR(ret, operation) \
@@ -144,10 +149,18 @@ static inline mach_msg_return_t mach_msg2( mach_msg_header_t *data, uint64_t opt
 
 static mach_port_name_t receive_port;
 
+/* A thread waiting on an object. A plain node is a wait-any registration, woken and
+ * dropped when the object is signaled. NODE_ALL marks a member of a registered WaitAll,
+ * which stays until the pump grants, cancels or removes the whole set; NODE_ALERT marks
+ * that set's alert object, whose signal ends the wait for the APC. */
+#define NODE_ALL   1
+#define NODE_ALERT 2
+
 struct tid_node
 {
     struct tid_node *next;
     int tid;
+    unsigned int flags;
 };
 
 #define MAX_POOL_NODES 0x80000
@@ -223,13 +236,14 @@ static inline struct tid_list *get_tid_list( unsigned int shm_idx )
     return tid_map + shm_idx;
 }
 
-static inline void add_tid( unsigned int shm_idx, int tid )
+static inline void add_tid( unsigned int shm_idx, int tid, unsigned int flags )
 {
     struct tid_node *new_node;
     struct tid_list *list = get_tid_list( shm_idx );
 
     new_node = pool_alloc();
     new_node->tid = tid;
+    new_node->flags = flags;
 
     new_node->next = list->head;
     list->head = new_node;
@@ -260,10 +274,23 @@ static inline void remove_tid( unsigned int shm_idx, int tid )
 static long pagesize;
 static void *get_shm( unsigned int idx );
 
+/* Bits above the 28-bit object index in a registration message's entries; ntdll's msync.c
+ * writes the same ones. */
+#define REGISTER_MUTEX    (1u << 28)  /* on any entry: the object is a mutex */
+#define REGISTER_REMOVE   (1u << 29)  /* on the first entry: the message removes the wait */
+#define REGISTER_WAIT_ALL (1u << 30)  /* on the first entry: the set is a WaitAll */
+#define REGISTER_ALERT    (1u << 31)  /* on an entry of a WaitAll: the thread's alert object */
+
+/* Bits above the object index in a header-only message's id. */
+#define MESSAGE_DESTROY     (1u << 28)  /* a client dropped its reference to the object */
+#define MESSAGE_THREAD_DIED (1u << 29)  /* the id is a thread id; its registration ends */
+
+/* Every object of the set, the alert object, and for a WaitAll the registration's
+ * generation after them. */
 typedef struct
 {
     mach_msg_header_t header;
-    unsigned int shm_idx[MAXIMUM_WAIT_OBJECTS + 1];
+    unsigned int shm_idx[MAXIMUM_WAIT_OBJECTS + 2];
     mach_msg_trailer_t trailer;
 } mach_register_message_t;
 
@@ -355,32 +382,75 @@ static inline void wake_word( int *shm, uint32_t flags )
         fprintf( stderr, "msync: wake of %p failed: %s\n", shm, strerror( errno ) );
 }
 
+/* A thread's word in shm_tid_map while it has a wait registered: a state in the low four
+ * bits and, for a WaitAll, the registration's generation above them. ntdll's msync.c has
+ * the same values and the protocol: the three live values are the client's, a grant or
+ * the alert is written by compare-and-swap from TOKEN_REGISTERED of the registration's
+ * generation, a cancellation by compare-and-swap from any live value, and a terminal
+ * value is never overwritten. A wait-any registration has generation zero; a WaitAll
+ * never does. */
+#define TOKEN_WOKEN              0
+#define TOKEN_REGISTERED         1
+#define ACK_PENDING              2
+#define ACK_PARKED               3
+#define TOKEN_GRANTED            4
+#define TOKEN_GRANTED_ABANDONED  5
+#define TOKEN_CANCELLED          6
+#define TOKEN_ALERTED            7
+#define TOKEN_STATE_MASK         0xf
+#define TOKEN_GENERATION_SHIFT   4
+
+static inline int token_state( int value )
+{
+    return value & TOKEN_STATE_MASK;
+}
+
+static inline int token_live( int value )
+{
+    int state = token_state( value );
+    return state == TOKEN_REGISTERED || state == ACK_PENDING || state == ACK_PARKED;
+}
+
+static inline int make_token( unsigned int generation, int state )
+{
+    return (int)(generation << TOKEN_GENERATION_SHIFT) | state;
+}
+
+/* Moves a registered WaitAll's token to a terminal value; 0 when the thread cancelled
+ * first or the registration is of an earlier generation. */
+static inline int finish_token( int tid, unsigned int generation, int state )
+{
+    int expected = make_token( generation, TOKEN_REGISTERED );
+    return __atomic_compare_exchange_n( shm_tid_map + tid, &expected, make_token( generation, state ), 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
+}
+
+/* Moves a thread's token from a live value to TOKEN_CANCELLED, so no grant can reach it. */
+static inline void cancel_token( int tid )
+{
+    int *token = shm_tid_map + tid, val = __atomic_load_n( token, __ATOMIC_SEQ_CST );
+
+    while (token_live( val ) &&
+           !__atomic_compare_exchange_n( token, &val, (val & ~TOKEN_STATE_MASK) | TOKEN_CANCELLED, 0,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST )) ;
+}
+
+/* Wakes a wait-any waiter: its token returns to TOKEN_WOKEN and it looks at its objects
+ * again. A WaitAll's terminal value stays as it is. */
 static inline void wake_tid( int tid )
 {
-    int *shm = shm_tid_map + tid;
+    int *shm = shm_tid_map + tid, val = __atomic_load_n( shm, __ATOMIC_SEQ_CST );
 
-    __atomic_store_n( shm, 0, __ATOMIC_RELEASE );
+    while (token_live( val ) &&
+           !__atomic_compare_exchange_n( shm, &val, (val & ~TOKEN_STATE_MASK) | TOKEN_WOKEN, 0,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST )) ;
     wake_word( shm, 0 );
 }
 
-static inline void signal_all_internal( unsigned int shm_idx )
-{
-    struct tid_node *current, *temp;
-    struct tid_list *list = get_tid_list( shm_idx );
-
-    current = list->head;
-    list->head = NULL;
-
-    while (current)
-    {
-        wake_tid( current->tid );
-        temp = current;
-        current = current->next;
-        pool_free(temp);
-    }
-}
-
-/* shm layout for msync objects. */
+/* shm layout for msync objects: one 64-bit state word {low, high}, then the type, the
+ * shared reference count and the waiter-interest count. Bit 31 of high is MSYNC_FROZEN,
+ * set only by the pump while it evaluates and commits a WaitAll. Every mutation, here and
+ * in the clients, is one 64-bit compare-and-swap whose expected value has the bit clear. */
 struct msync_shm
 {
     int low;
@@ -389,6 +459,395 @@ struct msync_shm
     unsigned short refcount;
     int multiple_waiters;
 };
+
+#define MSYNC_FROZEN 0x80000000u
+#define MSYNC_MUTEX_RECURSION_MAX 0x7fffffff
+
+static inline uint64_t load_object( const void *obj )
+{
+    return __atomic_load_n( (const uint64_t *)obj, __ATOMIC_SEQ_CST );
+}
+
+static inline int object_low( uint64_t word )
+{
+    return (int)(unsigned int)word;
+}
+
+static inline unsigned int object_high( uint64_t word )
+{
+    return (unsigned int)(word >> 32) & ~MSYNC_FROZEN;
+}
+
+static inline int object_frozen( uint64_t word )
+{
+    return ((unsigned int)(word >> 32) & MSYNC_FROZEN) != 0;
+}
+
+static inline uint64_t make_object( int low, unsigned int high )
+{
+    return ((uint64_t)high << 32) | (unsigned int)low;
+}
+
+static inline int swap_object( void *obj, uint64_t *expected, uint64_t desired )
+{
+    return __atomic_compare_exchange_n( (uint64_t *)obj, expected, desired, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
+}
+
+#define FREEZE_SPIN 8192
+
+#if defined(__aarch64__)
+#define YIELD_PROCESSOR __asm__ __volatile__( "yield" ::: "memory" )
+#elif defined(__x86_64__)
+#define YIELD_PROCESSOR __asm__ __volatile__( "pause" ::: "memory" )
+#else
+#define YIELD_PROCESSOR do {} while (0)
+#endif
+
+/* The main thread's mutations meet a freeze held by the pump thread, which never waits for
+ * anything, so the sleep here is bounded by the pump's evaluation. */
+static uint64_t thawed_object( void *obj, uint64_t word )
+{
+    unsigned int *high = (unsigned int *)obj + 1;
+
+    while (object_frozen( word ))
+    {
+        unsigned int frozen = (unsigned int)(word >> 32);
+        int i, ret;
+
+        for (i = 0; i < FREEZE_SPIN && __atomic_load_n( high, __ATOMIC_ACQUIRE ) == frozen; i++)
+            YIELD_PROCESSOR;
+        if (__atomic_load_n( high, __ATOMIC_ACQUIRE ) == frozen)
+        {
+            do ret = __ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, high, frozen, 0 );
+            while (ret == -EINTR || ret == -EFAULT);
+        }
+        word = load_object( obj );
+    }
+    return word;
+}
+
+/* Only the pump freezes, so the bit is clear whenever it gets here; the swap only has to
+ * beat the clients' mutations. */
+static void freeze_object( struct msync_shm *obj )
+{
+    uint64_t word = load_object( obj );
+
+    while (!object_frozen( word ) &&
+           !swap_object( obj, &word, word | ((uint64_t)MSYNC_FROZEN << 32) )) ;
+}
+
+/* Nothing else writes a frozen object, so the thaw is a store. Every sleeper on the high
+ * word is woken. */
+static void thaw_object( struct msync_shm *obj )
+{
+    uint64_t word = load_object( obj );
+
+    __atomic_store_n( (uint64_t *)obj, word & ~((uint64_t)MSYNC_FROZEN << 32), __ATOMIC_SEQ_CST );
+    wake_word( &obj->high, ULF_WAKE_ALL );
+}
+
+/* A registered WaitAll, held until the pump grants it, its alert fires, or the thread
+ * cancels or dies. */
+struct waitall_reg
+{
+    int tid;
+    unsigned int generation;
+    unsigned int count;   /* members */
+    unsigned int alert;   /* the thread's alert object, or 0 */
+    unsigned int idx[MAXIMUM_WAIT_OBJECTS];
+};
+
+/* Indexed by thread id; a thread has at most one registered wait. */
+static struct waitall_reg **waitall_regs;
+static unsigned int waitall_regs_size;
+
+static struct waitall_reg **waitall_slot( unsigned int tid )
+{
+    if (tid >= waitall_regs_size)
+    {
+        unsigned int size = waitall_regs_size ? waitall_regs_size : 1024;
+        struct waitall_reg **grown;
+
+        while (size <= tid) size *= 2;
+        grown = realloc( waitall_regs, size * sizeof(*grown) );
+        if (!grown) fatal_error( "msync: no memory for %u wait-all registrations\n", size );
+        memset( grown + waitall_regs_size, 0, (size - waitall_regs_size) * sizeof(*grown) );
+        waitall_regs = grown;
+        waitall_regs_size = size;
+    }
+    return waitall_regs + tid;
+}
+
+static struct waitall_reg *waitall_lookup( unsigned int tid )
+{
+    return tid < waitall_regs_size ? waitall_regs[tid] : NULL;
+}
+
+/* Unlinks the registration from every object and forgets it. */
+static void retire_reg( struct waitall_reg *reg )
+{
+    unsigned int i;
+
+    for (i = 0; i < reg->count; i++)
+        remove_tid( reg->idx[i], reg->tid );
+    if (reg->alert) remove_tid( reg->alert, reg->tid );
+    waitall_regs[reg->tid] = NULL;
+    free( reg );
+}
+
+/* Whether every member is available to the waiting thread, read under the freeze. An
+ * object listed more than once needs that many counts, as the wineserver's own WaitAll
+ * takes them one entry at a time. */
+static int reg_satisfiable( const struct waitall_reg *reg, int *abandoned )
+{
+    unsigned int i, j, earlier;
+
+    *abandoned = 0;
+    for (i = 0; i < reg->count; i++)
+    {
+        struct msync_shm *obj = get_shm( reg->idx[i] );
+        uint64_t word = load_object( obj );
+        int low = object_low( word );
+
+        for (j = 0, earlier = 0; j < i; j++)
+            if (reg->idx[j] == reg->idx[i]) earlier++;
+
+        switch (obj->msync_type)
+        {
+        case MSYNC_SEMAPHORE:
+            if ((unsigned int)low <= earlier) return 0;
+            break;
+        case MSYNC_MUTEX:
+            if (low == ~0) *abandoned = 1;
+            else if (low && low != reg->tid) return 0;
+            else if (low == reg->tid && object_high( word ) + earlier >= MSYNC_MUTEX_RECURSION_MAX) return 0;
+            break;
+        default:
+            if (!low) return 0;
+            break;
+        }
+    }
+    return 1;
+}
+
+/* Consumes every member for the waiting thread, under the freeze, after reg_satisfiable. */
+static void reg_commit( const struct waitall_reg *reg )
+{
+    unsigned int i;
+
+    for (i = 0; i < reg->count; i++)
+    {
+        struct msync_shm *obj = get_shm( reg->idx[i] );
+        uint64_t word = load_object( obj ), frozen = word & ((uint64_t)MSYNC_FROZEN << 32);
+        int low = object_low( word );
+
+        switch (obj->msync_type)
+        {
+        case MSYNC_SEMAPHORE:
+            word = make_object( low - 1, object_high( word ) );
+            break;
+        case MSYNC_AUTO_EVENT:
+        case MSYNC_AUTO_SERVER:
+            word = make_object( 0, object_high( word ) );
+            break;
+        case MSYNC_MUTEX:
+            word = make_object( reg->tid, low == reg->tid ? object_high( word ) + 1 : 1 );
+            break;
+        default:
+            continue;
+        }
+        __atomic_store_n( (uint64_t *)obj, word | frozen, __ATOMIC_SEQ_CST );
+    }
+}
+
+static int compare_indices( const void *a, const void *b )
+{
+    unsigned int x = *(const unsigned int *)a, y = *(const unsigned int *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* The union of the sets under evaluation, each object once, and the threads granted. */
+static unsigned int *frozen_set, frozen_capacity;
+static int *granted_tids;
+static unsigned int granted_capacity;
+
+static void *grown( void *array, unsigned int *capacity, unsigned int needed, size_t size )
+{
+    if (*capacity >= needed) return array;
+    while (*capacity < needed) *capacity = *capacity ? *capacity * 2 : 256;
+    array = realloc( array, *capacity * size );
+    if (!array) fatal_error( "msync: no memory for %u wait-all entries\n", *capacity );
+    return array;
+}
+
+/* Evaluates the given registrations together: every member of every set is frozen, each
+ * registration is granted and consumed if its whole set is available at that instant,
+ * oldest first, and the objects are thawed before the granted threads are woken. A
+ * registration whose thread cancelled or died is retired on the way. */
+static void evaluate_regs( const int *tids, unsigned int n )
+{
+    unsigned int i, total = 0, unique = 0, granted = 0;
+
+    for (i = 0; i < n; i++)
+    {
+        struct waitall_reg *reg = waitall_lookup( tids[i] );
+        if (!reg) continue;
+        frozen_set = grown( frozen_set, &frozen_capacity, total + reg->count, sizeof(*frozen_set) );
+        memcpy( frozen_set + total, reg->idx, reg->count * sizeof(*frozen_set) );
+        total += reg->count;
+    }
+    if (!total) return;
+
+    qsort( frozen_set, total, sizeof(*frozen_set), compare_indices );
+    for (i = 0; i < total; i++)
+        if (!unique || frozen_set[unique - 1] != frozen_set[i]) frozen_set[unique++] = frozen_set[i];
+
+    for (i = 0; i < unique; i++) freeze_object( get_shm( frozen_set[i] ) );
+
+    granted_tids = grown( granted_tids, &granted_capacity, n, sizeof(*granted_tids) );
+    for (i = n; i-- > 0;)
+    {
+        struct waitall_reg *reg = waitall_lookup( tids[i] );
+        int abandoned;
+
+        if (!reg) continue;
+        if (__atomic_load_n( shm_tid_map + reg->tid, __ATOMIC_SEQ_CST ) != make_token( reg->generation, TOKEN_REGISTERED ))
+        {
+            retire_reg( reg );
+            continue;
+        }
+        if (!reg_satisfiable( reg, &abandoned )) continue;
+        if (finish_token( reg->tid, reg->generation, abandoned ? TOKEN_GRANTED_ABANDONED : TOKEN_GRANTED ))
+        {
+            reg_commit( reg );
+            granted_tids[granted++] = reg->tid;
+        }
+        retire_reg( reg );
+    }
+
+    for (i = 0; i < unique; i++) thaw_object( get_shm( frozen_set[i] ) );
+    for (i = 0; i < granted; i++) wake_word( shm_tid_map + granted_tids[i], 0 );
+}
+
+/* The alert of a registered WaitAll fired: the wait ends for the APC, unless the set was
+ * granted or cancelled first. */
+static void alert_waitall( int tid )
+{
+    struct waitall_reg *reg = waitall_lookup( tid );
+
+    if (!reg) return;
+    if (finish_token( tid, reg->generation, TOKEN_ALERTED )) wake_word( shm_tid_map + tid, 0 );
+    retire_reg( reg );
+}
+
+/* Registers a WaitAll set and evaluates it once. The acknowledgment moves the token to
+ * TOKEN_REGISTERED before the evaluation, so a grant is a compare-and-swap from there
+ * like every later one; a thread that already cancelled, or moved on to a later
+ * registration, is not registered. The last entry is the generation. */
+static void register_waitall( mach_register_message_t *message, unsigned int tid, unsigned int count )
+{
+    struct waitall_reg *reg = malloc( sizeof(*reg) ), **slot;
+    int *token = shm_tid_map + tid, expected, registered, parked = 0, tids[1];
+    unsigned int i;
+
+    if (!reg) fatal_error( "msync: no memory for a wait-all registration\n" );
+    reg->tid = tid;
+    reg->generation = message->shm_idx[--count];
+    reg->count = 0;
+    reg->alert = 0;
+    for (i = 0; i < count; i++)
+    {
+        unsigned int idx = message->shm_idx[i] & ~(REGISTER_MUTEX | REGISTER_REMOVE | REGISTER_WAIT_ALL);
+        if (idx & REGISTER_ALERT) reg->alert = idx & ~REGISTER_ALERT;
+        else reg->idx[reg->count++] = idx;
+    }
+
+    registered = make_token( reg->generation, TOKEN_REGISTERED );
+    expected = make_token( reg->generation, ACK_PENDING );
+    if (!__atomic_compare_exchange_n( token, &expected, registered, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
+    {
+        expected = make_token( reg->generation, ACK_PARKED );
+        if (!__atomic_compare_exchange_n( token, &expected, registered, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
+        {
+            free( reg );
+            return;
+        }
+        parked = 1;
+    }
+
+    if (reg->alert && __atomic_load_n( &((struct msync_shm *)get_shm( reg->alert ))->low, __ATOMIC_SEQ_CST ))
+    {
+        if (finish_token( tid, reg->generation, TOKEN_ALERTED )) wake_word( token, 0 );
+        free( reg );
+        return;
+    }
+
+    slot = waitall_slot( tid );
+    if (*slot)
+    {
+        fprintf( stderr, "msync: warn: thread %04x registers a wait-all over one still registered\n", tid );
+        retire_reg( *slot );
+    }
+    *slot = reg;
+    for (i = 0; i < reg->count; i++) add_tid( reg->idx[i], tid, NODE_ALL );
+    if (reg->alert) add_tid( reg->alert, tid, NODE_ALL | NODE_ALERT );
+
+    tids[0] = tid;
+    evaluate_regs( tids, 1 );
+
+    /* Still registered: a thread asleep on the acknowledgment can move to its token. */
+    if (parked && *slot == reg) wake_word( token, 0 );
+}
+
+/* The threads a signal found on an object's list, by kind. */
+static int *alert_tids, *all_tids, *any_tids;
+static unsigned int alert_capacity, all_capacity, any_capacity;
+
+/* An object was signaled. Registered WaitAll sets that list it are evaluated first, as
+ * ntsync does, then every wait-any waiter is woken to look again. */
+static inline void signal_all_internal( unsigned int shm_idx )
+{
+    struct tid_list *list = get_tid_list( shm_idx );
+    struct tid_node *node, *next, **link = &list->head;
+    unsigned int i, n_alert = 0, n_all = 0, n_any = 0;
+
+    for (node = list->head; node; node = next)
+    {
+        next = node->next;
+        if (node->flags & NODE_ALERT)
+        {
+            alert_tids = grown( alert_tids, &alert_capacity, n_alert + 1, sizeof(*alert_tids) );
+            alert_tids[n_alert++] = node->tid;
+        }
+        else if (node->flags & NODE_ALL)
+        {
+            all_tids = grown( all_tids, &all_capacity, n_all + 1, sizeof(*all_tids) );
+            all_tids[n_all++] = node->tid;
+        }
+        else
+        {
+            any_tids = grown( any_tids, &any_capacity, n_any + 1, sizeof(*any_tids) );
+            any_tids[n_any++] = node->tid;
+            *link = next;
+            pool_free( node );
+            continue;
+        }
+        link = &node->next;
+    }
+
+    for (i = 0; i < n_alert; i++) alert_waitall( alert_tids[i] );
+    if (n_all) evaluate_regs( all_tids, n_all );
+    for (i = 0; i < n_any; i++) wake_tid( any_tids[i] );
+}
+
+static void thread_died_internal( unsigned int tid )
+{
+    struct waitall_reg *reg = waitall_lookup( tid );
+
+    cancel_token( tid );
+    if (reg) retire_reg( reg );
+}
 
 /* The highest index ever handed out; a new object with no freed slot to reuse goes above it. */
 static unsigned int highest_allocated_idx = 1;
@@ -456,11 +915,11 @@ static inline void destroy_all_internal( unsigned int shm_idx )
  * thread-safe sequentially consistent guarantees relative to register/unregister
  * client-side are made by the mach messaging queue
  */
-static inline mach_msg_return_t destroy_all( unsigned int shm_idx )
+static inline mach_msg_return_t send_header_message( unsigned int msgh_id )
 {
     static mach_msg_header_t send_header;
     send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
-    send_header.msgh_id = shm_idx | (1 << 28);
+    send_header.msgh_id = msgh_id;
     send_header.msgh_size = sizeof(send_header);
     send_header.msgh_remote_port = receive_port;
 
@@ -468,22 +927,20 @@ static inline mach_msg_return_t destroy_all( unsigned int shm_idx )
                 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0);
 }
 
+static inline mach_msg_return_t destroy_all( unsigned int shm_idx )
+{
+    return send_header_message( shm_idx | MESSAGE_DESTROY );
+}
+
 static inline mach_msg_return_t signal_all( unsigned int shm_idx, int *shm )
 {
-    static mach_msg_header_t send_header;
     struct msync_shm *obj = (struct msync_shm *)shm;
 
     wake_word( shm, ULF_WAKE_ALL );
     if (!__atomic_load_n( &obj->multiple_waiters, __ATOMIC_SEQ_CST ))
         return MACH_MSG_SUCCESS;
 
-    send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
-    send_header.msgh_id = shm_idx;
-    send_header.msgh_size = sizeof(send_header);
-    send_header.msgh_remote_port = receive_port;
-
-    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
-                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
+    return send_header_message( shm_idx );
 }
 
 static inline mach_msg_return_t receive_mach_msg( mach_register_message_t *buffer )
@@ -537,17 +994,20 @@ static void *mach_message_pump( void *args )
         }
 
         /*
-         * A message with no body is a signal_all or destroy_all operation where the shm_idx
-         * is the msgh_id and the type of operation is decided by the 29th bit.
-         * (The shared memory index is only a 28-bit integer at max)
-         * See signal_all( unsigned int shm_idx ) and destroy_all( unsigned int shm_idx )above.
+         * A message with no body is a signal_all, destroy_all or thread-death operation:
+         * the shm_idx (or the thread id) is the msgh_id and the operation is decided by
+         * bits 28 and 29. (The shared memory index is only a 28-bit integer at max.)
          */
         if (receive_message.header.msgh_size == sizeof(mach_msg_header_t))
         {
-            if (check_bit( 28, (unsigned int *)&receive_message.header.msgh_id ))
-                destroy_all_internal( receive_message.header.msgh_id );
+            unsigned int id = receive_message.header.msgh_id;
+
+            if (check_bit( 29, &id ))
+                thread_died_internal( id );
+            else if (check_bit( 28, &id ))
+                destroy_all_internal( id );
             else
-                signal_all_internal( receive_message.header.msgh_id );
+                signal_all_internal( id );
             continue;
         }
 
@@ -555,13 +1015,21 @@ static void *mach_message_pump( void *args )
          * Finally server_register_wait and server_unregister_wait
          */
         decode_msgh_id( receive_message.header.msgh_id, &tid, &count );
+        if (check_bit( 29, receive_message.shm_idx ))
+        {
+            struct waitall_reg *reg = waitall_lookup( tid );
+
+            if (reg) retire_reg( reg );
+            else unregister_wait( &receive_message, tid, count );
+            continue;
+        }
+        if (check_bit( 30, receive_message.shm_idx ))
+        {
+            register_waitall( &receive_message, tid, count );
+            continue;
+        }
         for (i = 0; i < count; i++)
         {
-            if (i == 0 && check_bit( 29, receive_message.shm_idx + i ))
-            {
-                unregister_wait( &receive_message, tid, count );
-                break;
-            }
             is_mutex = check_bit( 28, receive_message.shm_idx + i );
             obj = get_shm( receive_message.shm_idx[i] );
             val = __atomic_load_n( &obj->low, __ATOMIC_SEQ_CST );
@@ -571,13 +1039,22 @@ static void *mach_message_pump( void *args )
                 wake_tid( tid );
                 break;
             }
-            add_tid( receive_message.shm_idx[i], tid );
+            add_tid( receive_message.shm_idx[i], tid, 0 );
             if (i == count - 1)
             {
                 /* The client can stop spinning and safely start waiting now; one that
-                 * has parked on the acknowledgment (3, ACK_PARKED in ntdll) needs the wake. */
-                if (__atomic_exchange_n( shm_tid_map + tid, 1, __ATOMIC_SEQ_CST ) == 3)
-                    wake_word( shm_tid_map + tid, 0 );
+                 * has parked on the acknowledgment (ACK_PARKED in ntdll) needs the wake.
+                 * A token that is neither is a later registration's and stays. */
+                int expected = ACK_PENDING;
+
+                if (!__atomic_compare_exchange_n( shm_tid_map + tid, &expected, TOKEN_REGISTERED, 0,
+                                                  __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
+                {
+                    expected = ACK_PARKED;
+                    if (__atomic_compare_exchange_n( shm_tid_map + tid, &expected, TOKEN_REGISTERED, 0,
+                                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
+                        wake_word( shm_tid_map + tid, 0 );
+                }
             }
         }
     }
@@ -694,7 +1171,9 @@ void msync_init(void)
 
     MACH_CHECK_ERROR(mach_port_insert_right(mach_task_self(), receive_port, receive_port, MACH_MSG_TYPE_MAKE_SEND), "mach_port_insert_right");
 
-    limits.mpl_qlimit = 50;
+    /* Every WaitAll is a message and a signal on an object with a registered waiter is
+     * one more; a sender blocks while the queue is full. */
+    limits.mpl_qlimit = MACH_PORT_QLIMIT_LARGE;
 
     if (getenv("WINEMSYNC_QLIMIT"))
         limits.mpl_qlimit = atoi(getenv("WINEMSYNC_QLIMIT"));
@@ -791,8 +1270,7 @@ static unsigned int msync_alloc_shm( int low, int high, enum msync_type type )
     }
 
     assert(shm);
-    shm->low = low;
-    shm->high = high;
+    __atomic_store_n( (uint64_t *)shm, make_object( low, high ), __ATOMIC_SEQ_CST );
     shm->msync_type = type;
     shm->multiple_waiters = 0;
     __atomic_store_n( &shm->refcount, 1, __ATOMIC_SEQ_CST );
@@ -814,59 +1292,56 @@ struct msync *create_msync( int low, int high, enum msync_type type )
     return msync;
 }
 
-/* shm layout for events or event-like objects. */
-struct msync_event
-{
-    int signaled;
-    unsigned int reset_gen;  /* with signaled, one 64-bit word; each reset adds one */
-    unsigned short msync_type;
-    unsigned short refcount;
-    int multiple_waiters;
-};
-
 void msync_set_event( struct msync *msync )
 {
-    struct msync_event *event = get_shm( msync->shm_idx );
+    struct msync_shm *event = get_shm( msync->shm_idx );
+    uint64_t word = load_object( event );
 
-    if (!__atomic_exchange_n( &event->signaled, 1, __ATOMIC_SEQ_CST ))
-        signal_all( msync->shm_idx, (int *)event );
+    for (;;)
+    {
+        word = thawed_object( event, word );
+        if (object_low( word )) return;
+        if (swap_object( event, &word, make_object( 1, object_high( word ) ) )) break;
+    }
+    signal_all( msync->shm_idx, (int *)event );
 }
 
 void msync_reset_event( struct msync *msync )
 {
-    struct msync_event *event = get_shm( msync->shm_idx );
-    uint64_t *word = (uint64_t *)&event->signaled;
-    uint64_t current = __atomic_load_n( word, __ATOMIC_SEQ_CST ), reset;
+    struct msync_shm *event = get_shm( msync->shm_idx );
+    uint64_t word = load_object( event );
 
-    /* the reset count lets a client WaitAll putting back a taken auto event see this reset */
-    do reset = (current & 0xffffffff00000000ull) + ((uint64_t)1 << 32);
-    while (!__atomic_compare_exchange_n( word, &current, reset, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
+    for (;;)
+    {
+        word = thawed_object( event, word );
+        if (!object_low( word )) return;
+        if (swap_object( event, &word, make_object( 0, object_high( word ) ) )) return;
+    }
 }
-
-struct mutex
-{
-    int tid;
-    int count;  /* recursion count */
-    unsigned short msync_type;
-    unsigned short refcount;
-    int multiple_waiters;
-};
 
 void msync_abandon_mutexes( thread_id_t tid )
 {
     struct msync *msync;
 
+    /* A WaitAll the thread had registered ends now, before any mutex it held is released
+     * to the pump's evaluation, so the pump cannot grant a set to a thread that is gone. */
+    cancel_token( tid );
+    send_header_message( tid | MESSAGE_THREAD_DIED );
+
     LIST_FOR_EACH_ENTRY( msync, &mutex_list, struct msync, mutex_entry )
     {
-        struct mutex *mutex = get_shm( msync->shm_idx );
+        struct msync_shm *mutex = get_shm( msync->shm_idx );
+        uint64_t word = load_object( mutex );
 
-        if (mutex->tid == tid)
+        for (;;)
         {
+            word = thawed_object( mutex, word );
+            if (object_low( word ) != tid) break;
+            if (!swap_object( mutex, &word, make_object( ~0, 0 ) )) continue;
             if (debug_level)
                 fprintf( stderr, "msync_abandon_mutexes() idx=%d\n", msync->shm_idx );
-            mutex->tid = ~0;
-            mutex->count = 0;
-            signal_all ( msync->shm_idx, (int *)mutex );
+            signal_all( msync->shm_idx, (int *)mutex );
+            break;
         }
     }
 }

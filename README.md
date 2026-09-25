@@ -97,8 +97,8 @@ Wine 11.0 with CodeWeavers' patches and no wine-staging.
 
 **Taken from CrossOver**
 - msync, with fixes CrossOver 26.3 lacks:
-  - WaitAll puts back what it took without overfilling a semaphore or
-    undoing a reset, and it rechecks the set after taking it.
+  - WaitAll is granted by wineserver under a freeze of the whole set, so a
+    grant is a set that was whole at one instant and is consumed once.
   - WaitAll reports an abandoned mutex.
   - `NtReleaseMutant` reports NT's previous count.
   - Freed object indexes are reused from a stack.
@@ -173,9 +173,7 @@ raw displacement when the program holds the cursor for mouse-look.
 
 Dormison includes CrossOver's msync implementation, which synchronizes in
 process through shared memory, `__ulock` waits and a Mach port to wineserver
-(`WINEMSYNC=1`). It is maintained as commits on `main`. One limit is known:
-WaitAll can grant a set whose objects were never all signaled at the same
-instant. [KNOWN-ISSUES.md](KNOWN-ISSUES.md) tracks it. Rosetta workarounds cover
+(`WINEMSYNC=1`). It is maintained as commits on `main`. Rosetta workarounds cover
 32-to-64-bit transitions, written executable code and signal contexts.
 The transition uses `lretq`, and signal handling preserves the thread's
 MXCSR state.

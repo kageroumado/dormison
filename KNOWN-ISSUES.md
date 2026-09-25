@@ -33,16 +33,15 @@ launched by Steam in the game's place initializes in 0.4 s on a server where the
 msync, the loader, the environment, the save. Record: the `astra-huniepop-*` documents in the
 app repository's `Docs/`. If it comes up black, quit and try again later.
 
-## WaitForMultipleObjects with WaitAll can succeed on a set that was never all signaled — msync, every release
+## WaitForMultipleObjects with WaitAll can succeed on a set that was never all signaled — msync, r17 and earlier, fixed in r18
 
-With `WINEMSYNC=1`, WaitAll checks each object and then takes each one. Nothing orders those
+With `WINEMSYNC=1`, WaitAll checked each object and then took each one. Nothing ordered those
 steps against other threads' SetEvent, ResetEvent and ReleaseSemaphore calls, so two manual
-events that are signaled one at a time, never together, can satisfy it. A synthetic fixture
-counts 4–13 such grants per 20,000 contended waits, and ordinary wineserver sync counts none.
-Since r18 a WaitAll that backs out no longer overfills a semaphore or undoes a reset. No game
-is known to fail from this. To rule it out for a suspect game, set `WINEMSYNC=0` in the
-bottle's `bottle.env`. A program's own settings file cannot change the sync mode. The fix,
-which is designed but not built, has wineserver commit the whole set.
+events that are signaled one at a time, never together, could satisfy it. A synthetic fixture
+counts 4–13 such grants per 20,000 contended waits on r17 and none on r18, where wineserver
+freezes the whole set, grants it only when it is whole at one instant and consumes it itself.
+No game is known to have failed from this. On an earlier engine, `WINEMSYNC=0` in the
+bottle's `bottle.env` rules it out for a suspect game.
 
 ## Where else
 

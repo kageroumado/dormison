@@ -14,10 +14,17 @@ Fixes from the 2026-09-26 sync, runtime and graphics reviews.
   was allocated RW and later made executable.
 - `ReleaseMutex` / `NtReleaseMutant` on an msync mutex reports NT's previous count (-1 at
   depth two, 0 at depth one), where it reported the recursion depth.
-- WaitForMultipleObjects with WaitAll no longer lifts a semaphore past its maximum or undoes
-  a ResetEvent when it backs out of a partial grant, and it rechecks manual events and
-  mutexes after taking the set. It can still grant a set whose members were never signaled
-  at the same instant; the fix for that is a wineserver-owned commit (research doc 33 §E).
+- WaitForMultipleObjects with WaitAll on msync is granted by wineserver: the set is
+  registered with the server's pump, which freezes every member (bit 31 of the object's
+  high word, which every fast path's compare-and-swap now respects), grants the set only
+  when all of it is available at that instant, consumes it itself and wakes the one thread
+  it went to. The client no longer takes members one at a time and puts them back, so a
+  WaitAll can no longer succeed on a set that was never all signaled (`waitall-phantom`
+  measured 4–13 such grants per 20 000 waits on every earlier release), a semaphore or event
+  is never consumed by a wait that then fails, and a contended WaitAll costs one wake per
+  grant where each signal used to wake every waiter parked on the object. A poll whose set
+  visibly lacks a member is refused without the round trip. A thread's registration ends
+  with the thread: wineserver cancels it before it abandons the thread's mutexes.
 - A terminated thread's handle is signaled once its Mach thread is gone. wineserver passed
   the Mach thread port name to `kill()` as a PID, so it could report a live thread dead.
 - An msync object wakes its waiters again when the wake call is interrupted, and an object

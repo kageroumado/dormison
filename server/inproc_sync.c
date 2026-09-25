@@ -269,7 +269,7 @@ struct inproc_sync *create_inproc_internal_sync( int manual, int signaled )
 
     if (!(event = alloc_object( &inproc_sync_ops ))) return NULL;
     event->type = INPROC_SYNC_INTERNAL;
-    event->msync = create_msync( signaled, 0xdeadbeef, manual ? MSYNC_MANUAL_SERVER : MSYNC_AUTO_SERVER );
+    event->msync = create_msync( signaled, 0, manual ? MSYNC_MANUAL_SERVER : MSYNC_AUTO_SERVER );
 
     if (!event->msync)
     {
@@ -286,7 +286,7 @@ struct inproc_sync *create_inproc_event_sync( int manual, int signaled )
 
     if (!(event = alloc_object( &inproc_sync_ops ))) return NULL;
     event->type = INPROC_SYNC_EVENT;
-    event->msync = create_msync( signaled, 0xdeadbeef, manual ? MSYNC_MANUAL_EVENT : MSYNC_AUTO_EVENT );
+    event->msync = create_msync( signaled, 0, manual ? MSYNC_MANUAL_EVENT : MSYNC_AUTO_EVENT );
 
     if (!event->msync)
     {

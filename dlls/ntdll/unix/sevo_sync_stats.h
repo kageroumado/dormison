@@ -59,11 +59,13 @@
     X(signal_all_messages)      /* ... followed by a message to the pump */ \
     X(signal_all_send_failures) \
     X(waitall_calls) \
-    X(waitall_attempts)         /* passes through tryagain */ \
-    X(waitall_readiness_failures) /* second look found an object gone */ \
-    X(waitall_rollbacks)        /* acquisition failed part way */ \
-    X(waitall_rolled_objects)   /* objects taken and put back, summed */ \
-    X(waitall_successes)
+    X(waitall_polls_refused)    /* polls answered here because a member was visibly missing */ \
+    X(waitall_registrations)    /* sets sent to the pump */ \
+    X(waitall_grants)           /* sets the pump granted and consumed */ \
+    X(waitall_cancels)          /* registrations this side cancelled at the deadline */ \
+    X(waitall_stale_wakes)      /* wakes that carried no verdict, registered again */ \
+    X(freeze_waits)             /* mutations that met a frozen object */ \
+    X(freeze_parks)             /* ... and slept on its high word */
 
 enum sevo_sync_counter
 {

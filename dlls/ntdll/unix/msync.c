@@ -178,6 +178,15 @@ static inline mach_msg_return_t mach_msg2( mach_msg_header_t *data, uint64_t opt
 #undef MACH_MSG2_SHIFT_ARGS
 }
 
+/* Every object is 16 bytes: one 64-bit state word, then the type, the shared reference
+ * count and the waiter-interest count. The low half of the word is the semaphore count,
+ * the event's signaled flag or the mutex owner; the high half is the semaphore maximum,
+ * zero for an event, or the mutex recursion depth. Bit 31 of the high half is MSYNC_FROZEN:
+ * the wineserver's pump sets it on every member of a WaitAll set while it evaluates and
+ * consumes the set, and nothing else ever holds it. Every mutation here is one 64-bit
+ * compare-and-swap whose expected value has the bit clear, so a frozen object cannot move
+ * under the pump, and a mutation that meets the bit sleeps until the thaw. A client never
+ * sets the bit, so a client that dies leaves nothing frozen. */
 struct semaphore
 {
     int count;
@@ -188,18 +197,16 @@ struct semaphore
 };
 C_ASSERT(sizeof(struct semaphore) == 16);
 
-/* signaled and reset_gen together are one 8-byte-aligned 64-bit word, signaled in the
- * low half; every reset adds one to reset_gen in the same atomic write. */
 struct event
 {
     int signaled;
-    unsigned int reset_gen;
+    unsigned int high;
     unsigned short msync_type;
     unsigned short refcount;
     int multiple_waiters;
 };
 C_ASSERT(sizeof(struct event) == 16);
-C_ASSERT(FIELD_OFFSET(struct event, reset_gen) == sizeof(int));
+C_ASSERT(FIELD_OFFSET(struct event, high) == sizeof(int));
 
 struct mutex
 {
@@ -211,11 +218,56 @@ struct mutex
 };
 C_ASSERT(sizeof(struct mutex) == 16);
 
+#define MSYNC_FROZEN 0x80000000u
+/* Windows raises STATUS_MUTANT_LIMIT_EXCEEDED two levels later; the bit above this is MSYNC_FROZEN. */
+#define MSYNC_MUTEX_RECURSION_MAX 0x7fffffff
+
+static inline uint64_t load_object( const void *obj )
+{
+    return __atomic_load_n( (const uint64_t *)obj, __ATOMIC_SEQ_CST );
+}
+
+static inline int object_low( uint64_t word )
+{
+    return (int)(unsigned int)word;
+}
+
+static inline unsigned int object_high( uint64_t word )
+{
+    return (unsigned int)(word >> 32) & ~MSYNC_FROZEN;
+}
+
+static inline BOOL object_frozen( uint64_t word )
+{
+    return ((unsigned int)(word >> 32) & MSYNC_FROZEN) != 0;
+}
+
+static inline uint64_t make_object( int low, unsigned int high )
+{
+    return ((uint64_t)high << 32) | (unsigned int)low;
+}
+
+/* On failure *expected holds the word found, as with __atomic_compare_exchange_n. */
+static inline BOOL swap_object( void *obj, uint64_t *expected, uint64_t desired )
+{
+    return __atomic_compare_exchange_n( (uint64_t *)obj, expected, desired, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
+}
+
+/* Every object of the set, the alert object, and for a WaitAll the registration's
+ * generation after them. */
 typedef struct
 {
     mach_msg_header_t header;
-    unsigned int shm_idx[MAXIMUM_WAIT_OBJECTS + 1];
+    unsigned int shm_idx[MAXIMUM_WAIT_OBJECTS + 2];
 } mach_register_message_t;
+
+/* Bits above the 28-bit object index in a registration message's entries; server/msync.c
+ * reads the same ones. */
+#define REGISTER_MUTEX    (1u << 28)  /* on any entry: the object is a mutex */
+#define REGISTER_REMOVE   (1u << 29)  /* on the first entry: the message removes the wait */
+#define REGISTER_WAIT_ALL (1u << 30)  /* on the first entry: the set is a WaitAll */
+#define REGISTER_ALERT    (1u << 31)  /* on an entry of a WaitAll: the thread's alert object */
 
 static mach_port_t server_port;
 
@@ -256,23 +308,24 @@ static void abort_if_server_gone( mach_msg_return_t mr )
     abort_thread( 0 );
 }
 
-static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, const int *objs,
-                                void **objs_shm, int alert_obj, void *alert_obj_shm, int count )
+static inline mach_msg_return_t server_register_wait( unsigned int tid, const int *objs,
+                                void **objs_shm, int alert_obj, void *alert_obj_shm, int count,
+                                unsigned int generation )
 {
     int i, is_mutex, total = count;
+    BOOL wait_all = generation != 0;
     mach_msg_return_t mr;
     __thread static mach_register_message_t message;
 
     message.header.msgh_remote_port = server_port;
     message.header.msgh_bits = msgh_bits_send;
-    message.header.msgh_id = msgh_id;
 
     for (i = 0; i < count; i++)
     {
         struct event *obj = (struct event *)objs_shm[i];
 
         is_mutex = obj->msync_type == MSYNC_MUTEX ? 1 : 0;
-        message.shm_idx[i] = objs[i]| (is_mutex << 28);
+        message.shm_idx[i] = objs[i] | (is_mutex ? REGISTER_MUTEX : 0);
         __atomic_add_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
     }
 
@@ -280,10 +333,17 @@ static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, cons
     {
         struct event *obj = (struct event *)alert_obj_shm;
 
-        message.shm_idx[total++] = alert_obj;
+        message.shm_idx[total++] = alert_obj | (wait_all ? REGISTER_ALERT : 0);
         __atomic_add_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
     }
 
+    if (wait_all)
+    {
+        message.shm_idx[0] |= REGISTER_WAIT_ALL;
+        message.shm_idx[total++] = generation;
+    }
+
+    message.header.msgh_id = (tid << 8) | total;
     message.header.msgh_size = sizeof(mach_msg_header_t) +
                                total * sizeof(unsigned int);
 
@@ -320,7 +380,7 @@ static inline void server_remove_wait( unsigned int msgh_id, const int *objs, vo
     if (alert_obj)
         message.shm_idx[count++] = alert_obj;
 
-    message.shm_idx[0] |= (1 << 29);
+    message.shm_idx[0] |= REGISTER_REMOVE;
     SEVO_STAT( msync_removals );
 
     message.header.msgh_size = sizeof(mach_msg_header_t) +
@@ -343,6 +403,40 @@ static inline void server_remove_wait( unsigned int msgh_id, const int *objs, vo
 #else
 #define YIELD_PROCESSOR do {} while (0)
 #endif
+
+/* Looks at a frozen object's high word this many times before parking on it. The pump's
+ * freeze lasts single-digit microseconds unless the pump is preempted. */
+#define FREEZE_SPIN 8192
+
+/* Sleeps until the pump thaws the object; the caller reloads the word afterwards. The
+ * pump clears MSYNC_FROZEN and wakes the high word on every thaw, so a compare-and-wait
+ * against the frozen value returns at once when the thaw came first. */
+static void wait_for_thaw( void *obj, uint64_t seen )
+{
+    unsigned int *high = (unsigned int *)obj + 1, frozen = (unsigned int)(seen >> 32);
+    int i, ret;
+
+    SEVO_STAT( freeze_waits );
+    for (i = 0; i < FREEZE_SPIN; i++)
+    {
+        YIELD_PROCESSOR;
+        if (__atomic_load_n( high, __ATOMIC_ACQUIRE ) != frozen) return;
+    }
+    SEVO_STAT( freeze_parks );
+    do ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, high, frozen, 0 );
+    while (ret == -EINTR || ret == -EFAULT);
+}
+
+/* The object's word once it is not frozen. */
+static inline uint64_t thawed_object( void *obj, uint64_t word )
+{
+    while (object_frozen( word ))
+    {
+        wait_for_thaw( obj, word );
+        word = load_object( obj );
+    }
+    return word;
+}
 
 #define SEVO_OBJECT_SPIN_MAX 1000000
 #define OBJECT_SPIN_BATCH 512
@@ -395,7 +489,7 @@ static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
     int ret, val = 0;
     ULONGLONG ns_timeleft = 0;
 
-    do 
+    do
     {
         if (((struct mutex *)obj_shm)->msync_type == MSYNC_MUTEX)
         {
@@ -425,11 +519,44 @@ static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
     return STATUS_SUCCESS;
 }
 
-/* A thread's word in shm_tid_map while it registers a wait. The server answers a
- * registration by writing 1, or 0 when the wait is already satisfied, and wakes the
- * thread only when what it replaced was ACK_PARKED. server/msync.c has the same values. */
-#define ACK_PENDING 2
-#define ACK_PARKED  3
+/* A thread's word in shm_tid_map while it has a wait registered with the server: a state
+ * in the low four bits and, for a WaitAll, the registration's generation above them. The
+ * thread writes ACK_PENDING before it sends the registration and ACK_PARKED when it goes
+ * to sleep waiting for the acknowledgment; the server acknowledges with TOKEN_REGISTERED,
+ * or TOKEN_WOKEN when a wait-any is already satisfied, and wakes the thread only when what
+ * it replaced was ACK_PARKED. A WaitAll ends in one of the terminal values: the pump
+ * writes a grant or the alert by compare-and-swap from TOKEN_REGISTERED of the same
+ * generation, and the thread cancels by compare-and-swap from any of the three live
+ * values, so exactly one of them wins and a grant is never lost or taken twice. The
+ * generation is never zero, so a wait-any registration, which has none, and a WaitAll
+ * cannot be mistaken for each other. server/msync.c has the same values. */
+#define TOKEN_WOKEN              0
+#define TOKEN_REGISTERED         1
+#define ACK_PENDING              2
+#define ACK_PARKED               3
+#define TOKEN_GRANTED            4
+#define TOKEN_GRANTED_ABANDONED  5
+#define TOKEN_CANCELLED          6
+#define TOKEN_ALERTED            7
+#define TOKEN_STATE_MASK         0xf
+#define TOKEN_GENERATION_SHIFT   4
+#define TOKEN_GENERATION_MAX     ((1u << 28) - 1)
+
+static inline int token_state( int value )
+{
+    return value & TOKEN_STATE_MASK;
+}
+
+static inline BOOL token_live( int value )
+{
+    int state = token_state( value );
+    return state == TOKEN_REGISTERED || state == ACK_PENDING || state == ACK_PARKED;
+}
+
+static inline int token_with_state( int value, int state )
+{
+    return (value & ~TOKEN_STATE_MASK) | state;
+}
 
 #ifndef SEVO_ACK_SPIN_DEFAULT
 #define SEVO_ACK_SPIN_DEFAULT 4096
@@ -490,7 +617,7 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
 
     __atomic_store_n( addr, ACK_PENDING, __ATOMIC_RELEASE );
     msgh_id = (tid << 8) | total_count;
-    mr = server_register_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+    mr = server_register_wait( tid, objs, objs_shm, alert_obj, alert_obj_shm, count, 0 );
 
     if (mr != MACH_MSG_SUCCESS)
         return STATUS_PENDING;
@@ -563,7 +690,7 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
             }
         }
         SEVO_STAT( msync_registered_parks );
-        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, 1, ns_timeleft );
+        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, TOKEN_REGISTERED, ns_timeleft );
         val = __atomic_load_n( addr, __ATOMIC_ACQUIRE );
         if (!val)
             break;
@@ -574,6 +701,131 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
     if (ret == -ETIMEDOUT) return STATUS_TIMEOUT;
 
     return STATUS_SUCCESS;
+}
+
+/* TRUE when a member is unavailable to this thread at the instant of the look, which is a
+ * legitimate answer to a poll and saves it the round trip; only the pump can say yes. */
+static BOOL set_visibly_unavailable( void **objs_shm, int count, int tid )
+{
+    int i, val;
+
+    for (i = 0; i < count; i++)
+    {
+        val = __atomic_load_n( (int *)objs_shm[i], __ATOMIC_SEQ_CST );
+        if (((struct mutex *)objs_shm[i])->msync_type == MSYNC_MUTEX)
+        {
+            if (val && val != ~0 && val != tid) return TRUE;
+        }
+        else if (!val) return TRUE;
+    }
+    return FALSE;
+}
+
+/* Moves the token from a live value to TOKEN_CANCELLED. FALSE when the pump reached a
+ * terminal value first, which *value then holds: a grant found this way stands. */
+static BOOL cancel_token( int *addr, int *value )
+{
+    int val = __atomic_load_n( addr, __ATOMIC_SEQ_CST );
+
+    while (token_live( val ))
+        if (__atomic_compare_exchange_n( addr, &val, token_with_state( val, TOKEN_CANCELLED ), 0,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
+            return TRUE;
+    *value = val;
+    return FALSE;
+}
+
+/* One WaitAll: the set is registered with the pump, which freezes every member, grants
+ * the set only when all are available at one instant and consumes them itself, and
+ * re-evaluates the registration whenever a member is signaled. The thread sleeps on its
+ * token until the pump writes a terminal value or the deadline passes. The deadline is
+ * looked at only once the pump has answered the registration, so a poll gets the pump's
+ * verdict on the set as it was, never a timeout for a set that was whole. STATUS_PENDING
+ * is a wake that carried no answer; the caller registers again. */
+static NTSTATUS msync_wait_all( const int *objs, void **objs_shm, int alert_obj, void *alert_obj_shm,
+                                int count, ULONGLONG *end, int tid )
+{
+    /* Each registration of this thread has its own generation, so the pump's answer to an
+     * earlier one it processes late cannot be taken for, or acknowledge, this one. */
+    static __thread unsigned int generation;
+    int *addr = shm_tid_map + tid;
+    int val, ret;
+    unsigned int msgh_id, turn = 0, budget = ack_spin_budget();
+    ULONGLONG ns_timeleft = 0;
+    mach_msg_return_t mr;
+
+    if (++generation > TOKEN_GENERATION_MAX) generation = 1;
+    __atomic_store_n( addr, (int)(generation << TOKEN_GENERATION_SHIFT) | ACK_PENDING, __ATOMIC_RELEASE );
+    msgh_id = (tid << 8) | (count + (alert_obj ? 1 : 0));
+    mr = server_register_wait( tid, objs, objs_shm, alert_obj, alert_obj_shm, count, generation );
+    if (mr != MACH_MSG_SUCCESS) return STATUS_PENDING;
+    SEVO_STAT( waitall_registrations );
+
+    for (;;)
+    {
+        val = __atomic_load_n( addr, __ATOMIC_ACQUIRE );
+        if (!token_live( val )) break;
+
+        if (token_state( val ) == ACK_PENDING)
+        {
+            if (turn < budget)
+            {
+                YIELD_PROCESSOR;
+                turn++;
+                continue;
+            }
+            if (!__atomic_compare_exchange_n( addr, &val, token_with_state( val, ACK_PARKED ), 0,
+                                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
+                continue;
+            SEVO_STAT( msync_ack_parks );
+            SEVO_STAT_ADD( msync_ack_turns, turn );
+            val = token_with_state( val, ACK_PARKED );
+        }
+
+        if (token_state( val ) == TOKEN_REGISTERED)
+        {
+            if (end)
+            {
+                ns_timeleft = update_timeout( *end ) * 100;
+                if (!ns_timeleft) goto cancel;
+            }
+            SEVO_STAT( msync_registered_parks );
+        }
+        else ns_timeleft = 0;
+
+        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, val, ns_timeleft );
+        if (ret == -ETIMEDOUT) goto cancel;
+    }
+    goto terminal;
+
+cancel:
+    if (cancel_token( addr, &val ))
+    {
+        SEVO_STAT( waitall_cancels );
+        server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+        if (alert_obj_shm && __atomic_load_n( (int *)alert_obj_shm, __ATOMIC_SEQ_CST )) return STATUS_USER_APC;
+        return STATUS_TIMEOUT;
+    }
+
+terminal:
+    /* A granted set was consumed by the pump and is this thread's. */
+    server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
+    switch (token_state( val ))
+    {
+    case TOKEN_GRANTED:
+        SEVO_STAT( waitall_grants );
+        return STATUS_SUCCESS;
+    case TOKEN_GRANTED_ABANDONED:
+        SEVO_STAT( waitall_grants );
+        return STATUS_ABANDONED;
+    case TOKEN_ALERTED:
+        return STATUS_USER_APC;
+    default:
+        /* TOKEN_WOKEN from an earlier registration of this thread, or a cancellation
+         * written for a thread the server saw die: nothing was granted. */
+        SEVO_STAT( waitall_stale_wakes );
+        return STATUS_PENDING;
+    }
 }
 
 int do_msync(void)
@@ -941,16 +1193,19 @@ static inline void signal_all( void *shm, unsigned int shm_idx )
 NTSTATUS msync_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
 {
     struct semaphore *semaphore = get_shm( obj );
-    ULONG current;
+    uint64_t word = load_object( semaphore );
+    ULONG current, max;
 
-    do
+    for (;;)
     {
-        current = semaphore->count;
+        word = thawed_object( semaphore, word );
+        current = object_low( word );
+        max = object_high( word );
         /* Subtracted rather than added: count + current wraps for a count near 2^32. */
-        if (current > (ULONG)semaphore->max || count > (ULONG)semaphore->max - current)
+        if (current > max || count > max - current)
             return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
-
-    } while (__sync_val_compare_and_swap( &semaphore->count, current, count + current ) != current);
+        if (swap_object( semaphore, &word, make_object( current + count, max ) )) break;
+    }
 
     if (prev_count) *prev_count = current;
 
@@ -960,70 +1215,30 @@ NTSTATUS msync_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
 
 NTSTATUS msync_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION *info )
 {
-    struct semaphore *semaphore = get_shm( obj );
+    uint64_t word = load_object( get_shm( obj ) );
 
-    info->CurrentCount = semaphore->count;
-    info->MaximumCount = semaphore->max;
+    info->CurrentCount = object_low( word );
+    info->MaximumCount = object_high( word );
 
     return STATUS_SUCCESS;
-}
-
-static inline uint64_t *event_word( struct event *event )
-{
-    return (uint64_t *)&event->signaled;
-}
-
-/* Clears the signaled half and counts the reset; returns the previous signaled state. */
-static inline LONG reset_event_word( struct event *event )
-{
-    uint64_t *word = event_word( event );
-    uint64_t current = __atomic_load_n( word, __ATOMIC_SEQ_CST ), reset;
-
-    do reset = (current & 0xffffffff00000000ull) + ((uint64_t)1 << 32);
-    while (!__atomic_compare_exchange_n( word, &current, reset, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
-    return (LONG)(unsigned int)current;
-}
-
-/* Takes a signaled auto event for WaitAll and returns the reset count it was taken at. */
-static inline BOOL take_event_word( struct event *event, unsigned int *gen )
-{
-    uint64_t *word = event_word( event );
-    uint64_t current = __atomic_load_n( word, __ATOMIC_SEQ_CST );
-
-    do if (!(unsigned int)current) return FALSE;
-    while (!__atomic_compare_exchange_n( word, &current, current & 0xffffffff00000000ull, 0,
-                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
-    *gen = current >> 32;
-    return TRUE;
-}
-
-/* Puts back an auto event taken at reset count gen, only while it is still unsignaled
- * and unreset: a set in between already signaled it, and a reset in between stands. */
-static inline void untake_event_word( struct event *event, unsigned int gen )
-{
-    uint64_t expected = (uint64_t)gen << 32;
-
-    __atomic_compare_exchange_n( event_word( event ), &expected, expected | 1, 0,
-                                 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
-}
-
-/* Returns one count taken from a semaphore, unless releases in between refilled it. */
-static inline void untake_semaphore( struct semaphore *semaphore )
-{
-    int current = __atomic_load_n( &semaphore->count, __ATOMIC_SEQ_CST );
-
-    while (current < semaphore->max &&
-           !__atomic_compare_exchange_n( &semaphore->count, &current, current + 1, 0,
-                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ));
 }
 
 NTSTATUS msync_set_event_obj( int obj, LONG *prev_state )
 {
     struct event *event = get_shm( obj );
+    uint64_t word = load_object( event );
     LONG current;
 
-    if (!(current = __atomic_exchange_n( &event->signaled, 1, __ATOMIC_SEQ_CST )))
-        signal_all( (void *)event, obj );
+    for (;;)
+    {
+        word = thawed_object( event, word );
+        if ((current = object_low( word ))) break;
+        if (swap_object( event, &word, make_object( 1, object_high( word ) ) ))
+        {
+            signal_all( (void *)event, obj );
+            break;
+        }
+    }
 
     if (prev_state) *prev_state = current;
 
@@ -1033,9 +1248,15 @@ NTSTATUS msync_set_event_obj( int obj, LONG *prev_state )
 NTSTATUS msync_reset_event_obj( int obj, LONG *prev_state )
 {
     struct event *event = get_shm( obj );
+    uint64_t word = load_object( event );
     LONG current;
 
-    current = reset_event_word( event );
+    for (;;)
+    {
+        word = thawed_object( event, word );
+        if (!(current = object_low( word ))) break;
+        if (swap_object( event, &word, make_object( 0, object_high( word ) ) )) break;
+    }
 
     if (prev_state) *prev_state = current;
 
@@ -1044,31 +1265,25 @@ NTSTATUS msync_reset_event_obj( int obj, LONG *prev_state )
 
 NTSTATUS msync_pulse_event_obj( int obj, LONG *prev_state )
 {
-    struct event *event = get_shm( obj );
-    LONG current;
-
     /* This isn't really correct; an application could miss the write.
      * Unfortunately we can't really do much better. Fortunately this is rarely
      * used (and publicly deprecated). */
-    if (!(current = __atomic_exchange_n( &event->signaled, 1, __ATOMIC_SEQ_CST )))
-        signal_all( (void *)event, obj );
+    NTSTATUS status = msync_set_event_obj( obj, prev_state );
 
     /* Try to give other threads a chance to wake up. Hopefully erring on this
      * side is the better thing to do... */
     sched_yield();
 
-    reset_event_word( event );
+    msync_reset_event_obj( obj, NULL );
 
-    if (prev_state) *prev_state = current;
-
-    return STATUS_SUCCESS;
+    return status;
 }
 
 NTSTATUS msync_query_event_obj( int obj, EVENT_BASIC_INFORMATION *info )
 {
     struct event *event = get_shm( obj );
 
-    info->EventState = event->signaled;
+    info->EventState = __atomic_load_n( &event->signaled, __ATOMIC_SEQ_CST );
     info->EventType = (event->msync_type == MSYNC_AUTO_EVENT ? SynchronizationEvent : NotificationEvent);
 
     return STATUS_SUCCESS;
@@ -1077,51 +1292,36 @@ NTSTATUS msync_query_event_obj( int obj, EVENT_BASIC_INFORMATION *info )
 NTSTATUS msync_release_mutex_obj( int obj, LONG *prev_count )
 {
     struct mutex *mutex = get_shm( obj );
+    uint64_t word = load_object( mutex );
+    int tid = GetCurrentThreadId();
+    unsigned int depth;
 
-    if (mutex->tid != GetCurrentThreadId())
-        return STATUS_MUTANT_NOT_OWNED;
-
-    if (prev_count) *prev_count = 1 - mutex->count;
-
-    if (!--mutex->count)
+    for (;;)
     {
-        __atomic_store_n( &mutex->tid, 0, __ATOMIC_SEQ_CST );
-        signal_all( (void *)mutex, obj );
+        word = thawed_object( mutex, word );
+        if (object_low( word ) != tid)
+            return STATUS_MUTANT_NOT_OWNED;
+        depth = object_high( word );
+        if (swap_object( mutex, &word, depth > 1 ? make_object( tid, depth - 1 ) : make_object( 0, 0 ) ))
+            break;
     }
+
+    if (prev_count) *prev_count = 1 - (LONG)depth;
+
+    if (depth <= 1) signal_all( (void *)mutex, obj );
 
     return STATUS_SUCCESS;
 }
 
 NTSTATUS msync_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info )
 {
-    struct mutex *mutex = get_shm( obj );
+    uint64_t word = load_object( get_shm( obj ) );
 
-    info->CurrentCount = 1 - mutex->count;
-    info->OwnedByCaller = (mutex->tid == GetCurrentThreadId());
-    info->AbandonedState = (mutex->tid == ~0);
+    info->CurrentCount = 1 - (LONG)object_high( word );
+    info->OwnedByCaller = (object_low( word ) == GetCurrentThreadId());
+    info->AbandonedState = (object_low( word ) == ~0);
 
     return STATUS_SUCCESS;
-}
-
-static NTSTATUS do_single_wait( int obj, void *obj_shm, int alert_obj, void *alert_obj_shm, ULONGLONG *end, int tid )
-{
-    NTSTATUS status;
-
-    if (alert_obj)
-    {
-        if (__atomic_load_n( (int *)alert_obj_shm, __ATOMIC_SEQ_CST ))
-            return STATUS_USER_APC;
-
-        status = msync_wait_multiple( &obj, &obj_shm, alert_obj, alert_obj_shm, 1, end, tid );
-
-        if (__atomic_load_n( (int *)alert_obj_shm, __ATOMIC_SEQ_CST ))
-            return STATUS_USER_APC;
-    }
-    else
-    {
-        status = msync_wait_single( obj, obj_shm, end, tid );
-    }
-    return status;
 }
 
 NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
@@ -1181,67 +1381,55 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
 
             for (i = 0; i < count; i++)
             {
+                uint64_t word = load_object( objs_shm[i] );
+
                 switch (((struct event *)objs_shm[i])->msync_type)
                 {
                 case MSYNC_SEMAPHORE:
-                {
-                    struct semaphore *semaphore = objs_shm[i];
-                    int current, new;
-
-                    new = __atomic_load_n( &semaphore->count, __ATOMIC_SEQ_CST );
-                    while ((current = new))
+                    for (;;)
                     {
-                        if ((new = __sync_val_compare_and_swap( &semaphore->count, current, current - 1 )) == current)
+                        word = thawed_object( objs_shm[i], word );
+                        if (!object_low( word )) break;
+                        if (swap_object( objs_shm[i], &word, make_object( object_low( word ) - 1, object_high( word ) ) ))
                             return i;
                     }
                     break;
-                }
                 case MSYNC_MUTEX:
-                {
-                    struct mutex *mutex = objs_shm[i];
-                    int tid;
-
-                    if (mutex->tid == current_tid)
+                    for (;;)
                     {
-                        mutex->count++;
-                        return i;
-                    }
+                        int owner;
 
-                    tid = 0;
-                    if (__atomic_compare_exchange_n(&mutex->tid, &tid, current_tid, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
-                    {
-                        mutex->count = 1;
-                        return i;
+                        word = thawed_object( objs_shm[i], word );
+                        owner = object_low( word );
+                        if (owner == current_tid)
+                        {
+                            if (object_high( word ) == MSYNC_MUTEX_RECURSION_MAX)
+                                return STATUS_MUTANT_LIMIT_EXCEEDED;
+                            if (swap_object( objs_shm[i], &word, make_object( current_tid, object_high( word ) + 1 ) ))
+                                return i;
+                            continue;
+                        }
+                        /* An abandoned mutex (~0) is available to whoever grabs it. */
+                        if (owner && owner != ~0) break;
+                        if (swap_object( objs_shm[i], &word, make_object( current_tid, 1 ) ))
+                            return owner == ~0 ? STATUS_ABANDONED_WAIT_0 + i : i;
                     }
-                    else if (tid == ~0 && __atomic_compare_exchange_n(&mutex->tid, &tid, current_tid, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
-                    {
-                        mutex->count = 1;
-                        return STATUS_ABANDONED_WAIT_0 + i;
-                    }
-
                     break;
-                }
                 case MSYNC_AUTO_EVENT:
                 case MSYNC_AUTO_SERVER:
-                {
-                    struct event *event = objs_shm[i];
-                    int signaled = 1;
-
-                    if (__atomic_compare_exchange_n(&event->signaled, &signaled, 0, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
-                        return i;
-
+                    for (;;)
+                    {
+                        word = thawed_object( objs_shm[i], word );
+                        if (!object_low( word )) break;
+                        if (swap_object( objs_shm[i], &word, make_object( 0, object_high( word ) ) ))
+                            return i;
+                    }
                     break;
-                }
                 case MSYNC_MANUAL_EVENT:
                 case MSYNC_MANUAL_SERVER:
-                {
-                    struct event *event = objs_shm[i];
-
-                    if (__atomic_load_n(&event->signaled, __ATOMIC_SEQ_CST))
+                    if (object_low( word ))
                         return i;
-
                     break;
-                }
                 default:
                     ERR("Invalid type %#x for obj %d.\n", ((struct event *)objs_shm[i])->msync_type, objs[i]);
                     assert(0);
@@ -1269,247 +1457,27 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
     }
     else
     {
-        /* Wait-all is a little trickier to implement correctly. Fortunately,
-         * it's not as common.
-         *
-         * The idea is basically just to wait in sequence on every object in the
-         * set. Then when we're done, try to grab them all in a tight loop. If
-         * that fails, put back what this attempt took (mutexes, semaphores
-         * and auto events) and start over.
-         *
-         * What makes this inherently bad is that we might temporarily grab a
-         * resource incorrectly. Hopefully it'll be quick (and hey, it won't
-         * block on wineserver) so nobody will notice. Besides, consider: if
-         * object A becomes signaled but someone grabs it before we can grab it
-         * and everything else, then they could just as well have grabbed it
-         * before it became signaled. Similarly if object A was signaled and we
-         * were blocking on object B, then B becomes available and someone grabs
-         * A before we can, then they might have grabbed A before B became
-         * signaled. In either case anyone who tries to wait on A or B will be
-         * waiting for an instant while we put things back.
-         *
-         * The grant has no common serialization point with competing operations:
-         * the readiness scan, the takes and the recheck after them are separate
-         * atomic operations, so WaitAll can grant a set of states that never held
-         * at one instant. Putting back never lifts a semaphore past its maximum or
-         * undoes a reset. The promoted-object authority in
-         * Research/wine-engine/33 section E is the design that closes this. */
-
-        NTSTATUS status = STATUS_SUCCESS;
-        unsigned int attempts = 0;
-
+        /* A WaitAll is granted and consumed by the wineserver's pump under a freeze of the
+         * whole set, so the set it reports was whole at one instant. This side only
+         * registers, sleeps and reads the verdict; a poll that can see a missing member
+         * is refused here without the round trip. */
         SEVO_STAT( waitall_calls );
 
-        while (1)
+        for (;;)
         {
-            /* Bit i is set once this attempt consumed objs[i]; a mutex
-             * consumed from the abandoned state also sets was_abandoned. */
-            uint64_t taken, was_abandoned;
-            /* The reset count each taken auto event was taken at. */
-            unsigned int taken_gen[MAXIMUM_WAIT_OBJECTS];
+            if (alert_obj && __atomic_load_n( alert_obj_shm, __ATOMIC_SEQ_CST ))
+                goto userapc;
 
-tryagain:
-            taken = was_abandoned = 0;
-            SEVO_STAT( waitall_attempts );
-
-            /* A retry that finds every object signaled never reaches do_single_wait,
-             * which is where the deadline and the alert are looked at; so they are
-             * looked at here, from the second attempt on. */
-            if (attempts++)
+            if (timeout && !update_timeout( end ) && set_visibly_unavailable( objs_shm, count, current_tid ))
             {
-                if (timeout && !update_timeout( end )) return STATUS_TIMEOUT;
-                if (alert_obj_shm && __atomic_load_n( alert_obj_shm, __ATOMIC_SEQ_CST )) goto userapc;
+                SEVO_STAT( waitall_polls_refused );
+                return STATUS_TIMEOUT;
             }
 
-            /* First step: try to wait on each object in sequence. */
-
-            for (i = 0; i < count; i++)
-            {
-                if (((struct mutex *)objs_shm[i])->msync_type == MSYNC_MUTEX)
-                {
-                    struct mutex *mutex = (struct mutex *)objs_shm[i];
-                    int tid;
-
-                    if (mutex->tid == current_tid)
-                        continue;
-
-                    /* An abandoned mutex (~0) is available to whoever grabs it. */
-                    while ((tid = __atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST )) && tid != ~0)
-                    {
-                        status = do_single_wait( objs[i], objs_shm[i], alert_obj, alert_obj_shm, timeout ? &end : NULL, current_tid );
-                        if (status != STATUS_PENDING)
-                            break;
-                    }
-                }
-                else
-                {
-                    /* this works for semaphores too */
-                    struct event *event = (struct event *)objs_shm[i];
-
-                    while (!__atomic_load_n( &event->signaled, __ATOMIC_SEQ_CST ))
-                    {
-                        status = do_single_wait( objs[i], objs_shm[i], alert_obj, alert_obj_shm, timeout ? &end : NULL, current_tid );
-                        if (status != STATUS_PENDING)
-                            break;
-                    }
-                }
-
-                if (status == STATUS_TIMEOUT) return STATUS_TIMEOUT;
-                if (status == STATUS_USER_APC) goto userapc;
-            }
-
-            /* If we got here and we haven't timed out, that means all of the
-             * handles were signaled. Check to make sure they still are. */
-            for (i = 0; i < count; i++)
-            {
-
-                if (((struct mutex *)objs_shm[i])->msync_type == MSYNC_MUTEX)
-                {
-                    struct mutex *mutex = (struct mutex *)objs_shm[i];
-                    int tid = __atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST );
-
-                    if (tid && tid != ~0 && tid != current_tid)
-                    {
-                        SEVO_STAT( waitall_readiness_failures );
-                        goto tryagain;
-                    }
-                }
-                else
-                {
-                    struct event *event = (struct event *)objs_shm[i];
-
-                    if (!__atomic_load_n( &event->signaled, __ATOMIC_SEQ_CST ))
-                    {
-                        SEVO_STAT( waitall_readiness_failures );
-                        goto tryagain;
-                    }
-                }
-            }
-
-            /* Yep, still signaled. Now quick, grab everything. */
-            for (i = 0; i < count; i++)
-            {
-                switch (((struct event *)objs_shm[i])->msync_type)
-                {
-                case MSYNC_MUTEX:
-                {
-                    struct mutex *mutex = (struct mutex *)objs_shm[i];
-                    int tid = __atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST );
-                    if (tid == current_tid)
-                        break;
-                    if (tid && tid != ~0)
-                        goto tooslow;
-                    if (__sync_val_compare_and_swap( &mutex->tid, tid, current_tid ) != tid)
-                        goto tooslow;
-                    taken |= (uint64_t)1 << i;
-                    if (tid == ~0)
-                        was_abandoned |= (uint64_t)1 << i;
-                    break;
-                }
-                case MSYNC_SEMAPHORE:
-                {
-                    struct semaphore *semaphore = (struct semaphore *)objs_shm[i];
-                    int current, new;
-
-                    new = __atomic_load_n( &semaphore->count, __ATOMIC_SEQ_CST );
-                    while ((current = new))
-                    {
-                        if ((new = __sync_val_compare_and_swap( &semaphore->count, current, current - 1 )) == current)
-                            break;
-                    }
-                    if (!current)
-                        goto tooslow;
-                    taken |= (uint64_t)1 << i;
-                    break;
-                }
-                case MSYNC_AUTO_EVENT:
-                case MSYNC_AUTO_SERVER:
-                {
-                    struct event *event = (struct event *)objs_shm[i];
-                    if (!take_event_word( event, &taken_gen[i] ))
-                        goto tooslow;
-                    taken |= (uint64_t)1 << i;
-                    break;
-                }
-                default:
-                    /* Manual events are rechecked once the takes are done. */
-                    break;
-                }
-            }
-
-            /* Every mutex is still ours and every manual event still signaled, or the
-             * attempt is put back. */
-            for (i = 0; i < count; i++)
-            {
-                BOOL held = TRUE;
-
-                switch (((struct event *)objs_shm[i])->msync_type)
-                {
-                case MSYNC_MUTEX:
-                    held = __atomic_load_n( &((struct mutex *)objs_shm[i])->tid, __ATOMIC_SEQ_CST ) == current_tid;
-                    break;
-                case MSYNC_MANUAL_EVENT:
-                case MSYNC_MANUAL_SERVER:
-                    held = __atomic_load_n( &((struct event *)objs_shm[i])->signaled, __ATOMIC_SEQ_CST ) != 0;
-                    break;
-                }
-                if (!held)
-                {
-                    SEVO_STAT( waitall_readiness_failures );
-                    i = count;
-                    goto tooslow;
-                }
-            }
-
-            /* If we got here, we successfully waited on every object.
-             * Make sure to let ourselves know that we grabbed the mutexes. */
-            for (i = 0; i < count; i++)
-            {
-                if (((struct mutex *)objs_shm[i])->msync_type == MSYNC_MUTEX)
-                {
-                    struct mutex *mutex = (struct mutex *)objs_shm[i];
-                    mutex->count++;
-                }
-            }
-
-            SEVO_STAT( waitall_successes );
-            if (was_abandoned) return STATUS_ABANDONED;
-
-            return STATUS_SUCCESS;
-
-tooslow:
-            SEVO_STAT( waitall_rollbacks );
-            SEVO_STAT_ADD( waitall_rolled_objects, __builtin_popcountll( taken ) );
-            /* Put back only what this attempt consumed, in the state it was
-             * found, and wake the waiters the consumption hid it from. */
-            for (--i; i >= 0; i--)
-            {
-                if (!(taken & ((uint64_t)1 << i)))
-                    continue;
-
-                switch (((struct event *)objs_shm[i])->msync_type)
-                {
-                case MSYNC_MUTEX:
-                {
-                    struct mutex *mutex = (struct mutex *)objs_shm[i];
-                    int restored = (was_abandoned & ((uint64_t)1 << i)) ? ~0 : 0, tid = current_tid;
-                    /* a mutex the server abandoned since the take stays abandoned */
-                    __atomic_compare_exchange_n( &mutex->tid, &tid, restored, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
-                    break;
-                }
-                case MSYNC_SEMAPHORE:
-                {
-                    untake_semaphore( (struct semaphore *)objs_shm[i] );
-                    break;
-                }
-                case MSYNC_AUTO_EVENT:
-                case MSYNC_AUTO_SERVER:
-                    untake_event_word( (struct event *)objs_shm[i], taken_gen[i] );
-                    break;
-                }
-                signal_all( objs_shm[i], objs[i] );
-            }
-        } /* while (1) */
+            ret = msync_wait_all( objs, objs_shm, alert_obj, alert_obj_shm, count, timeout ? &end : NULL, current_tid );
+            if (ret == STATUS_USER_APC) goto userapc;
+            if (ret != STATUS_PENDING) return ret;
+        }
     } /* else (wait-all) */
 
     assert(0);  /* shouldn't reach here... */
