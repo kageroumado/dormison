@@ -1899,6 +1899,7 @@ static void load_ntdll_functions( HMODULE module )
     void **p__wine_unix_call_dispatcher;
     void **p__wine_unix_call_dispatcher_arm64ec = NULL;
     unixlib_handle_t *p__wine_unixlib_handle;
+    BOOL *p__wine_tls_expansion_mirror;
     const IMAGE_EXPORT_DIRECTORY *exports;
 
     exports = get_module_data_dir( module, IMAGE_DIRECTORY_ENTRY_EXPORT, NULL );
@@ -1920,6 +1921,7 @@ static void load_ntdll_functions( HMODULE module )
     GET_FUNC( __wine_syscall_dispatcher );
     GET_FUNC( __wine_unix_call_dispatcher );
     GET_FUNC( __wine_unixlib_handle );
+    GET_FUNC( __wine_tls_expansion_mirror );
     if (is_arm64ec())
     {
         GET_FUNC( __wine_unix_call_dispatcher_arm64ec );
@@ -1927,6 +1929,12 @@ static void load_ntdll_functions( HMODULE module )
     }
     *p__wine_syscall_dispatcher = __wine_syscall_dispatcher;
     *p__wine_unixlib_handle = (UINT_PTR)unix_call_funcs;
+#if defined(__APPLE__) && defined(__x86_64__)
+    if (p__wine_tls_expansion_mirror) *p__wine_tls_expansion_mirror = tls_expansion_key_reserved;
+    if (!tls_expansion_key_reserved)
+        ERR( "pthread key 752 (%%gs:0x1780) is taken by other native code; "
+             "TlsAlloc indices stay unreadable to inline %%gs loads (Mono's x64 JIT)\n" );
+#endif
     if (p__wine_unix_call_dispatcher_arm64ec)
     {
         /* redirect __wine_unix_call_dispatcher to __wine_unix_call_dispatcher_arm64ec */

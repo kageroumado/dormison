@@ -180,6 +180,37 @@ static void restore_thread_data( void *data )
     pthread_setspecific( thread_data_key, data );
 }
 
+#if defined(__APPLE__) && defined(__x86_64__)
+BOOL tls_expansion_key_reserved = FALSE;
+
+/* The PE loader mirrors TEB->TlsExpansionSlots at %gs:0x1780, which is the
+   slot of Darwin pthread key 752. Taking that key before any other native
+   code loads means pthread_key_create never hands the slot to a library.
+   Every other key created on the way to it is deleted again. */
+static void reserve_tls_expansion_key(void)
+{
+    const pthread_key_t wanted = 0x1780 / sizeof(void *);
+    pthread_key_t keys[1024];
+    unsigned int i, count;
+
+    for (count = 0; count < ARRAY_SIZE(keys); count++)
+    {
+        if (pthread_key_create( &keys[count], NULL )) break;
+        if (keys[count] == wanted)
+        {
+            tls_expansion_key_reserved = TRUE;
+            break;
+        }
+        if (keys[count] > wanted)
+        {
+            count++;
+            break;
+        }
+    }
+    for (i = 0; i < count; i++) pthread_key_delete( keys[i] );
+}
+#endif
+
 static const UINT page_shift = 12;
 static const UINT_PTR page_mask = 0xfff;
 static const UINT_PTR granularity_mask = 0xffff;
@@ -4103,6 +4134,9 @@ TEB *virtual_alloc_first_teb(void)
     thread_data = virtual_alloc_thread_data();
     thread_data->teb = teb;
     list_add_head( &teb_list, &thread_data->entry );
+#if defined(__APPLE__) && defined(__x86_64__)
+    reserve_tls_expansion_key();
+#endif
     pthread_key_create( &thread_data_key, restore_thread_data );
     pthread_setspecific( thread_data_key, thread_data );
     return teb;

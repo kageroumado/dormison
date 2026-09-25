@@ -79,6 +79,8 @@ SYSTEM_DLL_INIT_BLOCK LdrSystemDllInitBlock = { 0xf0 };
 
 void *__wine_syscall_dispatcher = NULL;
 unixlib_handle_t __wine_unixlib_handle = 0;
+/* Set by the Unix side when it owns the Darwin pthread key at %gs:0x1780. */
+BOOL __wine_tls_expansion_mirror = FALSE;
 
 /* windows directory */
 const WCHAR windows_dir[] = L"C:\\windows";
@@ -4128,7 +4130,7 @@ void WINAPI LdrShutdownThread(void)
 #ifdef __x86_64__  /* macOS-specific hack */
     /* The TSD slot the mirror uses is in pthread_key_create's range, so a
      * freed pointer must not stay behind in it. */
-    if (NtCurrentTeb()->Instrumentation[0])
+    if (__wine_tls_expansion_mirror && NtCurrentTeb()->Instrumentation[0])
         ((TEB *)NtCurrentTeb()->Instrumentation[0])->TlsExpansionSlots = NULL;
 #endif
     RtlFreeHeap( GetProcessHeap(), 0, NtCurrentTeb()->TlsExpansionSlots );
@@ -4587,7 +4589,7 @@ static void mirror_tls_expansion_slots(void)
 {
     TEB *teb = NtCurrentTeb();
 
-    if (!teb->Instrumentation[0] || teb->WowTebOffset) return;
+    if (!__wine_tls_expansion_mirror || !teb->Instrumentation[0] || teb->WowTebOffset) return;
     if (!teb->TlsExpansionSlots)
         teb->TlsExpansionSlots = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY,
                 8 * sizeof(teb->Peb->TlsExpansionBitmapBits) * sizeof(void *) );
@@ -4634,7 +4636,7 @@ void loader_init( CONTEXT *context, void **entry )
 #if defined(__x86_64__) && !defined(__arm64ec__)
         /* Every TlsAlloc index lands in the expansion array, which
          * mirror_tls_expansion_slots makes reachable through %gs. */
-        if (NtCurrentTeb()->Instrumentation[0] && !NtCurrentTeb()->WowTebOffset)
+        if (__wine_tls_expansion_mirror && NtCurrentTeb()->Instrumentation[0] && !NtCurrentTeb()->WowTebOffset)
             RtlSetBits( peb->TlsBitmap, 0, TLS_MINIMUM_AVAILABLE );
 #endif
 

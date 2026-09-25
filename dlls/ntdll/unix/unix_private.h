@@ -122,6 +122,9 @@ struct thread_data
 };
 
 extern pthread_key_t thread_data_key;
+#if defined(__APPLE__) && defined(__x86_64__)
+extern BOOL tls_expansion_key_reserved;
+#endif
 
 static inline struct thread_data *get_thread_data(void)
 {
