@@ -43,7 +43,9 @@ final class GLViewPresenter: ViewPresenter {
     private final class Slot {
         let surface: IOSurfaceRef
         let texture: MTLTexture
-        /// Command buffers in flight that sample the texture.
+        /// Frames that sample the texture: each is counted from the moment it
+        /// chooses the slot, under `lock`, until its command buffer completes
+        /// or it gives up before encoding.
         var readers = 0
         var acquired = false
         init(surface: IOSurfaceRef, texture: MTLTexture) {
@@ -162,10 +164,14 @@ final class GLViewPresenter: ViewPresenter {
         let slot = slots[index]
         slot.acquired = false
         last = slot
+        slot.readers += 1
         lock.unlock()
         // The main thread attaches the view after the drawable exists: a swap before that
         // has no layer to go to, and the refresh after the attach shows the slot kept above.
-        guard let layer = madeOnscreen else { return }
+        guard let layer = madeOnscreen else {
+            release(slot)
+            return
+        }
         if layer.displaySyncEnabled != synced { layer.displaySyncEnabled = synced }
         encode(slot)
     }
@@ -186,26 +192,26 @@ final class GLViewPresenter: ViewPresenter {
             guard let self else { return }
             lock.lock()
             let slot = detached ? nil : last
+            slot?.readers += 1
             lock.unlock()
             if let slot { encode(slot) }
         }
     }
 
+    /// Draws `slot`, whose reader count the caller raised under `lock` when it
+    /// chose the slot. The count falls again when the command buffer completes,
+    /// or here when there is nothing to encode into.
     private func encode(_ slot: Slot) {
         encoding.lock()
         defer { encoding.unlock() }
         guard let layer = madeOnscreen, layer.drawableSize.width >= 1, layer.drawableSize.height >= 1,
               let commandBuffer = queue.makeCommandBuffer()
-        else { return }
-        lock.lock()
-        slot.readers += 1
-        lock.unlock()
-        commandBuffer.label = "sevo gl present"
-        commandBuffer.addCompletedHandler { [self] _ in
-            lock.lock()
-            slot.readers -= 1
-            lock.unlock()
+        else {
+            release(slot)
+            return
         }
+        commandBuffer.label = "sevo gl present"
+        commandBuffer.addCompletedHandler { [self] _ in release(slot) }
         if let real = encodeFrame(source: slot.texture, in: commandBuffer) {
             commandBuffer.present(real)
             if !presentedOnce {
@@ -216,5 +222,12 @@ final class GLViewPresenter: ViewPresenter {
             }
         }
         commandBuffer.commit()
+    }
+
+    /// One frame that chose `slot` has finished with it.
+    private func release(_ slot: Slot) {
+        lock.lock()
+        slot.readers -= 1
+        lock.unlock()
     }
 }
