@@ -341,14 +341,14 @@ static inline void unregister_wait( mach_register_message_t *message, unsigned i
         remove_tid( message->shm_idx[i], tid );
 }
 
-/* ENOENT is a thread that was not asleep. An interrupted wake woke nobody and is made
+/* ENOENT is a word nobody sleeps on. An interrupted wake woke nobody and is made
  * again; any other failure leaves a sleeper nobody else will call for, so it is said. */
-static inline void wake_word( int *shm )
+static inline void wake_word( int *shm, uint32_t flags )
 {
     static unsigned int failures;
     int ret;
 
-    do ret = __ulock_wake( UL_COMPARE_AND_WAIT_SHARED, (void *)shm, 0 );
+    do ret = __ulock_wake( UL_COMPARE_AND_WAIT_SHARED | flags, (void *)shm, 0 );
     while (ret == -1 && errno == EINTR);
 
     if (ret == -1 && errno != ENOENT && failures++ < 8)
@@ -360,7 +360,7 @@ static inline void wake_tid( int tid )
     int *shm = shm_tid_map + tid;
 
     __atomic_store_n( shm, 0, __ATOMIC_RELEASE );
-    wake_word( shm );
+    wake_word( shm, 0 );
 }
 
 static inline void signal_all_internal( unsigned int shm_idx )
@@ -473,7 +473,7 @@ static inline mach_msg_return_t signal_all( unsigned int shm_idx, int *shm )
     static mach_msg_header_t send_header;
     struct msync_shm *obj = (struct msync_shm *)shm;
 
-    __ulock_wake( UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL, (void *)shm, 0 );
+    wake_word( shm, ULF_WAKE_ALL );
     if (!__atomic_load_n( &obj->multiple_waiters, __ATOMIC_SEQ_CST ))
         return MACH_MSG_SUCCESS;
 
@@ -577,7 +577,7 @@ static void *mach_message_pump( void *args )
                 /* The client can stop spinning and safely start waiting now; one that
                  * has parked on the acknowledgment (3, ACK_PARKED in ntdll) needs the wake. */
                 if (__atomic_exchange_n( shm_tid_map + tid, 1, __ATOMIC_SEQ_CST ) == 3)
-                    wake_word( shm_tid_map + tid );
+                    wake_word( shm_tid_map + tid, 0 );
             }
         }
     }

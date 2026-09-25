@@ -894,6 +894,20 @@ void msync_init(void)
     watch_server_death();
 }
 
+/* ENOENT is an object nobody sleeps on. An interrupted wake woke nobody and is made
+ * again; any other failure leaves a sleeper nobody else will call for, so it is said. */
+static inline void wake_all_on_word( void *shm )
+{
+    static unsigned int failures;
+    int ret;
+
+    do ret = __ulock_wake( UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL, shm, 0 );
+    while (ret == -1 && errno == EINTR);
+
+    if (ret == -1 && errno != ENOENT && failures++ < 8)
+        ERR( "wake of %p failed: errno %d\n", shm, errno );
+}
+
 static inline void signal_all( void *shm, unsigned int shm_idx )
 {
     __thread static mach_msg_header_t send_header;
@@ -901,7 +915,7 @@ static inline void signal_all( void *shm, unsigned int shm_idx )
     mach_msg_return_t mr;
 
     SEVO_STAT( signal_all_calls );
-    __ulock_wake( UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL, shm, 0 );
+    wake_all_on_word( shm );
 
     if (!__atomic_load_n( &event_obj->multiple_waiters, __ATOMIC_SEQ_CST ))
         return;
