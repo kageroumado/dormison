@@ -91,6 +91,12 @@ enum {
        cursor is visible: held until the cursor hides. */
     CGRect      deferredClipRect;
     BOOL        hasDeferredClip;
+    /* The game clipped the cursor to the whole screen its fullscreen window
+       covers. Held like a windowed clip while the cursor is visible, and
+       applied inset from the edges while it is hidden, where the menu bar
+       and the Dock would otherwise reveal. */
+    BOOL        screenClip;
+    CGRect      screenClipRect;
     BOOL        clientWantsCursorHidden;
 
     NSTimeInterval lastSetCursorPositionTime;

@@ -1688,9 +1688,9 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         {
             clientWantsCursorHidden = FALSE;
             [self updateCursor:FALSE];
-            if (self.clippingCursor && [self keyWindowIsPresentedInWindow])
+            if (self.clippingCursor && ([self keyWindowIsPresentedInWindow] || screenClip))
             {
-                CGRect rect = clipCursorHandler.cursorClipRect;
+                CGRect rect = screenClip ? screenClipRect : clipCursorHandler.cursorClipRect;
                 [self stopClippingCursor];
                 deferredClipRect = rect;
                 hasDeferredClip = TRUE;
@@ -1931,6 +1931,27 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         }
     }
 
+    /* How far a whole-screen clip keeps the cursor from the screen's edges,
+       in points: one is enough to stay out of the menu bar's and the Dock's
+       reveal zones. */
+    static const CGFloat screenClipInset = 1;
+
+    /* Whether a clip that covers every screen is the game holding the cursor
+       inside its own fullscreen window: the app is active and its key window
+       is a fullscreen Wine window whose frame contains the rect. */
+    - (BOOL) isScreenClip:(NSRect)rect
+    {
+        NSWindow* key = [NSApp keyWindow];
+        return [NSApp isActive] && [key isKindOfClass:[WineWindow class]]
+            && [(WineWindow*)key isFullscreen] && NSContainsRect([key frame], rect);
+    }
+
+    - (void) setScreenClip:(BOOL)clip rect:(CGRect)rect
+    {
+        screenClip = clip;
+        screenClipRect = rect;
+    }
+
     /* Whether the key window is a fullscreen-style window shown in a window. */
     - (BOOL) keyWindowIsPresentedInWindow
     {
@@ -1954,7 +1975,7 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
            and the buttons beside it become unreachable. While the cursor is
            visible the clip is held back; a hidden cursor — mouse look — gets
            it, and a cursor shown again is let go. */
-        if (!clientWantsCursorHidden && [self keyWindowIsPresentedInWindow])
+        if (!clientWantsCursorHidden && ([self keyWindowIsPresentedInWindow] || screenClip))
         {
             if (self.clippingCursor) [self stopClippingCursor];
             deferredClipRect = rect;
@@ -1962,6 +1983,9 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
             return TRUE;
         }
         hasDeferredClip = FALSE;
+
+        if (screenClip)
+            rect = CGRectInset(rect, screenClipInset, screenClipInset);
 
         if (self.clippingCursor && CGRectEqualToRect(rect, clipCursorHandler.cursorClipRect))
             return TRUE;
@@ -3450,6 +3474,7 @@ int macdrv_clip_cursor(CGRect r)
     OnMainThread(^{
         WineApplicationController* controller = [WineApplicationController sharedController];
         BOOL clipping = FALSE;
+        BOOL screenClip = FALSE;
         CGRect rect = r;
 
         if (!CGRectIsInfinite(rect))
@@ -3472,8 +3497,16 @@ int macdrv_clip_cursor(CGRect r)
                     break;
                 }
             }
+
+            /* A rect covering every screen unclips on Windows, and upstream
+               follows it. A fullscreen game asks for exactly that to hold the
+               cursor for mouse-look, and on a Mac the screen's edges reveal
+               the menu bar and the Dock, so that one clip is kept. */
+            if (!clipping && [controller isScreenClip:nsrect])
+                clipping = screenClip = TRUE;
         }
 
+        [controller setScreenClip:screenClip rect:rect];
         if (clipping)
             ret = [controller startClippingCursor:rect];
         else
