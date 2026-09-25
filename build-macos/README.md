@@ -190,10 +190,12 @@ it>"` line per name to `[Fonts]`. The exact family string comes from
 
 ## msync
 
-`msync-src/` is CrossOver 26.3's msync (six files, LGPL) and
-`apply-msync.py` is the port that placed them and rewrote the eight hook
-sites in 11.16. It is already applied on `main`; it stays here for the next
-rebase, where the anchors will need checking.
+msync started from CrossOver 26.3's (LGPL) and is maintained as commits on
+`main`: the backend in `server/msync.c` and `dlls/ntdll/unix/msync.c`, and its
+hooks in the server and ntdll files around them. A rebase carries it like any
+other commit.
+
+## DXMT
 
 DXMT's `d3d11.dll` and `dxgi.dll` are a binary payload from the upstream
 release tarball, so a change to DXMT itself is a patch here plus a rebuilt

@@ -22,9 +22,8 @@ renderer, and the options in play.
   before wine; `package-engine.sh` refuses a tree where it is stale.
 - Test on a real program before opening a pull request: a game, the DirectX 12
   samples, winecfg. Say which ones in the pull request.
-- The msync sources under `build-macos/msync-src/` are CrossOver's; changes to
-  msync go into `server/msync.c` and `dlls/ntdll/unix/msync.c`, and
-  `apply-msync.py` stays the record of where the hooks sit for the next rebase.
+- msync lives in `server/msync.c` and `dlls/ntdll/unix/msync.c` as commits on
+  `main`; changes to it are ordinary commits there.
 
 ## Rebasing onto the next wine-staging
 
