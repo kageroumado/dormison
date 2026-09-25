@@ -355,12 +355,13 @@ static BOOL WINAPI my_GetMonitorInfoA(HMONITOR monitor, LPMONITORINFO info)
     if (ret)
     {
         MONITORINFOEXA *miA = (MONITORINFOEXA *)info;
-        ULONG size;
+        ULONG size = 0;
         miA->rcMonitor = miW.rcMonitor;
         miA->rcWork = miW.rcWork;
         miA->dwFlags = miW.dwFlags;
-        RtlUnicodeToUTF8N(miA->szDevice, sizeof(miA->szDevice), &size, miW.szDevice,
+        RtlUnicodeToUTF8N(miA->szDevice, sizeof(miA->szDevice) - 1, &size, miW.szDevice,
                           wcslen(miW.szDevice) * sizeof(WCHAR));
+        miA->szDevice[size] = 0;
     }
     return ret;
 }
