@@ -125,8 +125,6 @@ extern id objc_storeWeak(id *location, id obj);
             }
         }
 
-        sevo_stats_note_drawable();
-
         os_unfair_lock_lock(&stateLock);
         presenter = _presenter;
         if (presenter) sevo_presenter_retain(presenter);
@@ -138,10 +136,12 @@ extern id objc_storeWeak(id *location, id obj);
         {
             drawable = (id<CAMetalDrawable>)sevo_presenter_next_drawable(presenter);
             sevo_presenter_release(presenter);
-            return drawable;
         }
+        else
+            drawable = [super nextDrawable];
 
-        return [super nextDrawable];
+        if (drawable) sevo_stats_note_drawable();
+        return drawable;
     }
 
 @end

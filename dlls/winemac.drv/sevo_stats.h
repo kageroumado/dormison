@@ -56,8 +56,9 @@ struct sevo_stats_page
        the driver drains its queue has its presents coalesced here. */
     uint64_t frames;
     /* Drawables D3DMetal took: the frames the game produced, one per
-       `-[WineMetalLayer nextDrawable]` and never coalesced, which is the
-       frame rate to read whenever it is non-zero. */
+       `-[WineMetalLayer nextDrawable]` that returned a drawable and never
+       coalesced, which is the frame rate to read whenever it is non-zero
+       and the presenter is not the source. */
     uint64_t drawables;
     uint64_t last_present_ns;
     uint64_t start_ns;
@@ -100,8 +101,9 @@ extern void sevo_stats_note_drawable(void);
 /* The main thread's run loop turned. Writes to a page a present has made and
    makes none, so a process that never draws still leaves no file. */
 extern void sevo_stats_note_main_beat(void);
-/* Frames so far (drawables when D3DMetal takes any, presents otherwise) and the
-   Cocoa window number they go to; both 0 before the first present. */
+/* Frames so far (the presenter's frames when it presents, else drawables when D3DMetal
+   takes any, else presents) and the Cocoa window number they go to; both 0 before the
+   first present. */
 extern unsigned long long sevo_stats_frame_count(unsigned long long *window_id);
 /* The first window number a present path can name; later calls are ignored. */
 extern void sevo_stats_note_window(unsigned long long window_id);

@@ -429,7 +429,8 @@ static int compare_floats(const void* a, const void* b)
     }
 
     /* The rate since the last reading, from the counter the stats page keeps. A count that
-       went backwards switched source (presents to D3DMetal's drawables) and starts over. */
+       went backwards switched source (to D3DMetal's drawables or the presenter's frames)
+       and starts over. */
     - (NSString*) rateText
     {
         unsigned long long frames = sevo_stats_frame_count(NULL);
