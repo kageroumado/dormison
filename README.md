@@ -39,7 +39,102 @@ manifest.
 This repository is [Wine](https://www.winehq.org) 11.16 with
 [wine-staging](https://github.com/wine-staging/wine-staging) 11.16 applied
 (tag `wine-staging-base`), plus Dormison's changes.
-`git diff wine-staging-base` shows the complete diff.
+`git diff wine-staging-base` shows the complete diff, and
+[CHANGES.md](build-macos/CHANGES.md) describes each release.
+
+### Changes from Wine
+
+Everything below is absent from Wine 11.16 and wine-staging 11.16.
+
+**Graphics**
+- D3DMetal host support for Game Porting Toolkit 3.0 and 4.0, including 4.0's
+  host-callback table.
+- A present-time upscaler for Metal, OpenGL and GDI windows (Lanczos, MetalFX
+  Spatial, Anime4K, CuNNy), with a final filter and an in-game View menu.
+- wined3d hands the upscaler the game's own frame, at its own resolution.
+- Resizable game windows that keep the game's resolution and aspect ratio.
+- An FPS counter and frame-time graph, fed by a per-process stats page that
+  the app also reads.
+- `SEVO_GPU_*` adapter identity, plus RTX 50 and RX 7000/9000 device IDs in
+  wined3d.
+- Vulkan portability enumeration on, so Windows programs see MoltenVK.
+
+**Windows, input and the Mac**
+- Each game gets its own Dock tile with its Steam title and icon. Steam's
+  helper processes stay out of the Dock.
+- NW.js games run on native NW.js, with a Steamworks stub for achievements.
+- Cursor confinement through the window server; raw mouse movement for
+  mouse-look.
+- A "not responding" sheet for a game that ignores quit, and crash reports
+  for faults on threads Wine did not create.
+- Tray icons can stay out of the menu bar. A background program no longer
+  keeps the display awake.
+
+**Processes, sync and memory**
+- msync: Mach-based in-process synchronization (`WINEMSYNC=1`).
+- Per-program settings files, read at every process start.
+- A native arm64 wineserver.
+- Fixes for Steam's 20-second network wait and for Unity/Mono TLS reads.
+- `SEVO_LARGE_ADDRESS_AWARE` for 32-bit games.
+
+**Audio, media and text**
+- Bundled GStreamer (LGPL build) for Media Foundation and DirectShow movies,
+  MPEG program streams included.
+- CoreAudio streams keep other programs' playback and the Mac's volume
+  intact.
+- A Discord Rich Presence bridge.
+- Japanese font families mapped onto the bundled IPAGothic/IPAPGothic and the
+  Mac's Hiragino Mincho.
+
+**Release**
+- `wine --version` names the release.
+- Releases are signed, and each ships its diff against `wine-staging-base`.
+
+### Compared to CrossOver
+
+This comparison is against the CrossOver 26.3 source release, which is
+Wine 11.0 with CodeWeavers' patches and no wine-staging.
+
+**Taken from CrossOver**
+- msync, with fixes CrossOver 26.3 lacks:
+  - WaitAll puts back what it took without overfilling a semaphore or
+    undoing a reset, and it rechecks the set after taking it.
+  - WaitAll reports an abandoned mutex.
+  - `NtReleaseMutant` reports NT's previous count.
+  - Freed object indexes are reused from a stack.
+  - A process exits when its wineserver dies.
+- Rosetta workarounds: the `lretq` 32→64 transition, MXCSR restore,
+  XGETBV/CET/debug-register handling, and retranslation of written code.
+  Dormison's cross-process write invalidation walks the range region by
+  region, where CrossOver restores the first page's protection over the whole
+  range.
+- D3DMetal glue: `__wine_unix_call`, the Microsoft-ABI trampoline, and the
+  GS base kept on Darwin thread storage with the TEB and PEB mirrored.
+- The Mono TLS mirror at `%gs:0x1780`. Dormison also reserves the pthread key
+  behind that offset.
+
+**In Dormison, not in CrossOver 26.3**
+- Wine 11.16 and wine-staging.
+- The upscaler, the D3DMetal 4.0 callback table, and the Metal 4 present
+  ordering.
+- A native arm64 wineserver.
+- The Steam network-wait fix, Vulkan portability enumeration and
+  `SEVO_GPU_*`.
+- Window-server cursor confinement.
+- `localtime_r` in ntdll, which the PEB mirror needs to be safe.
+- The Dock shim, NW.js runner, Discord bridge, stats page and per-program
+  settings.
+
+**In CrossOver 26.3, not in Dormison**
+- A 32-bit-only bottle mode under WoW64, and Rosetta's 16-bit LDT fix.
+- wined3d on Vulkan by default for Direct3D 10/11.
+- Per-title fixes: GTA IV/V, Counter-Strike 2, Cities: Skylines II, and BC7
+  decoding for Tomb Raider I–III Remastered.
+- Launcher fixes for Epic, Battle.net, Rockstar, GOG Galaxy and Ubisoft
+  Connect.
+- PlayStation controller rumble over Bluetooth, an Xbox 360 USB bus, and the
+  microphone permission prompt.
+- CrossOver's desktop and Office integration.
 
 ### Graphics and presentation
 
@@ -65,8 +160,10 @@ CuNNy. A final filter resamples the output. Configure it with `Upscaler`,
 `SEVO_PRESENTER_LOG` and `SEVO_SHADER_DIR`.
 
 A running program has a View menu: Upscaler, Final Filter, Show Frame Rate
-(`FrameRate=Y` or `SEVO_FPS=1` shows it from the first frame) and Show
-Picture Details.
+(`FrameRate=Y` or `SEVO_FPS=1` shows it from the first frame), Show Frame
+Time Graph (`FrameRateGraph=Y` or `SEVO_FPS_GRAPH=1`) and Show Picture
+Details. The counter and graph read the same per-process stats page as
+Sevoflurane.
 
 `ResizableWindows` preserves the game's rendering size and aspect ratio
 while allowing the presentation window to resize. `LinearMouse` supplies
@@ -74,8 +171,11 @@ raw displacement when the program holds the cursor for mouse-look.
 
 ### Processes and compatibility
 
-Dormison includes CrossOver's msync implementation, using Mach semaphores
-for in-process synchronization (`WINEMSYNC=1`). Rosetta workarounds cover
+Dormison includes CrossOver's msync implementation, which synchronizes in
+process through shared memory, `__ulock` waits and a Mach port to wineserver
+(`WINEMSYNC=1`). It is maintained as commits on `main`. One limit is known:
+WaitAll can grant a set whose objects were never all signaled at the same
+instant. [KNOWN-ISSUES.md](KNOWN-ISSUES.md) tracks it. Rosetta workarounds cover
 32-to-64-bit transitions, written executable code and signal contexts.
 The transition uses `lretq`, and signal handling preserves the thread's
 MXCSR state.
