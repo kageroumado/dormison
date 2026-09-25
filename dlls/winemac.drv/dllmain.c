@@ -440,35 +440,104 @@ static NTSTATUS WINAPI macdrv_regsetvalueexa(void *arg, ULONG size)
  * pointer in the block's last field. Module and heap handles cross the
  * boundary as 32-bit values (the toolkit's wrappers store them in a DWORD),
  * so a 64-bit HMODULE is handed out as a small token from the table below
- * and the process heap as token 1. */
+ * and the process heap as token 1.
+ *
+ * A token is the slot index plus one in its low byte and the slot's generation
+ * above it, so a token kept past its slot's reuse resolves to nothing. Each
+ * slot counts the references the toolkit took through LoadLibrary; a
+ * GetModuleHandle token borrows one. The slot is released once the toolkit
+ * holds no reference and the module is no longer loaded. The loader is only
+ * called outside the table lock, since a DllMain can reach these callbacks
+ * while holding the loader lock. */
 
 #define D3DMETAL_MODULE_TOKENS 64
 
-static HMODULE d3dmetal_modules[D3DMETAL_MODULE_TOKENS];
+static struct
+{
+    HMODULE module;
+    UINT32 generation;
+    UINT32 refs;
+} d3dmetal_modules[D3DMETAL_MODULE_TOKENS];
 
-static UINT32 d3dmetal_module_token(HMODULE module)
+static SRWLOCK d3dmetal_modules_lock = SRWLOCK_INIT;
+
+static UINT32 d3dmetal_token_make(unsigned int slot)
+{
+    return (d3dmetal_modules[slot].generation << 8) | (slot + 1);
+}
+
+/* Returns the slot the token names, or -1 when it names nothing current;
+ * called with the lock held. */
+static int d3dmetal_token_slot(UINT32 token)
+{
+    unsigned int slot = (token & 0xff) - 1;
+
+    if (slot >= D3DMETAL_MODULE_TOKENS) return -1;
+    if (!d3dmetal_modules[slot].module) return -1;
+    if ((d3dmetal_modules[slot].generation & 0xffffff) != token >> 8) return -1;
+    return slot;
+}
+
+static UINT32 d3dmetal_module_token(HMODULE module, BOOL owned)
 {
     unsigned int i, free_slot = D3DMETAL_MODULE_TOKENS;
+    UINT32 token = 0;
 
     if (!module) return 0;
+    AcquireSRWLockExclusive(&d3dmetal_modules_lock);
     for (i = 0; i < D3DMETAL_MODULE_TOKENS; i++)
     {
-        if (d3dmetal_modules[i] == module) return i + 1;
-        if (!d3dmetal_modules[i] && free_slot == D3DMETAL_MODULE_TOKENS) free_slot = i;
+        if (d3dmetal_modules[i].module == module) break;
+        if (!d3dmetal_modules[i].module && free_slot == D3DMETAL_MODULE_TOKENS) free_slot = i;
     }
-    if (free_slot == D3DMETAL_MODULE_TOKENS)
+    if (i == D3DMETAL_MODULE_TOKENS && (i = free_slot) < D3DMETAL_MODULE_TOKENS)
     {
-        ERR("no token left for module %p\n", module);
-        return 0;
+        d3dmetal_modules[i].module = module;
+        d3dmetal_modules[i].refs = 0;
     }
-    d3dmetal_modules[free_slot] = module;
-    return free_slot + 1;
+    if (i < D3DMETAL_MODULE_TOKENS)
+    {
+        if (owned) d3dmetal_modules[i].refs++;
+        token = d3dmetal_token_make(i);
+    }
+    ReleaseSRWLockExclusive(&d3dmetal_modules_lock);
+
+    if (!token) ERR("no token left for module %p\n", module);
+    return token;
 }
 
 static HMODULE d3dmetal_module_from_token(UINT32 token)
 {
-    if (!token || token > D3DMETAL_MODULE_TOKENS) return NULL;
-    return d3dmetal_modules[token - 1];
+    HMODULE module = NULL;
+    int slot;
+
+    AcquireSRWLockShared(&d3dmetal_modules_lock);
+    if ((slot = d3dmetal_token_slot(token)) >= 0) module = d3dmetal_modules[slot].module;
+    ReleaseSRWLockShared(&d3dmetal_modules_lock);
+    return module;
+}
+
+/* Drops one toolkit reference after a successful FreeLibrary of the module
+ * the token named. */
+static void d3dmetal_module_release(UINT32 token, HMODULE module)
+{
+    HMODULE loaded = NULL;
+    int slot;
+
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (const WCHAR *)module, &loaded);
+
+    AcquireSRWLockExclusive(&d3dmetal_modules_lock);
+    if ((slot = d3dmetal_token_slot(token)) >= 0 && d3dmetal_modules[slot].module == module)
+    {
+        if (d3dmetal_modules[slot].refs) d3dmetal_modules[slot].refs--;
+        if (!d3dmetal_modules[slot].refs && loaded != module)
+        {
+            d3dmetal_modules[slot].module = NULL;
+            d3dmetal_modules[slot].generation = (d3dmetal_modules[slot].generation + 1) & 0xffffff;
+        }
+    }
+    ReleaseSRWLockExclusive(&d3dmetal_modules_lock);
 }
 
 static NTSTATUS WINAPI d3dmetal_regdeletekeyvaluea(void *arg, ULONG size)
@@ -502,7 +571,7 @@ static NTSTATUS WINAPI d3dmetal_d3dkmtenumadapters2(void *arg, ULONG size)
 static NTSTATUS WINAPI d3dmetal_getmodulehandlea(void *arg, ULONG size)
 {
     struct d3dmetal_getmodulehandlea_params *params = arg;
-    UINT32 token = d3dmetal_module_token(GetModuleHandleA(param_ptr(params->name)));
+    UINT32 token = d3dmetal_module_token(GetModuleHandleA(param_ptr(params->name)), FALSE);
     TRACE("%s -> token %u\n", debugstr_a(param_ptr(params->name)), token);
     *(UINT64 *)param_ptr(params->result) = token;
     return 0;
@@ -538,7 +607,7 @@ static NTSTATUS WINAPI d3dmetal_getmodulefilenamea(void *arg, ULONG size)
 static NTSTATUS WINAPI d3dmetal_loadlibrarya(void *arg, ULONG size)
 {
     struct d3dmetal_loadlibrarya_params *params = arg;
-    UINT32 token = d3dmetal_module_token(LoadLibraryA(param_ptr(params->name)));
+    UINT32 token = d3dmetal_module_token(LoadLibraryA(param_ptr(params->name)), TRUE);
     TRACE("%s -> token %u\n", debugstr_a(param_ptr(params->name)), token);
     *(UINT64 *)param_ptr(params->result) = token;
     return 0;
@@ -549,7 +618,7 @@ static NTSTATUS WINAPI d3dmetal_freelibrary(void *arg, ULONG size)
     struct d3dmetal_freelibrary_params *params = arg;
     HMODULE module = d3dmetal_module_from_token(params->module);
     BOOL ret = module ? FreeLibrary(module) : FALSE;
-    if (ret) d3dmetal_modules[params->module - 1] = NULL;
+    if (ret) d3dmetal_module_release(params->module, module);
     *(BOOL *)param_ptr(params->result) = ret;
     return 0;
 }
@@ -558,7 +627,7 @@ static NTSTATUS WINAPI d3dmetal_loadlibraryexa(void *arg, ULONG size)
 {
     struct d3dmetal_loadlibraryexa_params *params = arg;
     UINT32 token = d3dmetal_module_token(LoadLibraryExA(param_ptr(params->name),
-                                                        UlongToHandle(params->file), params->flags));
+                                                        UlongToHandle(params->file), params->flags), TRUE);
     TRACE("%s flags %#x -> token %u\n", debugstr_a(param_ptr(params->name)), (unsigned int)params->flags, token);
     *(UINT64 *)param_ptr(params->result) = token;
     return 0;
