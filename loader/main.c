@@ -181,12 +181,41 @@ static void *try_tree( const char *dir )
 }
 
 
+/* A loader copy inside a game's bundle, opened by LaunchServices (a Dock
+ * tile, Finder) with no program to run: the game starts through Sevoflurane,
+ * which stages its bottle first. The bundle's directory is named after the
+ * game's id, as in Launchers/<id>/<Title>.app/Contents/MacOS/<Title>. */
+static void open_in_sevoflurane( int argc, char *argv[] )
+{
+    char *self, *slash, *id, url[64];
+    int i;
+
+    if (argc > 2 || (argc == 2 && strncmp( argv[1], "-psn_", 5 ))) return;
+    if (getenv( "SEVO_LOADER_TREE" )) return;
+    if (!(self = (char *)get_self_exe())) return;
+    for (i = 0; i < 4; i++)
+    {
+        if (!(slash = strrchr( self, '/' ))) return;
+        *slash = 0;
+    }
+    if (!(slash = strrchr( self, '/' ))) return;
+    id = slash + 1;
+    if (!*id || strspn( id, "0123456789" ) != strlen( id ) || strlen( id ) > 12) return;
+    snprintf( url, sizeof(url), "sevoflurane://play/%s", id );
+    execl( "/usr/bin/open", "open", url, (char *)NULL );
+}
+
+
 /**********************************************************************
  *           main
  */
 int main( int argc, char *argv[] )
 {
     void *handle;
+
+#ifdef __APPLE__
+    open_in_sevoflurane( argc, argv );
+#endif
 
     init_reserved_areas();
 
