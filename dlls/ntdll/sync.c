@@ -368,17 +368,22 @@ NTSTATUS WINAPI RtlDeleteCriticalSection( RTL_CRITICAL_SECTION *crit )
 /******************************************************************************
  *      RtlpWaitForCriticalSection   (NTDLL.@)
  */
+/* A process that is terminating waits on no section: the thread holding it may be one
+ * of those RtlExitUserProcess already killed, and a DLL's detach routine entering it must
+ * come back. The entry completes as an acquisition and leaves the word alone. */
+static BOOL crit_shutdown_bypass( RTL_CRITICAL_SECTION *crit )
+{
+    if (!RtlDllShutdownInProgress()) return FALSE;
+    WARN( "process %s is shutting down, section %p entered without waiting\n",
+          debugstr_w(NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer), crit );
+    return TRUE;
+}
+
+/* Waits for the notification a release reserved for this thread. Only a real token comes
+ * back as success: a caller that may not block asks crit_shutdown_bypass first. */
 static NTSTATUS crit_wait_token( RTL_CRITICAL_SECTION *crit )
 {
     unsigned int timeout = 5;
-
-    /* Don't allow blocking on a critical section during process termination */
-    if (RtlDllShutdownInProgress())
-    {
-        WARN( "process %s is shutting down, returning STATUS_SUCCESS\n",
-              debugstr_w(NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer) );
-        return STATUS_SUCCESS;
-    }
 
     for (;;)
     {
@@ -397,7 +402,10 @@ static NTSTATUS crit_wait_token( RTL_CRITICAL_SECTION *crit )
 
 NTSTATUS WINAPI RtlpWaitForCriticalSection( RTL_CRITICAL_SECTION *crit )
 {
-    NTSTATUS status = crit_wait_token( crit );
+    NTSTATUS status;
+
+    if (crit_shutdown_bypass( crit )) return STATUS_SUCCESS;
+    status = crit_wait_token( crit );
 
     if (!status && crit_section_has_debuginfo( crit )) crit->DebugInfo->ContentionCount++;
     return status;
@@ -455,6 +463,8 @@ static NTSTATUS crit_enter_contended( RTL_CRITICAL_SECTION *crit )
                 continue;
             return STATUS_SUCCESS;
         }
+
+        if (crit_shutdown_bypass( crit )) return STATUS_SUCCESS;
 
         state.waiters++;
         if (holds_wake) state.wake = FALSE;
