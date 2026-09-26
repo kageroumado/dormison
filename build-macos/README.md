@@ -303,8 +303,9 @@ with `publish-engine.sh`.
 
 wineserver runs no guest code, so it is the one process in the engine that need not
 be translated; served natively it takes the Rosetta round trip out of every wait,
-handle and APC a game makes (`bispectral/native-server/RESULTS.md`: p99 0.52×, wall
-0.77×, server CPU 0.71× on syncprof). `build-native-server.sh` configures a second,
+handle and APC a game makes. Packaged against the Rosetta server it measures at
+parity on syncprof (`bispectral/native-server/RESULTS.md`, r11 against r10: p50 0.98×,
+p99 1.01×, wall 1.02×, server CPU 0.96×); its case is one translated process fewer. `build-native-server.sh` configures a second,
 arm64 tree for `server/` under `$DORMISON_BUILD/server-native` with
 `-DDORMISON_X86_64_GUEST`, which makes `server/registry.c` report the x86 machines,
 and builds a universal libinotify beside it; `server/mach.c` decides per process
