@@ -420,6 +420,7 @@ final class Presenter: @unchecked Sendable {
             CommandBufferHook.present = unsafeBitCast(method_getImplementation(method), to: CommandBufferHook.PresentIMP.self)
             let replacement: CommandBufferHook.PresentIMP = { buffer, selector, drawable in
                 if let proxy = drawable as? SevoDrawable, let commandBuffer = buffer as? MTLCommandBuffer {
+                    proxy.presenter.announcePresents(.hooked, .immediate)
                     proxy.presenter.present(proxy, in: commandBuffer) { real in CommandBufferHook.present?(buffer, selector, real) }
                 } else {
                     CommandBufferHook.present?(buffer, selector, drawable)
@@ -431,6 +432,7 @@ final class Presenter: @unchecked Sendable {
             CommandBufferHook.presentAtTime = unsafeBitCast(method_getImplementation(method), to: CommandBufferHook.PresentTimedIMP.self)
             let replacement: CommandBufferHook.PresentTimedIMP = { buffer, selector, drawable, time in
                 if let proxy = drawable as? SevoDrawable, let commandBuffer = buffer as? MTLCommandBuffer {
+                    proxy.presenter.announcePresents(.hooked, .atTime)
                     proxy.presenter.present(proxy, in: commandBuffer) { real in CommandBufferHook.presentAtTime?(buffer, selector, real, time) }
                 } else {
                     CommandBufferHook.presentAtTime?(buffer, selector, drawable, time)
@@ -442,6 +444,7 @@ final class Presenter: @unchecked Sendable {
             CommandBufferHook.presentAfterDuration = unsafeBitCast(method_getImplementation(method), to: CommandBufferHook.PresentTimedIMP.self)
             let replacement: CommandBufferHook.PresentTimedIMP = { buffer, selector, drawable, duration in
                 if let proxy = drawable as? SevoDrawable, let commandBuffer = buffer as? MTLCommandBuffer {
+                    proxy.presenter.announcePresents(.hooked, .afterMinimumDuration)
                     proxy.presenter.present(proxy, in: commandBuffer) { real in CommandBufferHook.presentAfterDuration?(buffer, selector, real, duration) }
                 } else {
                     CommandBufferHook.presentAfterDuration?(buffer, selector, drawable, duration)
@@ -462,6 +465,25 @@ enum CommandBufferHook {
     nonisolated(unsafe) static var present: PresentIMP?
     nonisolated(unsafe) static var presentAtTime: PresentTimedIMP?
     nonisolated(unsafe) static var presentAfterDuration: PresentTimedIMP?
+}
+
+/// How a renderer's present reached a Metal view's presenter.
+enum PresentRoute: String {
+    /// `-[MTLCommandBuffer presentDrawable:]` or a timed variant, through the hook:
+    /// a classic queue, the M1's path.
+    case hooked = "hooked command buffer"
+    /// The drawable's own present after a Metal 4 queue relayed `signalDrawable:` to it:
+    /// D3DMetal on Apple GPU family 9 (M3 and later).
+    case metal4 = "direct from a Metal 4 queue"
+    /// The drawable's own present with no queue's signal before it.
+    case direct = "direct with no queue signal"
+}
+
+/// Which present call the renderer made.
+enum PresentVariant: String {
+    case immediate = "present"
+    case atTime = "present(at:)"
+    case afterMinimumDuration = "present(afterMinimumDuration:)"
 }
 
 /// One line on stderr, prefixed so it can be picked out of the wine log.
@@ -840,6 +862,21 @@ final class MetalViewPresenter: ViewPresenter {
     private lazy var readyEvent: MTLSharedEvent? = device.makeSharedEvent()
     private var readyValue: UInt64 = 0
     private var loggedDirectPresent = false
+    /// The route, variant and display sync the last `presents:` line named, under the lock.
+    private var announced: (route: PresentRoute, variant: PresentVariant, displaySync: Bool)?
+
+    /// Frames the Metal 4 route handed over with display sync off, in the order they were
+    /// presented, each waiting for its ready value. An entry holds its proxy, and the proxy
+    /// is the slot's hold. Under the lock.
+    private var waiting: [DeferredFrame] = []
+    /// Where a waiting frame's final pass is encoded and presented once its ready value is
+    /// signaled: one serial queue, so frames reach the screen in order.
+    private let deferredQueue = DispatchQueue(label: "sevo.presenter.deferred", qos: .userInteractive)
+    private lazy var readyListener = MTLSharedEventListener(dispatchQueue: deferredQueue)
+    /// Entered for each waiting frame and left once it is presented. The renderer's thread
+    /// and the detach wait on it before encoding or letting go, so one thread at a time
+    /// encodes a frame.
+    private let deferredFrames = DispatchGroup()
 
     /// The event and the next value a renderer queue signals for a drawable, or nil on a
     /// device that makes no shared event.
@@ -1012,6 +1049,28 @@ final class MetalViewPresenter: ViewPresenter {
 
     // MARK: The present
 
+    /// Logs how this view's frames arrive, once and again whenever that changes: the
+    /// route, the present call, and the renderer layer's `displaySyncEnabled`, which
+    /// decide whether the present can wait on the display.
+    ///
+    /// - Returns: the display sync it read.
+    @discardableResult
+    func announcePresents(_ route: PresentRoute, _ variant: PresentVariant) -> Bool {
+        let displaySync = rendererLayer.displaySyncEnabled
+        lock.lock()
+        let changed = announced.map { $0.route != route || $0.variant != variant || $0.displaySync != displaySync } ?? true
+        if changed { announced = (route, variant, displaySync) }
+        lock.unlock()
+        guard changed else { return displaySync }
+        let thread = switch route {
+        case .hooked: ""
+        case .metal4 where !displaySync: ", on screen from the ready signal's listener"
+        case .metal4, .direct: ", on screen from the renderer's thread"
+        }
+        log("presents: \(route.rawValue), \(variant.rawValue), display sync \(displaySync ? "on" : "off")\(thread), \(sourceDescription)")
+        return displaySync
+    }
+
     /// Encodes the scaler chain and the final pass into the renderer's own
     /// command buffer, then presents the real drawable through `presentReal`
     /// (the original `presentDrawable:` the hook replaced). Runs on the
@@ -1047,18 +1106,73 @@ final class MetalViewPresenter: ViewPresenter {
     /// `present`: a drawable presented directly waits only for the buffers
     /// already scheduled, and the final pass that draws it is not yet, so the
     /// screen showed whatever the drawable last held.
-    func presentDirectly(_ proxy: SevoDrawable, presentReal: (CAMetalDrawable, MTLCommandBuffer) -> Void) {
-        guard let queue = fallbackQueue ?? device.makeCommandQueue(), let commandBuffer = queue.makeCommandBuffer() else { return }
+    ///
+    /// With the renderer's display sync off and its queue's ready signal in hand, the
+    /// call returns at once and the frame goes up from the signal's listener
+    /// (``presentWhenReady(_:signal:queue:presentReal:)``). Otherwise it takes an on-screen
+    /// drawable here, on the renderer's thread, so a layer with display sync on paces the
+    /// renderer the way its own `nextDrawable` would.
+    func presentDirectly(
+        _ proxy: SevoDrawable, variant: PresentVariant, presentReal: @escaping (CAMetalDrawable, MTLCommandBuffer) -> Void
+    ) {
+        let displaySync = announcePresents(proxy.readySignal == nil ? .direct : .metal4, variant)
+        guard let queue = fallbackQueue ?? device.makeCommandQueue() else { return }
         fallbackQueue = queue
-        // The renderer's own queue is not this one: without its signal the final pass could
-        // sample a slot the renderer is still drawing.
-        if let ready = proxy.readySignal { commandBuffer.encodeWaitForEvent(ready.event, value: ready.value) }
         if !loggedDirectPresent, Presenter.shared.tracing {
             loggedDirectPresent = true
             log("direct present " + (proxy.readySignal == nil ? "with no signal from the renderer's queue" : "waits for the renderer's signal"))
         }
+        if let ready = proxy.readySignal, !displaySync {
+            presentWhenReady(proxy, signal: ready, queue: queue, presentReal: presentReal)
+            return
+        }
+        // Frames handed over while display sync was off go up first.
+        _ = deferredFrames.wait(timeout: .now() + .seconds(1))
+        guard let commandBuffer = queue.makeCommandBuffer() else { return }
+        // The renderer's own queue is not this one: without its signal the final pass could
+        // sample a slot the renderer is still drawing.
+        if let ready = proxy.readySignal { commandBuffer.encodeWaitForEvent(ready.event, value: ready.value) }
         present(proxy, in: commandBuffer) { real in presentReal(real, commandBuffer) }
         commandBuffer.commit()
+    }
+
+    /// Hands a frame to the ready signal's listener, which presents it once the renderer's
+    /// queue has signaled its value: the renderer's thread never waits on the display, the
+    /// way it does not with a plain layer whose display sync is off. Frames go up in the
+    /// order they were presented, every one of them.
+    private func presentWhenReady(
+        _ proxy: SevoDrawable, signal: (event: MTLSharedEvent, value: UInt64), queue: MTLCommandQueue,
+        presentReal: @escaping (CAMetalDrawable, MTLCommandBuffer) -> Void
+    ) {
+        deferredFrames.enter()
+        lock.lock()
+        waiting.append(DeferredFrame(value: signal.value, proxy: proxy, presentReal: presentReal))
+        lock.unlock()
+        signal.event.notify(readyListener, atValue: signal.value) { [self] event, _ in
+            presentReady(signaled: event.signaledValue, queue: queue)
+        }
+    }
+
+    /// On the listener's queue: the waiting frames from the oldest up to the first whose
+    /// value is not yet signaled are encoded and presented, each on its own command buffer.
+    private func presentReady(signaled: UInt64, queue: MTLCommandQueue) {
+        lock.lock()
+        let due = waiting.prefix { $0.value <= signaled }
+        waiting.removeFirst(due.count)
+        lock.unlock()
+        for frame in due {
+            if let commandBuffer = queue.makeCommandBuffer() {
+                present(frame.proxy, in: commandBuffer) { real in frame.presentReal(real, commandBuffer) }
+                commandBuffer.commit()
+            }
+            deferredFrames.leave()
+        }
+    }
+
+    /// Frames already handed over go up before the driver lets go. One whose ready value
+    /// never comes keeps its slot and this presenter until the process ends.
+    override func willDetach() {
+        _ = deferredFrames.wait(timeout: .now() + .seconds(1))
     }
 
     /// What the renderer set on its layer that the on-screen one must match
@@ -1076,6 +1190,14 @@ final class MetalViewPresenter: ViewPresenter {
         let colorspace = rendererLayer.colorspace
         if onscreen.colorspace != colorspace { onscreen.colorspace = colorspace }
     }
+}
+
+/// A frame the Metal 4 route handed over, waiting for the renderer's ready value.
+struct DeferredFrame {
+    let value: UInt64
+    /// Held until the frame is presented: the proxy's release is the slot's.
+    let proxy: SevoDrawable
+    let presentReal: (CAMetalDrawable, MTLCommandBuffer) -> Void
 }
 
 /// One source texture of a Metal view's ring and the state of its lease.
@@ -1112,8 +1234,11 @@ final class SevoDrawable: NSObject, CAMetalDrawable {
     let slot: SourceSlot
     let presenter: MetalViewPresenter
     let drawableID: Int
+    /// Under ``handlersLock``: a deferred present forwards them on the listener's queue
+    /// while the renderer can still add one.
     private var handlers: [MTLDrawablePresentedHandler] = []
     private var real: CAMetalDrawable?
+    private let handlersLock = NSLock()
 
     init(slot: SourceSlot, presenter: MetalViewPresenter, drawableID: Int) {
         self.slot = slot
@@ -1129,28 +1254,36 @@ final class SevoDrawable: NSObject, CAMetalDrawable {
 
     var layer: CAMetalLayer { presenter.rendererLayer }
 
-    var presentedTime: CFTimeInterval { real?.presentedTime ?? 0 }
+    var presentedTime: CFTimeInterval {
+        handlersLock.lock()
+        defer { handlersLock.unlock() }
+        return real?.presentedTime ?? 0
+    }
 
     func addPresentedHandler(_ block: @escaping MTLDrawablePresentedHandler) {
+        handlersLock.lock()
+        defer { handlersLock.unlock() }
         if let real { real.addPresentedHandler(block) } else { handlers.append(block) }
     }
 
     func forwardHandlers(to real: CAMetalDrawable) {
+        handlersLock.lock()
+        defer { handlersLock.unlock() }
         self.real = real
         for handler in handlers { real.addPresentedHandler(handler) }
         handlers.removeAll()
     }
 
     func present() {
-        presenter.presentDirectly(self) { real, buffer in buffer.present(real) }
+        presenter.presentDirectly(self, variant: .immediate) { real, buffer in buffer.present(real) }
     }
 
     func present(at presentationTime: CFTimeInterval) {
-        presenter.presentDirectly(self) { real, buffer in buffer.present(real, atTime: presentationTime) }
+        presenter.presentDirectly(self, variant: .atTime) { real, buffer in buffer.present(real, atTime: presentationTime) }
     }
 
     func present(afterMinimumDuration duration: CFTimeInterval) {
-        presenter.presentDirectly(self) { real, buffer in buffer.present(real, afterMinimumDuration: duration) }
+        presenter.presentDirectly(self, variant: .afterMinimumDuration) { real, buffer in buffer.present(real, afterMinimumDuration: duration) }
     }
 
     /// What the renderer's queue signals when its work on this drawable is done: set by

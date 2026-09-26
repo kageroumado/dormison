@@ -10,6 +10,19 @@ uses the section for `r<N>` as the GitHub release body.
   captured display and left a black strip across the top with every click that far off
   (Subnautica 2's Fullscreen on a MacBook Pro). The borderless window that covers the screen
   keeps r18's fix: no menu bar or Dock on edge pressure during mouse-look.
+- A presented Metal window logs one `sevo:presenter presents:` line when its first frame
+  arrives and again whenever it changes: whether frames come through the hooked command
+  buffer or the drawable's own present after a Metal 4 queue's signal, which present call the
+  game makes (`present`, `present(at:)`, `present(afterMinimumDuration:)`), and the game
+  layer's display sync. Whether a present may wait on the display follows from these, and
+  the log could not say which applied.
+- A game on the Metal 4 route (D3DMetal on M3 and later) with display sync off no longer
+  waits in its present call. The present records the frame and returns; a listener on the
+  game queue's ready signal takes the on-screen drawable, draws the final pass and presents,
+  every frame in order. The present used to take the on-screen drawable on the game's queue
+  worker and hold it about one GPU frame (p99 13–19 ms on an M3 Pro), which added 1↔2
+  refresh alternation to the game's frame times. With display sync on, the present still
+  waits for the on-screen drawable, which is what paces the game to the display.
 
 ## r18
 
