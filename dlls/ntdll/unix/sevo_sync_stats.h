@@ -64,6 +64,7 @@
     X(waitall_grants)           /* sets the pump granted and consumed */ \
     X(waitall_cancels)          /* registrations this side cancelled at the deadline */ \
     X(waitall_stale_wakes)      /* wakes that carried no verdict, registered again */ \
+    X(waitall_commit_waits)     /* tokens found committing, waited for the grant */ \
     X(freeze_waits)             /* mutations that met a frozen object */ \
     X(freeze_parks)             /* ... and slept on its high word */
 

@@ -5,6 +5,29 @@ uses the section for `r<N>` as the GitHub release body.
 
 ## r20
 
+- A WaitForMultipleObjects WaitAll on msync returns once the pump has consumed its set: the
+  pump takes the registration into a committing state the thread cannot cancel out of,
+  consumes every member under the freeze, then publishes the grant, and the thread waits
+  through the committing state. The pump used to publish the grant first and consume after,
+  so a thread could return from a completed WaitAll and read a semaphore it had just taken at
+  its old count (`waitall-query.exe`: 4 such reads in 1.1 million rounds on r19b, 0 on r20).
+  NtQuerySemaphore, NtQueryEvent and NtQueryMutant on msync objects wait for the pump's freeze
+  to end, so a query never reads a WaitAll set half consumed, and a dying thread's mutexes are
+  abandoned only after any grant the pump is committing to it has landed.
+- A WASAPI stream's volume is applied to its own samples, each channel at its own gain: a
+  render stream's as CoreAudio pulls them, a capture stream's as its frames are converted, so
+  a muted capture session records silence and a stream at left 0, right 1 plays the left
+  channel silent. The stream used to set its AudioUnit's one gain to the loudest channel's
+  volume, so every channel played at that one, and a capture stream's volume and mute
+  changed nothing. `SEVO_COREAUDIO_DEVICE_BUFFER=1` still writes the device's controls instead.
+- The Metal presenter encodes one frame at a time whichever route brings it: the renderer's
+  thread on the hooked or the blocking direct route and the ready signal's listener take one
+  lock from the encoding through the present of the drawable. A switch from display sync off
+  to on while the listener was still presenting an earlier frame used to let the renderer's
+  thread wait one second for it and then encode beside it, on the same scaler, intermediates
+  and render pass. A deferred frame whose ready value has not come within that second is
+  dropped, at the transition and at the window's detach, rather than holding the frame behind
+  it or the presenter.
 - A game's own loader copy opened by LaunchServices with no program, from its Dock tile or
   from Finder, opens `sevoflurane://play/<id>` so the game starts through Sevoflurane, where
   it printed wine's usage and quit.

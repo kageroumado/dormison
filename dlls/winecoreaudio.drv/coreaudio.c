@@ -41,6 +41,7 @@
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <fenv.h>
+#include <math.h>
 #include <unistd.h>
 
 #include <CoreAudio/CoreAudio.h>
@@ -76,6 +77,18 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(coreaudio);
 
+/* How a sample of the stream's format is scaled by a channel gain. */
+enum sample_kind
+{
+    SAMPLES_COMPANDED,  /* mu-law and A-law: played at unity */
+    SAMPLES_PCM8,
+    SAMPLES_PCM16,
+    SAMPLES_PCM24,
+    SAMPLES_PCM32,
+    SAMPLES_FLOAT32,
+    SAMPLES_FLOAT64,
+};
+
 struct coreaudio_stream
 {
     os_unfair_lock lock;
@@ -83,6 +96,13 @@ struct coreaudio_stream
     AudioConverterRef converter;
     AudioStreamBasicDescription dev_desc; /* audio unit format, not necessarily the same as fmt */
     AudioDeviceID dev_id;
+
+    /* The stream's volume, as a gain per channel of fmt applied to its samples: for a render
+     * stream in the render callback, for a capture stream as the captured frames are converted.
+     * Under the lock; gains_unity says every gain is 1.0, so the samples are left alone. */
+    enum sample_kind samples;
+    float *gains;
+    BOOL gains_unity;
 
     EDataFlow flow;
     DWORD flags;
@@ -353,6 +373,99 @@ static WAVEFORMATEX *clone_format(const WAVEFORMATEX *fmt)
     return ret;
 }
 
+static enum sample_kind sample_kind_of(const WAVEFORMATEX *fmt)
+{
+    const WAVEFORMATEXTENSIBLE *fmtex = (const WAVEFORMATEXTENSIBLE *)fmt;
+    BOOL extensible = fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE;
+
+    if(fmt->wFormatTag == WAVE_FORMAT_PCM ||
+       (extensible && IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_PCM))){
+        switch(fmt->wBitsPerSample){
+        case 8: return SAMPLES_PCM8;
+        case 16: return SAMPLES_PCM16;
+        case 24: return SAMPLES_PCM24;
+        case 32: return SAMPLES_PCM32;
+        }
+    }else if(fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+             (extensible && IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT))){
+        switch(fmt->wBitsPerSample){
+        case 32: return SAMPLES_FLOAT32;
+        case 64: return SAMPLES_FLOAT64;
+        }
+    }
+    return SAMPLES_COMPANDED;
+}
+
+/* Scales frames of the stream's format in place, each channel by its gain. Every gain is
+ * within [0, 1], so a scaled sample stays within its type. Called with the lock held. */
+static void apply_gains(struct coreaudio_stream *stream, BYTE *buffer, UINT32 frames)
+{
+    const UINT32 channels = stream->fmt->nChannels;
+    const float *gains = stream->gains;
+    UINT32 i, c;
+
+    if(stream->gains_unity || stream->samples == SAMPLES_COMPANDED)
+        return;
+
+    switch(stream->samples){
+    case SAMPLES_PCM8:
+    {
+        BYTE *sample = buffer;
+        for(i = 0; i < frames; i++)
+            for(c = 0; c < channels; c++, sample++)
+                *sample = (BYTE)(128 + lrintf(((int)*sample - 128) * gains[c]));
+        break;
+    }
+    case SAMPLES_PCM16:
+    {
+        INT16 *sample = (INT16 *)buffer;
+        for(i = 0; i < frames; i++)
+            for(c = 0; c < channels; c++, sample++)
+                *sample = (INT16)lrintf(*sample * gains[c]);
+        break;
+    }
+    case SAMPLES_PCM24:
+    {
+        BYTE *sample = buffer;
+        for(i = 0; i < frames; i++)
+            for(c = 0; c < channels; c++, sample += 3){
+                INT32 value = (INT32)(((UINT32)sample[2] << 24) | ((UINT32)sample[1] << 16) | ((UINT32)sample[0] << 8)) >> 8;
+                value = lrintf(value * gains[c]);
+                sample[0] = value;
+                sample[1] = value >> 8;
+                sample[2] = value >> 16;
+            }
+        break;
+    }
+    case SAMPLES_PCM32:
+    {
+        INT32 *sample = (INT32 *)buffer;
+        for(i = 0; i < frames; i++)
+            for(c = 0; c < channels; c++, sample++)
+                *sample = (INT32)lrint(*sample * (double)gains[c]);
+        break;
+    }
+    case SAMPLES_FLOAT32:
+    {
+        float *sample = (float *)buffer;
+        for(i = 0; i < frames; i++)
+            for(c = 0; c < channels; c++, sample++)
+                *sample *= gains[c];
+        break;
+    }
+    case SAMPLES_FLOAT64:
+    {
+        double *sample = (double *)buffer;
+        for(i = 0; i < frames; i++)
+            for(c = 0; c < channels; c++, sample++)
+                *sample *= gains[c];
+        break;
+    }
+    case SAMPLES_COMPANDED:
+        break;
+    }
+}
+
 static void silence_buffer(struct coreaudio_stream *stream, BYTE *buffer, UINT32 frames)
 {
     WAVEFORMATEXTENSIBLE *fmtex = (WAVEFORMATEXTENSIBLE*)stream->fmt;
@@ -387,6 +500,8 @@ static OSStatus ca_render_cb(void *user, AudioUnitRenderActionFlags *flags,
             memcpy(((BYTE *)data->mBuffers[0].mData) + chunk_bytes, stream->local_buffer, to_copy_bytes - chunk_bytes);
         }else
             memcpy(data->mBuffers[0].mData, stream->local_buffer + lcl_offs_bytes, to_copy_bytes);
+
+        apply_gains(stream, data->mBuffers[0].mData, to_copy_frames);
 
         stream->lcl_offs_frames += to_copy_frames;
         stream->lcl_offs_frames %= stream->bufsize_frames;
@@ -846,6 +961,7 @@ static NTSTATUS unix_create_stream(void *args)
     AURenderCallbackStruct input;
     OSStatus sc;
     SIZE_T size;
+    UINT32 i;
 
     params->result = S_OK;
 
@@ -859,6 +975,15 @@ static NTSTATUS unix_create_stream(void *args)
         params->result = E_OUTOFMEMORY;
         goto end;
     }
+
+    stream->samples = sample_kind_of(stream->fmt);
+    stream->gains = malloc(stream->fmt->nChannels * sizeof(*stream->gains));
+    if(!stream->gains){
+        params->result = E_OUTOFMEMORY;
+        goto end;
+    }
+    for(i = 0; i < stream->fmt->nChannels; i++) stream->gains[i] = 1.0f;
+    stream->gains_unity = TRUE;
 
     stream->period_frames = muldiv(params->period, stream->fmt->nSamplesPerSec, 10000000);
     if (stream->period_frames == 0)
@@ -944,6 +1069,7 @@ end:
     if(FAILED(params->result)){
         if(stream->converter) AudioConverterDispose(stream->converter);
         if(stream->unit) AudioComponentInstanceDispose(stream->unit);
+        free(stream->gains);
         free(stream->fmt);
         free(stream);
     } else {
@@ -972,6 +1098,7 @@ static NTSTATUS unix_release_stream( void *args )
     }
 
     if(stream->converter) AudioConverterDispose(stream->converter);
+    free(stream->gains);
     free(stream->resamp_buffer);
     free(stream->wrap_buffer);
     free(stream->cap_buffer);
@@ -1367,6 +1494,8 @@ static void capture_resample(struct coreaudio_stream *stream)
             WARN("AudioConverterFillComplexBuffer failed: %x\n", (int)sc);
             break;
         }
+
+        apply_gains(stream, stream->resamp_buffer, wanted_frames);
 
         ca_wrap_buffer(stream->local_buffer,
                        stream->wri_offs_frames * stream->fmt->nBlockAlign,
@@ -1965,16 +2094,19 @@ static void set_device_volumes(struct coreaudio_stream *stream, const struct set
     }
 }
 
-/* A stream's volume is a gain on its own AudioUnit, so it scales this stream alone; the
- * device's volume is the Mac's output volume, which Music and every other program play at.
- * The AUHAL unit has one gain for all channels, so it takes the loudest channel's volume: a
- * stream that sets its channels to different volumes plays all of them at that one. */
+/* A stream's volume is a gain on its own samples, so it scales this stream alone, each channel
+ * at its own volume; the device's volume is the Mac's output volume, which Music and every
+ * other program play at. A render stream's samples are scaled as CoreAudio pulls them, a
+ * capture stream's as they are converted, so a muted session records silence. Each gain is the
+ * session's master volume (0 while the session is muted) times the session's and the
+ * stream's volume for that channel. */
 static NTSTATUS unix_set_volumes(void *args)
 {
     struct set_volumes_params *params = args;
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
-    Float32 gain = 0.0f;
-    OSStatus sc;
+    char text[256];
+    int len = 0;
+    BOOL unity = TRUE;
     UINT32 i;
 
     if (device_wide_settings())
@@ -1983,17 +2115,22 @@ static NTSTATUS unix_set_volumes(void *args)
         return STATUS_SUCCESS;
     }
 
-    /* The unit's gain acts on its output element: a capture stream records at the device's level. */
-    if (stream->flow != eRender)
-        return STATUS_SUCCESS;
-
+    os_unfair_lock_lock(&stream->lock);
     for (i = 0; i < stream->fmt->nChannels; ++i)
-        gain = max(gain, params->session_volumes[i] * params->volumes[i]);
-    gain *= params->master_volume;
+    {
+        float gain = params->master_volume * params->session_volumes[i] * params->volumes[i];
 
-    sc = AudioUnitSetParameter(stream->unit, kHALOutputParam_Volume, kAudioUnitScope_Global, 0, gain, 0);
-    if (sc != noErr)
-        WARN("Couldn't set the unit's volume: %x\n", (int)sc);
+        if (!(gain > 0.0f)) gain = 0.0f;
+        else if (gain > 1.0f) gain = 1.0f;
+        stream->gains[i] = gain;
+        if (gain != 1.0f) unity = FALSE;
+        if (len < (int)sizeof(text) - 8) len += snprintf(text + len, sizeof(text) - len, " %.3f", gain);
+    }
+    stream->gains_unity = unity;
+    os_unfair_lock_unlock(&stream->lock);
+
+    TRACE("stream %p %s master %.3f channel gains%s\n", stream, stream->flow == eRender ? "render" : "capture",
+          params->master_volume, text);
 
     return STATUS_SUCCESS;
 }

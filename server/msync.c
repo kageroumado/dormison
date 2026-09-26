@@ -384,11 +384,16 @@ static inline void wake_word( int *shm, uint32_t flags )
 
 /* A thread's word in shm_tid_map while it has a wait registered: a state in the low four
  * bits and, for a WaitAll, the registration's generation above them. ntdll's msync.c has
- * the same values and the protocol: the three live values are the client's, a grant or
- * the alert is written by compare-and-swap from TOKEN_REGISTERED of the registration's
- * generation, a cancellation by compare-and-swap from any live value, and a terminal
- * value is never overwritten. A wait-any registration has generation zero; a WaitAll
- * never does. */
+ * the same values and the protocol: the three live values are the client's, the alert is
+ * written by compare-and-swap from TOKEN_REGISTERED of the registration's generation, a
+ * cancellation by compare-and-swap from any live value, and a terminal value is never
+ * overwritten. A grant takes two steps: the pump moves the token from TOKEN_REGISTERED to
+ * TOKEN_COMMITTING by compare-and-swap, consumes every member of the set under the
+ * freeze, and then stores the terminal grant. TOKEN_COMMITTING is neither live nor
+ * terminal: the thread cannot cancel out of it, nothing but the pump writes over it, and
+ * the thread waits for the value that follows, so a thread that reads its grant reads a
+ * set already consumed, and a query it makes next reads the consumed objects. A wait-any
+ * registration has generation zero; a WaitAll never does. */
 #define TOKEN_WOKEN              0
 #define TOKEN_REGISTERED         1
 #define ACK_PENDING              2
@@ -397,6 +402,7 @@ static inline void wake_word( int *shm, uint32_t flags )
 #define TOKEN_GRANTED_ABANDONED  5
 #define TOKEN_CANCELLED          6
 #define TOKEN_ALERTED            7
+#define TOKEN_COMMITTING         8
 #define TOKEN_STATE_MASK         0xf
 #define TOKEN_GENERATION_SHIFT   4
 
@@ -416,13 +422,40 @@ static inline int make_token( unsigned int generation, int state )
     return (int)(generation << TOKEN_GENERATION_SHIFT) | state;
 }
 
-/* Moves a registered WaitAll's token to a terminal value; 0 when the thread cancelled
- * first or the registration is of an earlier generation. */
+/* Moves a registered WaitAll's token from TOKEN_REGISTERED to the alert or to
+ * TOKEN_COMMITTING; 0 when the thread cancelled first or the registration is of an earlier
+ * generation. */
 static inline int finish_token( int tid, unsigned int generation, int state )
 {
     int expected = make_token( generation, TOKEN_REGISTERED );
     return __atomic_compare_exchange_n( shm_tid_map + tid, &expected, make_token( generation, state ), 0,
                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
+}
+
+/* Publishes the grant of a set the pump has consumed. The token is TOKEN_COMMITTING, which
+ * only the pump writes over, so the store needs no compare; it follows the consuming stores
+ * in every thread's view. */
+static inline void publish_grant( int tid, unsigned int generation, int state )
+{
+    __atomic_store_n( shm_tid_map + tid, make_token( generation, state ), __ATOMIC_SEQ_CST );
+}
+
+/* The token once the pump is done committing a grant to it. The commit is a handful of
+ * stores under the freeze, so the wait is short and only the main thread makes it, before
+ * it abandons a dying thread's mutexes: the ownership the grant stores must be in place. */
+static inline int settled_token( int tid )
+{
+    int *token = shm_tid_map + tid, val = __atomic_load_n( token, __ATOMIC_SEQ_CST );
+
+    while (token_state( val ) == TOKEN_COMMITTING)
+    {
+        int ret;
+
+        do ret = __ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, token, val, 0 );
+        while (ret == -EINTR || ret == -EFAULT);
+        val = __atomic_load_n( token, __ATOMIC_SEQ_CST );
+    }
+    return val;
 }
 
 /* Moves a thread's token from a live value to TOKEN_CANCELLED, so no grant can reach it. */
@@ -682,9 +715,9 @@ static void *grown( void *array, unsigned int *capacity, unsigned int needed, si
 }
 
 /* Evaluates the given registrations together: every member of every set is frozen, each
- * registration is granted and consumed if its whole set is available at that instant,
- * oldest first, and the objects are thawed before the granted threads are woken. A
- * registration whose thread cancelled or died is retired on the way. */
+ * registration whose whole set is available at that instant is taken into TOKEN_COMMITTING,
+ * consumed and then granted, oldest first, and the objects are thawed before the granted
+ * threads are woken. A registration whose thread cancelled or died is retired on the way. */
 static void evaluate_regs( const int *tids, unsigned int n )
 {
     unsigned int i, total = 0, unique = 0, granted = 0;
@@ -718,9 +751,10 @@ static void evaluate_regs( const int *tids, unsigned int n )
             continue;
         }
         if (!reg_satisfiable( reg, &abandoned )) continue;
-        if (finish_token( reg->tid, reg->generation, abandoned ? TOKEN_GRANTED_ABANDONED : TOKEN_GRANTED ))
+        if (finish_token( reg->tid, reg->generation, TOKEN_COMMITTING ))
         {
             reg_commit( reg );
+            publish_grant( reg->tid, reg->generation, abandoned ? TOKEN_GRANTED_ABANDONED : TOKEN_GRANTED );
             granted_tids[granted++] = reg->tid;
         }
         retire_reg( reg );
@@ -1324,8 +1358,11 @@ void msync_abandon_mutexes( thread_id_t tid )
     struct msync *msync;
 
     /* A WaitAll the thread had registered ends now, before any mutex it held is released
-     * to the pump's evaluation, so the pump cannot grant a set to a thread that is gone. */
+     * to the pump's evaluation, so the pump cannot grant a set to a thread that is gone. A
+     * set the pump is committing to it is the thread's once the commit lands, and its
+     * mutexes are abandoned below with the rest. */
     cancel_token( tid );
+    settled_token( tid );
     send_header_message( tid | MESSAGE_THREAD_DIED );
 
     LIST_FOR_EACH_ENTRY( msync, &mutex_list, struct msync, mutex_entry )

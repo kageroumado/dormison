@@ -525,11 +525,16 @@ static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
  * to sleep waiting for the acknowledgment; the server acknowledges with TOKEN_REGISTERED,
  * or TOKEN_WOKEN when a wait-any is already satisfied, and wakes the thread only when what
  * it replaced was ACK_PARKED. A WaitAll ends in one of the terminal values: the pump
- * writes a grant or the alert by compare-and-swap from TOKEN_REGISTERED of the same
- * generation, and the thread cancels by compare-and-swap from any of the three live
- * values, so exactly one of them wins and a grant is never lost or taken twice. The
- * generation is never zero, so a wait-any registration, which has none, and a WaitAll
- * cannot be mistaken for each other. server/msync.c has the same values. */
+ * writes the alert by compare-and-swap from TOKEN_REGISTERED of the same generation, and
+ * the thread cancels by compare-and-swap from any of the three live values, so exactly
+ * one of them wins. A grant takes two steps: the pump moves the token from
+ * TOKEN_REGISTERED to TOKEN_COMMITTING by compare-and-swap, consumes the set, and then
+ * stores TOKEN_GRANTED or TOKEN_GRANTED_ABANDONED. TOKEN_COMMITTING is neither live nor
+ * terminal: the thread cannot cancel out of it, and it waits for the value that follows,
+ * so the success it returns is of a set already consumed and a query it makes next reads
+ * the consumed objects. The generation is never zero, so a wait-any registration, which has
+ * none, and a WaitAll cannot be mistaken for each other. server/msync.c has the same
+ * values. */
 #define TOKEN_WOKEN              0
 #define TOKEN_REGISTERED         1
 #define ACK_PENDING              2
@@ -538,6 +543,7 @@ static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
 #define TOKEN_GRANTED_ABANDONED  5
 #define TOKEN_CANCELLED          6
 #define TOKEN_ALERTED            7
+#define TOKEN_COMMITTING         8
 #define TOKEN_STATE_MASK         0xf
 #define TOKEN_GENERATION_SHIFT   4
 #define TOKEN_GENERATION_MAX     ((1u << 28) - 1)
@@ -556,6 +562,26 @@ static inline BOOL token_live( int value )
 static inline int token_with_state( int value, int state )
 {
     return (value & ~TOKEN_STATE_MASK) | state;
+}
+
+/* Looks at a committing token this many times before parking on it. The pump's commit is a
+ * handful of stores under the freeze, then the grant and a wake of this word. */
+#define COMMIT_SPIN 4096
+
+/* Sleeps until the pump has stored the grant over a TOKEN_COMMITTING token; the caller
+ * reloads the token afterwards. */
+static void wait_for_grant( int *addr, int seen )
+{
+    int i, ret;
+
+    SEVO_STAT( waitall_commit_waits );
+    for (i = 0; i < COMMIT_SPIN; i++)
+    {
+        YIELD_PROCESSOR;
+        if (__atomic_load_n( addr, __ATOMIC_ACQUIRE ) != seen) return;
+    }
+    do ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, seen, 0 );
+    while (ret == -EINTR || ret == -EFAULT);
 }
 
 #ifndef SEVO_ACK_SPIN_DEFAULT
@@ -722,15 +748,25 @@ static BOOL set_visibly_unavailable( void **objs_shm, int count, int tid )
 }
 
 /* Moves the token from a live value to TOKEN_CANCELLED. FALSE when the pump reached a
- * terminal value first, which *value then holds: a grant found this way stands. */
+ * terminal value first, which *value then holds: a grant found this way stands, and one
+ * the pump is still committing is waited for. */
 static BOOL cancel_token( int *addr, int *value )
 {
     int val = __atomic_load_n( addr, __ATOMIC_SEQ_CST );
 
-    while (token_live( val ))
-        if (__atomic_compare_exchange_n( addr, &val, token_with_state( val, TOKEN_CANCELLED ), 0,
-                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
-            return TRUE;
+    for (;;)
+    {
+        if (token_live( val ))
+        {
+            if (__atomic_compare_exchange_n( addr, &val, token_with_state( val, TOKEN_CANCELLED ), 0,
+                                             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
+                return TRUE;
+            continue;
+        }
+        if (token_state( val ) != TOKEN_COMMITTING) break;
+        wait_for_grant( addr, val );
+        val = __atomic_load_n( addr, __ATOMIC_SEQ_CST );
+    }
     *value = val;
     return FALSE;
 }
@@ -764,6 +800,12 @@ static NTSTATUS msync_wait_all( const int *objs, void **objs_shm, int alert_obj,
     for (;;)
     {
         val = __atomic_load_n( addr, __ATOMIC_ACQUIRE );
+        if (token_state( val ) == TOKEN_COMMITTING)
+        {
+            /* The pump is consuming the set for this thread; the grant follows. */
+            wait_for_grant( addr, val );
+            continue;
+        }
         if (!token_live( val )) break;
 
         if (token_state( val ) == ACK_PENDING)
@@ -1213,9 +1255,12 @@ NTSTATUS msync_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
     return STATUS_SUCCESS;
 }
 
+/* A query reads the object once the pump is not consuming it: a WaitAll's members move
+ * together under the freeze, and a read in the middle would show a set half taken. */
 NTSTATUS msync_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION *info )
 {
-    uint64_t word = load_object( get_shm( obj ) );
+    struct semaphore *semaphore = get_shm( obj );
+    uint64_t word = thawed_object( semaphore, load_object( semaphore ) );
 
     info->CurrentCount = object_low( word );
     info->MaximumCount = object_high( word );
@@ -1282,8 +1327,9 @@ NTSTATUS msync_pulse_event_obj( int obj, LONG *prev_state )
 NTSTATUS msync_query_event_obj( int obj, EVENT_BASIC_INFORMATION *info )
 {
     struct event *event = get_shm( obj );
+    uint64_t word = thawed_object( event, load_object( event ) );
 
-    info->EventState = __atomic_load_n( &event->signaled, __ATOMIC_SEQ_CST );
+    info->EventState = object_low( word );
     info->EventType = (event->msync_type == MSYNC_AUTO_EVENT ? SynchronizationEvent : NotificationEvent);
 
     return STATUS_SUCCESS;
@@ -1315,7 +1361,8 @@ NTSTATUS msync_release_mutex_obj( int obj, LONG *prev_count )
 
 NTSTATUS msync_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info )
 {
-    uint64_t word = load_object( get_shm( obj ) );
+    struct mutex *mutex = get_shm( obj );
+    uint64_t word = thawed_object( mutex, load_object( mutex ) );
 
     info->CurrentCount = 1 - (LONG)object_high( word );
     info->OwnedByCaller = (object_low( word ) == GetCurrentThreadId());

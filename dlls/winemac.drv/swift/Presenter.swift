@@ -550,6 +550,13 @@ class ViewPresenter: NSObject {
     private var dropped = 0
     private var lastSummary = CFAbsoluteTimeGetCurrent()
 
+    /// Frames a subclass let go of without encoding them.
+    func noteDropped(_ count: Int) {
+        statsLock.lock()
+        dropped += count
+        statsLock.unlock()
+    }
+
     /// The view's own layer, at the device pixels the view covers, made on
     /// the main thread when the driver first asks for it. Never create it on
     /// another thread: such a `CAMetalLayer` joins the layer tree and draws
@@ -873,10 +880,16 @@ final class MetalViewPresenter: ViewPresenter {
     /// signaled: one serial queue, so frames reach the screen in order.
     private let deferredQueue = DispatchQueue(label: "sevo.presenter.deferred", qos: .userInteractive)
     private lazy var readyListener = MTLSharedEventListener(dispatchQueue: deferredQueue)
-    /// Entered for each waiting frame and left once it is presented. The renderer's thread
-    /// and the detach wait on it before encoding or letting go, so one thread at a time
-    /// encodes a frame.
+    /// Entered for each waiting frame and left once it is presented or dropped. The
+    /// renderer's thread waits on it before a blocking present, so the frames handed over
+    /// earlier reach the screen first, and the detach waits on it before letting go.
     private let deferredFrames = DispatchGroup()
+    /// Held from the encoding of a frame through the present of its drawable. The
+    /// renderer's thread, on the hooked or the blocking direct route, and the ready
+    /// signal's listener each take it, so one frame is encoded at a time whichever route
+    /// it came by: `encodeFrame`'s scaler, intermediates and render pass are one set per
+    /// presenter. Taken before `lock`, never while holding it.
+    private let encoding = NSLock()
 
     /// The event and the next value a renderer queue signals for a drawable, or nil on a
     /// device that makes no shared event.
@@ -1085,6 +1098,7 @@ final class MetalViewPresenter: ViewPresenter {
         slot.presented = true
         lock.unlock()
         var sequence = 0
+        encoding.lock()
         if let real = encodeFrame(source: slot.texture, in: commandBuffer) {
             proxy.forwardHandlers(to: real)
             presentReal(real)
@@ -1093,6 +1107,7 @@ final class MetalViewPresenter: ViewPresenter {
             sequence = presentsSubmitted
             lock.unlock()
         }
+        encoding.unlock()
         commandBuffer.addCompletedHandler { [self] _ in presentCompleted(slot, sequence: sequence) }
     }
 
@@ -1126,8 +1141,10 @@ final class MetalViewPresenter: ViewPresenter {
             presentWhenReady(proxy, signal: ready, queue: queue, presentReal: presentReal)
             return
         }
-        // Frames handed over while display sync was off go up first.
-        _ = deferredFrames.wait(timeout: .now() + .seconds(1))
+        // Frames handed over while display sync was off go up first; one whose ready value
+        // has not come within a second is dropped rather than holding this frame behind it.
+        // The frames the listener is presenting meanwhile are ordered by `encoding`.
+        if deferredFrames.wait(timeout: .now() + .seconds(1)) == .timedOut { abandonWaitingFrames() }
         guard let commandBuffer = queue.makeCommandBuffer() else { return }
         // The renderer's own queue is not this one: without its signal the final pass could
         // sample a slot the renderer is still drawing.
@@ -1169,10 +1186,25 @@ final class MetalViewPresenter: ViewPresenter {
         }
     }
 
-    /// Frames already handed over go up before the driver lets go. One whose ready value
-    /// never comes keeps its slot and this presenter until the process ends.
+    /// Drops every frame still waiting for its ready value: the entries leave the list
+    /// under the lock, so the listener finds none of them due, and their proxies go with
+    /// them, which frees their slots. The listener's registration for each value stays
+    /// with the event and holds this presenter until that value is signaled.
+    private func abandonWaitingFrames() {
+        lock.lock()
+        let abandoned = waiting
+        waiting.removeAll()
+        lock.unlock()
+        guard !abandoned.isEmpty else { return }
+        for _ in abandoned { deferredFrames.leave() }
+        noteDropped(abandoned.count)
+        log("\(abandoned.count) deferred frame(s) not ready within a second, dropped")
+    }
+
+    /// Frames already handed over go up before the driver lets go; those whose ready value
+    /// has not come within a second are dropped.
     override func willDetach() {
-        _ = deferredFrames.wait(timeout: .now() + .seconds(1))
+        if deferredFrames.wait(timeout: .now() + .seconds(1)) == .timedOut { abandonWaitingFrames() }
     }
 
     /// What the renderer set on its layer that the on-screen one must match
