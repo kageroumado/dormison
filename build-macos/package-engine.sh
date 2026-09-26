@@ -28,12 +28,19 @@ OUT="$ENGINES/$VERSION"
 
 # --- the driver's Swift half is linked into winemac.so, so it is built before
 # `make`, not here; wine's makefiles cannot order it. Refuse to package a tree
-# where the archive is missing or newer than the winemac.so meant to carry it. ---
+# where the archive is missing, older than its Swift sources, or newer than the
+# winemac.so meant to carry it. ---
 SWIFT_A="$REPO/dlls/winemac.drv/swift/libwinemacswift.a"
 [ -f "$SWIFT_A" ] || {
     echo "missing $SWIFT_A — run 'make -C $REPO/dlls/winemac.drv/swift', then rebuild wine"
     exit 1
 }
+for source in "$REPO"/dlls/winemac.drv/swift/*.swift; do
+    if [ "$source" -nt "$SWIFT_A" ]; then
+        echo "$(basename "$source") is newer than $SWIFT_A — run 'make -C $REPO/dlls/winemac.drv/swift', relink winemac.so and re-run install-lib"
+        exit 1
+    fi
+done
 if [ "$SWIFT_A" -nt "$STAGE/lib/wine/x86_64-unix/winemac.so" ]; then
     echo "$SWIFT_A is newer than the staged winemac.so — rebuild wine and re-run install-lib"
     exit 1
