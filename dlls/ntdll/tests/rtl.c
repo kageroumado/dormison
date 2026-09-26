@@ -3085,7 +3085,6 @@ static void test_RtlLeaveCriticalSection(void)
 
     status = RtlEnterCriticalSection(&cs);
     ok(!status, "RtlEnterCriticalSection failed: %lx\n", status);
-    todo_wine
     ok(cs.LockCount == -2, "expected LockCount == -2, got %ld\n", cs.LockCount);
     ok(cs.RecursionCount == 1, "expected RecursionCount == 1, got %ld\n", cs.RecursionCount);
     ok(cs.OwningThread == ULongToHandle(GetCurrentThreadId()), "unexpected OwningThread\n");
@@ -3116,7 +3115,6 @@ static void test_RtlLeaveCriticalSection(void)
     /* entering section fixes RecursionCount */
     status = RtlEnterCriticalSection(&cs);
     ok(!status, "RtlEnterCriticalSection failed: %lx\n", status);
-    todo_wine
     ok(cs.LockCount == -2, "expected LockCount == -2, got %ld\n", cs.LockCount);
     ok(cs.RecursionCount == 1, "expected RecursionCount == 1, got %ld\n", cs.RecursionCount);
     ok(cs.OwningThread == ULongToHandle(GetCurrentThreadId()), "unexpected OwningThread\n");

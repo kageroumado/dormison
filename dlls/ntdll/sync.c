@@ -187,6 +187,79 @@ static inline NTSTATUS wait_semaphore( RTL_CRITICAL_SECTION *crit, int timeout )
     }
 }
 
+/* LockCount in the documented post-2003-SP1 encoding, which is one word holding three
+ * things at once:
+ *
+ *   bit 0 clear   the section is held
+ *   bit 1 clear   one wake is outstanding, and a token is stored for whoever takes it
+ *   bits 2-31     the one's complement of the number of queued waiters
+ *
+ * so a free, unwoken, uncontended section is -1 and every value is
+ * -1 - locked - 2 * wake - 4 * waiters. Ownership, queued interest and the outstanding
+ * wake therefore change together in one exchange, which is what lets a release publish
+ * the lock as free while a waiter is still on its way: the state L=0 W=1 hands the next
+ * acquisition to whoever asks first, and issues no further wake however often the lock
+ * is taken and released meanwhile. One notification is reserved, never the lock.
+ *
+ * Every program that reads LockCount reads it in this encoding, so it is a property of
+ * the build: nothing here may be selected at run time, and a comparison like
+ * `LockCount > 0` — which meant "there are contenders" in the legacy encoding — is
+ * false for every state of this one.
+ */
+
+enum
+{
+    CRIT_LOCKED = 1,   /* subtracted from -1 when the section is held */
+    CRIT_WAKE   = 2,   /* subtracted when a wake is outstanding */
+    CRIT_WAITER = 4,   /* subtracted once per queued waiter */
+};
+
+struct crit_state
+{
+    BOOL locked;
+    BOOL wake;      /* a notification has been posted and not yet consumed */
+    LONG waiters;   /* threads that have published interest and not been served */
+};
+
+static inline struct crit_state crit_decode( LONG value )
+{
+    struct crit_state state;
+
+    state.locked  = !(value & CRIT_LOCKED);
+    state.wake    = !(value & CRIT_WAKE);
+    state.waiters = (LONG)(~(ULONG)value >> 2);
+    return state;
+}
+
+/* Unsigned throughout: the waiter field spans 30 bits, so the multiply would overflow a
+ * signed LONG for a section with more than 2^29 of them. decode() and encode() are exact
+ * inverses for every 32-bit value, which is what makes a compare-and-swap on the encoded
+ * word the same thing as a compare-and-swap on the three fields. */
+static inline LONG crit_encode( struct crit_state state )
+{
+    ULONG value = ~0u - (state.locked ? CRIT_LOCKED : 0) - (state.wake ? CRIT_WAKE : 0)
+                  - CRIT_WAITER * (ULONG)state.waiters;
+    return (LONG)value;
+}
+
+/* Takes a section that is free, whatever its queue and outstanding wake say. A thread
+ * that asks while a woken waiter is still on its way wins here, and that is the point:
+ * Windows lets the running thread barge, and a protocol that handed the lock to the
+ * waiter instead is the convoy `bispectral/order-probe` measures us losing to. */
+static BOOL crit_try_acquire( RTL_CRITICAL_SECTION *crit )
+{
+    for (;;)
+    {
+        LONG value = *(volatile LONG *)&crit->LockCount;
+        struct crit_state state = crit_decode( value );
+
+        if (state.locked) return FALSE;
+        state.locked = TRUE;
+        if (InterlockedCompareExchange( &crit->LockCount, crit_encode( state ), value ) == value)
+            return TRUE;
+    }
+}
+
 static ULONG crit_sect_default_flags(void)
 {
     if (NtCurrentTeb()->Peb->OSMajorVersion > 6 ||
@@ -295,7 +368,7 @@ NTSTATUS WINAPI RtlDeleteCriticalSection( RTL_CRITICAL_SECTION *crit )
 /******************************************************************************
  *      RtlpWaitForCriticalSection   (NTDLL.@)
  */
-NTSTATUS WINAPI RtlpWaitForCriticalSection( RTL_CRITICAL_SECTION *crit )
+static NTSTATUS crit_wait_token( RTL_CRITICAL_SECTION *crit )
 {
     unsigned int timeout = 5;
 
@@ -311,7 +384,7 @@ NTSTATUS WINAPI RtlpWaitForCriticalSection( RTL_CRITICAL_SECTION *crit )
     {
         NTSTATUS status = wait_semaphore( crit, timeout );
 
-        if (status == STATUS_WAIT_0) break;
+        if (status == STATUS_WAIT_0) return STATUS_SUCCESS;
         if (status != WAIT_TIMEOUT) return status;
 
         timeout = (TRACE_ON(relay) ? 300 : 60);
@@ -319,8 +392,15 @@ NTSTATUS WINAPI RtlpWaitForCriticalSection( RTL_CRITICAL_SECTION *crit )
         ERR( "section %p %s wait timed out in thread %04lx, blocked by %04lx, retrying (%u sec)\n",
              crit, debugstr_a(crit_section_get_name(crit)), GetCurrentThreadId(), HandleToULong(crit->OwningThread), timeout );
     }
-    if (crit_section_has_debuginfo( crit )) crit->DebugInfo->ContentionCount++;
-    return STATUS_SUCCESS;
+}
+
+
+NTSTATUS WINAPI RtlpWaitForCriticalSection( RTL_CRITICAL_SECTION *crit )
+{
+    NTSTATUS status = crit_wait_token( crit );
+
+    if (!status && crit_section_has_debuginfo( crit )) crit->DebugInfo->ContentionCount++;
+    return status;
 }
 
 
@@ -348,37 +428,78 @@ NTSTATUS WINAPI RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
 /******************************************************************************
  *      RtlEnterCriticalSection   (NTDLL.@)
  */
+/* Publishes interest, waits for the reserved notification, and then races for the lock on
+ * equal terms with every running thread. A waiter that wins clears the wake it consumed in
+ * the same exchange that takes the lock; one that loses gives the wake back and re-queues,
+ * so the next release posts again and no notification is ever lost or duplicated. */
+static NTSTATUS crit_enter_contended( RTL_CRITICAL_SECTION *crit )
+{
+    BOOL holds_wake = FALSE;    /* this thread consumed a notification and owes its bit back */
+    BOOL charged = FALSE;       /* the contention counter has been charged for this Enter */
+
+    for (;;)
+    {
+        LONG value = *(volatile LONG *)&crit->LockCount;
+        struct crit_state state = crit_decode( value );
+        NTSTATUS status;
+
+        /* A thread only reaches here holding a wake while that wake is still outstanding,
+         * because it is the only one that can clear it; trust the word over the flag. */
+        if (holds_wake && !state.wake) holds_wake = FALSE;
+
+        if (!state.locked)
+        {
+            state.locked = TRUE;
+            if (holds_wake) state.wake = FALSE;
+            if (InterlockedCompareExchange( &crit->LockCount, crit_encode( state ), value ) != value)
+                continue;
+            return STATUS_SUCCESS;
+        }
+
+        state.waiters++;
+        if (holds_wake) state.wake = FALSE;
+        if (InterlockedCompareExchange( &crit->LockCount, crit_encode( state ), value ) != value)
+            continue;
+        holds_wake = FALSE;
+
+        if (!charged)
+        {
+            if (crit_section_has_debuginfo( crit )) crit->DebugInfo->ContentionCount++;
+            charged = TRUE;
+        }
+        if ((status = crit_wait_token( crit ))) return status;
+        holds_wake = TRUE;
+    }
+}
+
+
 NTSTATUS WINAPI RtlEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
 {
+    NTSTATUS status;
+
+    if (crit_try_acquire( crit )) goto done;
+
+    if (crit->OwningThread == ULongToHandle(GetCurrentThreadId()))
+    {
+        crit->RecursionCount++;
+        return STATUS_SUCCESS;
+    }
+
     if (crit->SpinCount)
     {
         ULONG count;
 
-        if (RtlTryEnterCriticalSection( crit )) return STATUS_SUCCESS;
         for (count = crit->SpinCount; count > 0; count--)
         {
-            if (crit->LockCount > 0) break;  /* more than one waiter, don't bother spinning */
-            if (crit->LockCount == -1)       /* try again */
-            {
-                if (InterlockedCompareExchange( &crit->LockCount, 0, -1 ) == -1) goto done;
-            }
+            struct crit_state state = crit_decode( *(volatile LONG *)&crit->LockCount );
+
+            if (state.waiters) break;   /* someone is already queued, don't bother spinning */
+            if (!state.locked && crit_try_acquire( crit )) goto done;
             YieldProcessor();
         }
     }
 
-    if (InterlockedIncrement( &crit->LockCount ))
-    {
-        NTSTATUS status;
-
-        if (crit->OwningThread == ULongToHandle(GetCurrentThreadId()))
-        {
-            crit->RecursionCount++;
-            return STATUS_SUCCESS;
-        }
-
-        /* Now wait for it */
-        if ((status = RtlpWaitForCriticalSection( crit ))) RtlRaiseStatus( status );
-    }
+    if ((status = crit_enter_contended( crit ))) RtlRaiseStatus( status );
 done:
     crit->OwningThread   = ULongToHandle(GetCurrentThreadId());
     crit->RecursionCount = 1;
@@ -392,7 +513,7 @@ done:
 BOOL WINAPI RtlTryEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
 {
     BOOL ret = FALSE;
-    if (InterlockedCompareExchange( &crit->LockCount, 0, -1 ) == -1)
+    if (crit_try_acquire( crit ))
     {
         crit->OwningThread   = ULongToHandle(GetCurrentThreadId());
         crit->RecursionCount = 1;
@@ -400,7 +521,6 @@ BOOL WINAPI RtlTryEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
     }
     else if (crit->OwningThread == ULongToHandle(GetCurrentThreadId()))
     {
-        InterlockedIncrement( &crit->LockCount );
         crit->RecursionCount++;
         ret = TRUE;
     }
@@ -434,19 +554,32 @@ NTSTATUS WINAPI RtlLeaveCriticalSection( RTL_CRITICAL_SECTION *crit )
 {
     if (--crit->RecursionCount)
     {
-        if (crit->RecursionCount > 0) InterlockedDecrement( &crit->LockCount );
-        else ERR( "section %p %s is not acquired\n", crit, debugstr_a( crit_section_get_name( crit )));
+        /* Recursion is not queued interest and owns no bit of the word. */
+        if (crit->RecursionCount < 0)
+            ERR( "section %p %s is not acquired\n", crit, debugstr_a( crit_section_get_name( crit )));
+        return STATUS_SUCCESS;
     }
-    else
+
+    /* Ownership is given up before the lock is published free, so a thread that takes it
+     * in the next instant never reads the previous owner out of OwningThread. */
+    crit->OwningThread = 0;
+    for (;;)
     {
-        crit->OwningThread = 0;
-        if (InterlockedDecrement( &crit->LockCount ) >= 0)
+        LONG value = *(volatile LONG *)&crit->LockCount;
+        struct crit_state state = crit_decode( value );
+        BOOL post = state.waiters > 0 && !state.wake;
+
+        state.locked = FALSE;
+        if (post)
         {
-            /* someone is waiting */
-            RtlpUnWaitCriticalSection( crit );
+            state.wake = TRUE;
+            state.waiters--;
         }
+        if (InterlockedCompareExchange( &crit->LockCount, crit_encode( state ), value ) != value)
+            continue;
+        if (post) RtlpUnWaitCriticalSection( crit );
+        return STATUS_SUCCESS;
     }
-    return STATUS_SUCCESS;
 }
 
 /******************************************************************
