@@ -3,6 +3,14 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r19
+
+- A fullscreen game in exclusive fullscreen keeps the menu bar and the Dock as r17 left them
+  while it holds the cursor for mouse-look, where r18 switched them to hidden under the
+  captured display and left a black strip across the top with every click that far off
+  (Subnautica 2's Fullscreen on a MacBook Pro). The borderless window that covers the screen
+  keeps r18's fix: no menu bar or Dock on edge pressure during mouse-look.
+
 ## r18
 
 Fixes from the 2026-09-26 sync, runtime and graphics reviews.
@@ -44,6 +52,23 @@ Fixes from the 2026-09-26 sync, runtime and graphics reviews.
   an uninitialized value there.
 - An allocation retried after native views are released searches the normal address range;
   the staging allocator retried over an empty range when no upper limit was given.
+- A fullscreen game that holds the cursor for mouse-look (clipped and hidden) hides the menu
+  bar and the Dock outright, and they return to auto-hide when the cursor shows or the clip
+  ends. Auto-hide revealed them whenever the pinned pointer pushed against a screen edge,
+  one point inside it or not.
+- A process that has presented prints `sevo:exit pid=<pid> wpid=<wine pid> windows closed`
+  when its last on-screen window goes away, hidden or destroyed (a destroyed main window
+  reaches the driver only as the hide; hidden helper windows live until exit), and
+  `… windows reopened` when one shows again, so the app can tell a crash during the
+  program's own teardown from one while it was playing.
+- wined3d says in the default log whether a presented OpenGL window's frame size reached the
+  presenter, and if not, why: exclusive fullscreen, a destination that is not the whole
+  client area, or a back buffer as large as the window. One `sevo:presenter … wined3d` line
+  each time the answer or the sizes change.
+- The presenter's readout names the engine that is running, from the build name
+  `wine --version` prints, and falls back to `SEVO_ENGINE_NAME` only when ntdll gives none.
+  The app writes that variable from its own idea of the active engine, which lagged behind
+  an engine installed while it ran.
 
 ## r17
 

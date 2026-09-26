@@ -122,6 +122,69 @@ static void swapchain_gl_publish_presenter_source(struct wined3d_swapchain *swap
     swapchain->presenter_source = source;
 }
 
+/* Whether a present's source size went to the presenter, and if not, why. */
+enum presenter_source_reason
+{
+    PRESENTER_SOURCE_UNMARKED = 1,
+    PRESENTER_SOURCE_PUBLISHED,
+    PRESENTER_SOURCE_FULLSCREEN,
+    PRESENTER_SOURCE_PARTIAL_DST,
+    PRESENTER_SOURCE_EMPTY,
+    PRESENTER_SOURCE_FILLS_WINDOW,
+    PRESENTER_SOURCE_LARGER,
+};
+
+static const char *presenter_source_reason_text(enum presenter_source_reason reason)
+{
+    switch (reason)
+    {
+        case PRESENTER_SOURCE_PUBLISHED: return "published";
+        case PRESENTER_SOURCE_FULLSCREEN: return "not published: exclusive fullscreen";
+        case PRESENTER_SOURCE_PARTIAL_DST: return "not published: dst rect is not the whole client area";
+        case PRESENTER_SOURCE_EMPTY: return "not published: empty source";
+        case PRESENTER_SOURCE_FILLS_WINDOW: return "not published: back buffer is the client size";
+        case PRESENTER_SOURCE_LARGER: return "not published: back buffer larger than the client area";
+        default: return "unmarked";
+    }
+}
+
+/* One line in the default log whenever the answer for a window the presenter
+ * shows changes, never per frame: the upscaler's source is the whole drawable
+ * unless the size was published, and this names why it was not. It goes
+ * through __wine_dbg_output, so no debug channel has to be on. The
+ * fullscreen answer is reached without the window property, which is looked
+ * up here only when the answer changes. */
+static void swapchain_gl_note_presenter_source(struct wined3d_swapchain *swapchain, HWND window,
+        enum presenter_source_reason reason, LONG width, LONG height, const RECT *dst_rect, const RECT *client)
+{
+    RECT client_rect;
+    char line[256];
+
+    if (swapchain->presenter_note.window == window && swapchain->presenter_note.reason == reason
+            && swapchain->presenter_note.width == width && swapchain->presenter_note.height == height
+            && EqualRect(&swapchain->presenter_note.dst, dst_rect))
+        return;
+    swapchain->presenter_note.window = window;
+    swapchain->presenter_note.reason = reason;
+    swapchain->presenter_note.width = width;
+    swapchain->presenter_note.height = height;
+    swapchain->presenter_note.dst = *dst_rect;
+
+    if (reason == PRESENTER_SOURCE_UNMARKED) return;
+    if (!client)
+    {
+        if (!GetPropW(window, presenter_gl_prop)) return;
+        if (!GetClientRect(window, &client_rect)) SetRectEmpty(&client_rect);
+        client = &client_rect;
+    }
+    snprintf(line, sizeof(line), "sevo:presenter wpid=%04x wined3d windowed %u src %dx%d "
+            "dst (%d,%d)-(%d,%d) client %dx%d %s\n", (unsigned int)GetCurrentProcessId(),
+            swapchain->state.desc.windowed, (int)width, (int)height, (int)dst_rect->left,
+            (int)dst_rect->top, (int)dst_rect->right, (int)dst_rect->bottom, (int)client->right,
+            (int)client->bottom, presenter_source_reason_text(reason));
+    __wine_dbg_output(line);
+}
+
 /* The destination of a present that stretches the back buffer over a whole
  * window the presenter shows: the back buffer's own size at the top left. Any
  * other destination is returned as it is. */
@@ -130,13 +193,32 @@ static const RECT *swapchain_gl_presenter_dst_rect(struct wined3d_swapchain *swa
 {
     LONG width = src_rect->right - src_rect->left, height = src_rect->bottom - src_rect->top;
     HWND window = swapchain->win_handle;
+    enum presenter_source_reason reason;
+    const RECT *client = NULL;
     UINT_PTR source = 0;
-    RECT client;
+    RECT client_rect;
 
-    if (swapchain->state.desc.windowed && GetPropW(window, presenter_gl_prop)
-            && GetClientRect(window, &client) && EqualRect(dst_rect, &client)
-            && width > 0 && height > 0 && width <= client.right && height <= client.bottom
-            && (width != client.right || height != client.bottom))
+    if (!swapchain->state.desc.windowed)
+        reason = PRESENTER_SOURCE_FULLSCREEN;
+    else if (!GetPropW(window, presenter_gl_prop) || !GetClientRect(window, &client_rect))
+        reason = PRESENTER_SOURCE_UNMARKED;
+    else
+    {
+        client = &client_rect;
+        if (!EqualRect(dst_rect, client))
+            reason = PRESENTER_SOURCE_PARTIAL_DST;
+        else if (width <= 0 || height <= 0)
+            reason = PRESENTER_SOURCE_EMPTY;
+        else if (width > client->right || height > client->bottom)
+            reason = PRESENTER_SOURCE_LARGER;
+        else if (width == client->right && height == client->bottom)
+            reason = PRESENTER_SOURCE_FILLS_WINDOW;
+        else
+            reason = PRESENTER_SOURCE_PUBLISHED;
+    }
+    swapchain_gl_note_presenter_source(swapchain, window, reason, width, height, dst_rect, client);
+
+    if (reason == PRESENTER_SOURCE_PUBLISHED)
     {
         SetRect(unscaled, 0, 0, width, height);
         dst_rect = unscaled;

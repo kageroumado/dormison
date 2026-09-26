@@ -32,6 +32,15 @@ extern void sevo_provenance_init(int presenter_on, const char *upscaler);
    counts. */
 extern void sevo_provenance_note_present(const void *surface);
 
+/* The program's last on-screen window went away, hidden or destroyed. A
+   process that has presented prints
+   `sevo:exit pid=<unix pid> wpid=<wine pid, %04x> windows closed`, and
+   `… windows reopened` when a window shows again after it, so a crash that
+   follows a `windows closed` with no reopening happened while the program
+   was on its way out. */
+extern void sevo_provenance_note_windows_closed(void);
+extern void sevo_provenance_note_windows_shown(void);
+
 /* D3DMetal's own present hook: a CLIENT_SURFACE_PRESENTED posted from
    nextDrawable, and one executed by the driver's event handler. The pair
    is printed under SEVO_GFX_LOG=1. */

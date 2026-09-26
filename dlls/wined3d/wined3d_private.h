@@ -4142,6 +4142,15 @@ struct wined3d_swapchain
        presenter of a GL drawable; 0 while nothing is. */
     HWND presenter_source_window;
     UINT_PTR presenter_source;
+    /* The presenter answer last logged, and the window and sizes it was
+       for; the log line repeats only when one of them changes. */
+    struct
+    {
+        HWND window;
+        unsigned int reason;
+        LONG width, height;
+        RECT dst;
+    } presenter_note;
 };
 
 void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activate);

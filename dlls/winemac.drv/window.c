@@ -47,6 +47,27 @@ static CFMutableDictionaryRef win_datas;
 
 static unsigned int activate_on_focus_time;
 
+/* The process's Cocoa windows that are ordered in, across all its threads.
+   Hidden helper windows (wined3d's GL window, message-only toplevels) hold
+   a Cocoa window until exit and never count. */
+static LONG on_screen_count;
+
+/* The last window going off screen, hidden or destroyed, is the program's
+   teardown as far as the app can tell: a program that destroys its main
+   window reaches the driver only as the hide. */
+static void set_on_screen(struct macdrv_win_data *data, BOOL on_screen)
+{
+    if (!data->on_screen == !on_screen) return;
+    data->on_screen = on_screen;
+    if (on_screen)
+    {
+        if (InterlockedIncrement(&on_screen_count) == 1)
+            sevo_provenance_note_windows_shown();
+    }
+    else if (!InterlockedDecrement(&on_screen_count))
+        sevo_provenance_note_windows_closed();
+}
+
 
 /* per-monitor DPI aware NtUserSetWindowPos call */
 static BOOL set_window_pos(HWND hwnd, HWND after, INT x, INT y, INT cx, INT cy, UINT flags)
@@ -518,7 +539,7 @@ static void destroy_cocoa_window(struct macdrv_win_data *data)
 
     macdrv_destroy_cocoa_window(data->cocoa_window);
     data->cocoa_window = 0;
-    data->on_screen = FALSE;
+    set_on_screen(data, FALSE);
 }
 
 
@@ -656,7 +677,7 @@ static void show_window(struct macdrv_win_data *data)
     if (!prev_window)
         activate = activate_on_focus_time && (NtGetTickCount() - activate_on_focus_time < 2000);
     macdrv_order_cocoa_window(data->cocoa_window, prev_window, next_window, activate);
-    data->on_screen = TRUE;
+    set_on_screen(data, TRUE);
 
     info.cbSize = sizeof(info);
     if (NtUserGetGUIThreadInfo(NtUserGetWindowThread(data->hwnd, NULL), &info) && info.hwndFocus &&
@@ -676,7 +697,7 @@ static void hide_window(struct macdrv_win_data *data)
 
     if (data->cocoa_window)
         macdrv_hide_cocoa_window(data->cocoa_window);
-    data->on_screen = FALSE;
+    set_on_screen(data, FALSE);
 }
 
 

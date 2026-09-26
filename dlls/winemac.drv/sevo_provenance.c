@@ -62,6 +62,7 @@ static char cfg_d3d11[80];
 static char cfg_d3d12[80];
 static char cfg_dxgi[80];
 static atomic_int header_printed;
+static atomic_int windows_closed_last;
 
 static atomic_ullong present_count;
 static atomic_ullong drawable_posted;
@@ -412,6 +413,25 @@ void sevo_provenance_note_present(const void *surface)
              (now_ns() - start_ns) / 1000000ULL, surface,
              layer_off_screen ? "off-screen" : "on-screen");
     }
+}
+
+void sevo_provenance_note_windows_closed(void)
+{
+    if (!provenance_on || !atomic_load(&present_count)) return;
+    atomic_store(&windows_closed_last, 1);
+    fprintf(stderr, "sevo:exit pid=%d wpid=%04x windows closed\n",
+            getpid(), (unsigned int)GetCurrentProcessId());
+    fflush(stderr);
+}
+
+void sevo_provenance_note_windows_shown(void)
+{
+    int expected = 1;
+
+    if (!atomic_compare_exchange_strong(&windows_closed_last, &expected, 0)) return;
+    fprintf(stderr, "sevo:exit pid=%d wpid=%04x windows reopened\n",
+            getpid(), (unsigned int)GetCurrentProcessId());
+    fflush(stderr);
 }
 
 void sevo_provenance_note_drawable(void)

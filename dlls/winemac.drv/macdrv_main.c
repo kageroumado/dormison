@@ -314,6 +314,23 @@ static int resizable_windows_from_option(char first)
     return RESIZABLE_WINDOWS_OFF;
 }
 
+/* The engine's build name, as `wine --version` prints it without the
+   parenthesized suffix: "dormison-r18" of "dormison-r18 (Staging)". Empty
+   when ntdll does not answer. */
+static void engine_build_name(char *name, size_t size)
+{
+    char info[256], *build, *suffix;
+    ULONG len;
+
+    name[0] = 0;
+    if (NtQuerySystemInformation(SystemWineVersionInformation, info, sizeof(info), &len)) return;
+    info[sizeof(info) - 1] = 0;
+    build = info + strlen(info) + 1;
+    if (build >= info + sizeof(info)) return;
+    if ((suffix = strstr(build, " ("))) *suffix = 0;
+    snprintf(name, size, "%s", build);
+}
+
 /***********************************************************************
  *              setup_options
  *
@@ -576,8 +593,12 @@ static NTSTATUS macdrv_init(void *arg)
 
     if (presenter_on)
     {
+        char engine[64];
+
+        engine_build_name(engine, sizeof(engine));
         presenter_on = sevo_presenter_init(upscaler_option, final_filter_option, getenv("SEVO_SHADER_DIR"),
-                                           presenter_log_on, presenter_debug_option);
+                                           presenter_log_on, presenter_debug_option,
+                                           engine[0] ? engine : NULL);
         TRACE("presenter: %s upscaler %s filter %s\n", presenter_on ? "on" : "off (no device)",
               upscaler_option, final_filter_option);
     }

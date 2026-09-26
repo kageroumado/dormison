@@ -28,10 +28,11 @@
    FinalFilter option (nearest, bilinear, lanczos), `shader_dirs` the
    colon-separated package search path or NULL, `trace` whether frames are
    traced to stderr, `debug` the PresenterDebug option ("clear" paints the
-   drawable red instead of the frame). Returns 1 when frames can be presented,
-   0 when the driver is to behave as if the option were off. */
+   drawable red instead of the frame), `engine` the engine's build name for
+   the readout, or NULL for SEVO_ENGINE_NAME. Returns 1 when frames can be
+   presented, 0 when the driver is to behave as if the option were off. */
 extern int sevo_presenter_init(const char *upscaler, const char *final_filter, const char *shader_dirs,
-                               int trace, const char *debug);
+                               int trace, const char *debug, const char *engine);
 
 /* Takes over one Metal view. `renderer_layer` is the CAMetalLayer the
    renderer draws into, which stays off screen; the returned handle owns the

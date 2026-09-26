@@ -1376,7 +1376,13 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
        such a window is key on the active space and the app is active, the bar
        and the Dock auto-hide: the bar is under the game and slides in over it
        when the pointer reaches the top edge, so View and the rest stay
-       reachable. AppKit raises on AutoHideMenuBar without AutoHideDock. */
+       reachable. While the game holds the cursor for mouse-look they are
+       hidden outright: auto-hide reveals them when a pinned pointer pushes
+       against the edge, however far inside the clip keeps it. Only while the
+       displays are uncaptured: a captured display puts the window above the
+       menu bar already, and switching the options under it leaves a black
+       strip across the top with every click that far off. AppKit raises on AutoHideMenuBar without
+       AutoHideDock, and on HideMenuBar without HideDock. */
     - (void) updatePresentationOptionsForActive:(BOOL)active
     {
         NSWindow* key = [NSApp keyWindow];
@@ -1384,13 +1390,19 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
 
         if (active && [key isKindOfClass:[WineWindow class]] && [(WineWindow*)key isFullscreen] &&
             [key isOnActiveSpace])
-            options = NSApplicationPresentationAutoHideMenuBar | NSApplicationPresentationAutoHideDock;
+        {
+            if ([self cursorHeldForMouseLook] && ![self areDisplaysCaptured])
+                options = NSApplicationPresentationHideMenuBar | NSApplicationPresentationHideDock;
+            else
+                options = NSApplicationPresentationAutoHideMenuBar | NSApplicationPresentationAutoHideDock;
+        }
 
         if ([NSApp presentationOptions] == options) return;
         [NSApp setPresentationOptions:options];
         if (presentation_log_on)
             fprintf(stderr, "sevo:presentation %p menubar=%s\n", key,
-                    options == NSApplicationPresentationDefault ? "shown" : "autohide");
+                    options == NSApplicationPresentationDefault ? "shown" :
+                    (options & NSApplicationPresentationHideMenuBar) ? "hidden" : "autohide");
     }
 
     - (void) updatePresentationOptions
@@ -1680,6 +1692,7 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
             clientWantsCursorHidden = TRUE;
             [self updateCursor:TRUE];
             [self applyDeferredClip];
+            [self updatePresentationOptions];
         }
     }
 
@@ -1696,6 +1709,7 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
                 deferredClipRect = rect;
                 hasDeferredClip = TRUE;
             }
+            [self updatePresentationOptions];
         }
     }
 
@@ -1933,8 +1947,9 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
     }
 
     /* How far a whole-screen clip keeps the cursor from the screen's edges,
-       in points: one is enough to stay out of the menu bar's and the Dock's
-       reveal zones. */
+       in points. The menu bar and the Dock are hidden while the cursor is
+       held (updatePresentationOptionsForActive:), since a pointer pushing
+       against the edge reveals them at any inset. */
     static const CGFloat screenClipInset = 1;
 
     /* Whether a clip that covers every screen is the game holding the cursor
@@ -2006,6 +2021,7 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         [self setCursorPosition:NSPointToCGPoint([self flippedMouseLocation:[NSEvent mouseLocation]])];
 
         [self updateWindowsForCursorClipping];
+        [self updatePresentationOptions];
 
         return TRUE;
     }
@@ -2022,6 +2038,7 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
 
         [self updateWindowsForCursorClipping];
+        [self updatePresentationOptions];
 
         return TRUE;
     }

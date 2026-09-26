@@ -37,6 +37,8 @@ import QuartzCore
 ///   - trace: non-zero to trace frames to stderr (`PresenterLog`).
 ///   - debug: the `PresenterDebug` option; `clear` paints the drawable red
 ///     instead of the frame.
+///   - engine: the engine's build name for the readout, `dormison-r18`; NULL
+///     falls back to `SEVO_ENGINE_NAME`.
 /// The upscaler and the final filter change now, for every view of the
 /// process. A null argument leaves that one as it is.
 @_cdecl("sevo_presenter_set_options")
@@ -63,14 +65,17 @@ public func sevoPresenterPackageNames() -> UnsafeMutablePointer<CChar>? {
 @_cdecl("sevo_presenter_init")
 public func sevoPresenterInit(
     _ upscaler: UnsafePointer<CChar>?, _ filter: UnsafePointer<CChar>?,
-    _ shaderDirectories: UnsafePointer<CChar>?, _ trace: Int32, _ debug: UnsafePointer<CChar>?
+    _ shaderDirectories: UnsafePointer<CChar>?, _ trace: Int32, _ debug: UnsafePointer<CChar>?,
+    _ engine: UnsafePointer<CChar>?
 ) -> Int32 {
     let config = PresenterConfig(
         upscaler: upscaler.map { String(cString: $0) } ?? "off",
         filter: FinalFilter(option: filter.map { String(cString: $0) } ?? ""),
         shaderDirectories: shaderDirectories.map { String(cString: $0) } ?? "",
         tracing: trace != 0,
-        debugClear: debug.map { String(cString: $0).lowercased() == "clear" } ?? false
+        debugClear: debug.map { String(cString: $0).lowercased() == "clear" } ?? false,
+        engineName: engine.map { String(cString: $0) }
+            ?? ProcessInfo.processInfo.environment["SEVO_ENGINE_NAME"] ?? "dormison"
     )
     return Presenter.shared.start(config) ? 1 : 0
 }
@@ -250,6 +255,8 @@ struct PresenterConfig {
     let tracing: Bool
     /// The final pass paints red instead of the frame.
     let debugClear: Bool
+    /// The engine the readout names.
+    var engineName = "dormison"
 
     var upscalerName: String { upscaler.lowercased() }
 }
@@ -282,7 +289,8 @@ final class Presenter: @unchecked Sendable {
         config = PresenterConfig(
             upscaler: upscaler ?? config.upscaler,
             filter: filter.map { FinalFilter(option: $0) } ?? config.filter,
-            shaderDirectories: config.shaderDirectories, tracing: config.tracing, debugClear: config.debugClear)
+            shaderDirectories: config.shaderDirectories, tracing: config.tracing, debugClear: config.debugClear,
+            engineName: config.engineName)
         optionsGeneration += 1
         let live = views.allObjects
         optionsLock.unlock()
@@ -715,9 +723,8 @@ class ViewPresenter: NSObject {
         let config = Presenter.shared.optionsSnapshot.config
         let chain = scaler == nil && !["off", "lanczos", "passthrough"].contains(config.upscalerName)
             ? "\(config.upscalerName) (unavailable)" : config.upscalerName
-        let engine = ProcessInfo.processInfo.environment["SEVO_ENGINE_NAME"] ?? "dormison"
         let rate = frames == 0 ? "picture at rest" : "\(frames) fps"
-        showReadout("\(engine) · \(sourceDescription)\n\(sizes.isEmpty ? "no frame yet" : sizes)"
+        showReadout("\(config.engineName) · \(sourceDescription)\n\(sizes.isEmpty ? "no frame yet" : sizes)"
             + " · upscaler \(chain) · filter \(config.filter) · \(rate)")
     }
 
