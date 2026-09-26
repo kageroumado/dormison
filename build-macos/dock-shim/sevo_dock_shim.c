@@ -1,6 +1,9 @@
 // The bottle's face is the app; wine's infrastructure must not reach the
 // screen. Four levers, each per process by the Windows exe name:
 //
+// "Infrastructure" is Steam's own processes by exe name, plus any process
+// started with SEVO_QUIET=1: a helper the app runs beside a game.
+//
 // 1. TransformProcessType is interposed away for Steam's own processes:
 //    winemac.drv promotes any wine process that shows a window into the
 //    Dock, and there is no demotion API. Games keep the real call, since
@@ -69,6 +72,15 @@ static const char *exe_name(void) {
 }
 
 static int is_steam_infrastructure(void) {
+    // A helper the app starts beside a game, whatever its name: SEVO_QUIET=1
+    // in its own environment, never a bottle-wide one. The first is the
+    // frame-rate unlocker Genshin Impact runs with. Its window, shown the
+    // moment it starts, took the foreground from the game, and the game
+    // minimized itself into the Dock at its next display-mode change, as you
+    // entered the world (Sevoflurane 1.17, Dormison r19, 2026-09-26). It
+    // needs no window: the app writes its settings.
+    const char *helper = getenv("SEVO_QUIET");
+    if (helper && strcmp(helper, "1") == 0) return 1;
     static const char *quiet[] = {
         "steamwebhelper.exe", "steam.exe", "steamservice.exe",
         "steamerrorreporter.exe", "steamerrorreporter64.exe",
