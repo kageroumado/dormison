@@ -98,4 +98,9 @@ extern void sevo_presenter_set_readout(int shown);
 /* The shader packages that can be chosen, newline-separated; the caller frees it. */
 extern char *sevo_presenter_package_names(void);
 
+/* The archive's build id, `sevo:winemacswift=<16 hex>`: the sha256 prefix of
+   its sources (swift/Makefile). Printed in the `sevo:run` line, and what
+   build-macos/package-engine.sh pairs a staged winemac.so with. */
+extern const char *sevo_winemacswift_build_id(void);
+
 #endif

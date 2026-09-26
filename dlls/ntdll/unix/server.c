@@ -112,6 +112,13 @@ WINE_DECLARE_DEBUG_CHANNEL(syscall);
 
 static const char *server_dir;
 
+/* Readable with strings(1): build-macos/package-engine.sh packages this ntdll.so
+ * only beside a wineserver that carries the same protocol version. */
+#define SEVO_STRINGIFY_(x) #x
+#define SEVO_STRINGIFY(x) SEVO_STRINGIFY_(x)
+const char __attribute__((used)) sevo_client_protocol_stamp[] =
+    "sevo:server-protocol=" SEVO_STRINGIFY(SERVER_PROTOCOL_VERSION);
+
 unsigned int supported_machines_count = 0;
 USHORT supported_machines[8] = { 0 };
 USHORT native_machine = 0;

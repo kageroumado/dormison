@@ -26,6 +26,9 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <float.h>
+#include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +38,20 @@
 #define DEFAULT_IDLE_SECONDS 300
 #define MAX_CLIENTS 4
 #define LINE_MAX 8192
+
+/* Set in the environment of the sibling stub this one hands an invocation to,
+ * so the sibling never hands it back: a dll neither bitness loads ends with
+ * one log line, where the two stubs re-executed each other without end. */
+#define HANDOFF_VARIABLE "SEVO_STEAM_STUB_HANDOFF"
+
+/* The PE machine of this build and of the sibling build. */
+#if defined(_WIN64)
+#define OWN_MACHINE IMAGE_FILE_MACHINE_AMD64
+#define SIBLING_MACHINE IMAGE_FILE_MACHINE_I386
+#else
+#define OWN_MACHINE IMAGE_FILE_MACHINE_I386
+#define SIBLING_MACHINE IMAGE_FILE_MACHINE_AMD64
+#endif
 
 /* ------------------------------------------------------------------ log */
 
@@ -136,10 +153,37 @@ static int file_exists(const char *path) {
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+/* The machine field of a PE's file header (IMAGE_FILE_MACHINE_AMD64 or
+ * IMAGE_FILE_MACHINE_I386 for a Steamworks dll), or 0 for a file that is not
+ * a PE. Read from the file, so the bitness is known before any LoadLibrary. */
+static WORD pe_machine(const char *path) {
+    WORD machine = 0;
+    IMAGE_DOS_HEADER dos;
+    DWORD signature;
+    IMAGE_FILE_HEADER header;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    if (fread(&dos, sizeof dos, 1, f) == 1 && dos.e_magic == IMAGE_DOS_SIGNATURE
+        && fseek(f, dos.e_lfanew, SEEK_SET) == 0
+        && fread(&signature, sizeof signature, 1, f) == 1 && signature == IMAGE_NT_SIGNATURE
+        && fread(&header, sizeof header, 1, f) == 1)
+        machine = header.Machine;
+    fclose(f);
+    return machine;
+}
+
 /* Games scatter steam_api next to the exe, under www/, or beside the
- * greenworks .node file, so a shallow walk beats a fixed list. */
+ * greenworks .node file, so a shallow walk beats a fixed list. Within one
+ * directory the dll of this build's own bitness comes first, so the stub that
+ * was handed an invocation finds the one it can load. */
 static int find_dll(const char *dir, int depth, char *out, size_t out_size) {
-    static const char *names[] = { "steam_api64.dll", "steam_api.dll" };
+    static const char *names[] = {
+#if defined(_WIN64)
+        "steam_api64.dll", "steam_api.dll"
+#else
+        "steam_api.dll", "steam_api64.dll"
+#endif
+    };
     for (int i = 0; i < 2; ++i) {
         snprintf(out, out_size, "%s\\%s", dir, names[i]);
         if (file_exists(out)) return 1;
@@ -164,7 +208,8 @@ static int find_dll(const char *dir, int depth, char *out, size_t out_size) {
 }
 
 /* A 64-bit stub cannot load a 32-bit steam_api.dll, and RPG Maker MV ships
- * 32-bit. The whole invocation goes to the sibling build, which answers. */
+ * 32-bit. The whole invocation goes to the sibling build, which answers. The
+ * sibling inherits HANDOFF_VARIABLE and so hands nothing back. */
 static int reexec_other_bitness(int argc, char **argv) {
     char self[MAX_PATH];
     if (!GetModuleFileNameA(NULL, self, sizeof self)) return 0;
@@ -185,6 +230,7 @@ static int reexec_other_bitness(int argc, char **argv) {
     for (int i = 1; i < argc && n > 0 && n < (int)sizeof cmd; ++i)
         n += snprintf(cmd + n, sizeof cmd - n, " \"%s\"", argv[i]);
 
+    SetEnvironmentVariableA(HANDOFF_VARIABLE, "1");
     STARTUPINFOA si = { .cb = sizeof si };
     PROCESS_INFORMATION pi;
     if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
@@ -256,6 +302,48 @@ static void json_escape(const char *in, char *out, size_t out_size) {
 
 static unsigned int g_appid;
 static char g_port_path[MAX_PATH];
+
+/* ----------------------------------------------------------- stat types */
+
+/* A stat is INT or FLOAT in the app's Steamworks schema, and Valve's setters
+ * succeed only for the matching type. The wire carries a name and a number,
+ * so the schema is read from Steamworks itself: the typed getters answer
+ * true only for a stat of their type. Answers are kept per name, since the
+ * schema does not change while the stub runs. */
+enum stat_type { STAT_UNKNOWN, STAT_INT32, STAT_FLOAT };
+
+#define STAT_TYPE_CACHE 64
+#define STAT_NAME_MAX 128
+
+static struct {
+    char name[STAT_NAME_MAX];
+    enum stat_type type;
+} g_stat_types[STAT_TYPE_CACHE];
+static int g_stat_type_count;
+
+static const char *stat_type_name(enum stat_type type) {
+    return type == STAT_INT32 ? "INT32" : type == STAT_FLOAT ? "FLOAT" : "unknown";
+}
+
+static enum stat_type stat_type_of(const char *name) {
+    for (int i = 0; i < g_stat_type_count; ++i)
+        if (!strcmp(g_stat_types[i].name, name)) return g_stat_types[i].type;
+
+    enum stat_type type = STAT_UNKNOWN;
+    int as_int = 0;
+    float as_float = 0;
+    if (S.get_stat_i && S.get_stat_i(S.stats, name, &as_int)) type = STAT_INT32;
+    else if (S.get_stat_f && S.get_stat_f(S.stats, name, &as_float)) type = STAT_FLOAT;
+
+    /* An unknown type is asked again next time: the stats may not have
+     * arrived from Steam yet. */
+    if (type != STAT_UNKNOWN && g_stat_type_count < STAT_TYPE_CACHE && strlen(name) < STAT_NAME_MAX) {
+        strcpy(g_stat_types[g_stat_type_count].name, name);
+        g_stat_types[g_stat_type_count].type = type;
+        ++g_stat_type_count;
+    }
+    return type;
+}
 
 static void send_line(SOCKET s, const char *text) {
     size_t len = strlen(text);
@@ -365,10 +453,28 @@ static int handle_line(SOCKET s, const char *line) {
 
     if (!strcmp(op, "setStat")) {
         if (!has_name || !has_value) { send_error(s, "no name or value"); return 0; }
-        int ok = value == (double)(int)value
-            ? S.set_stat_i && S.set_stat_i(S.stats, name, (int)value)
-            : S.set_stat_f && S.set_stat_f(S.stats, name, (float)value);
-        if (!ok) { send_error(s, "SetStat failed"); return 0; }
+        if (!isfinite(value)) { send_error(s, "value is not a finite number"); return 0; }
+        enum stat_type type = stat_type_of(name);
+        if (type == STAT_UNKNOWN) {
+            type = value == floor(value) && fabs(value) <= INT_MAX ? STAT_INT32 : STAT_FLOAT;
+            logf_("stat %s: neither typed getter answers, so its type is guessed as %s from the value %g",
+                  name, stat_type_name(type), value);
+        }
+        int ok;
+        if (type == STAT_INT32) {
+            if (value < INT_MIN || value > INT_MAX) { send_error(s, "value is outside the INT32 stat's range"); return 0; }
+            if (value != floor(value)) logf_("stat %s is INT32; %g is truncated to %d", name, value, (int)value);
+            ok = S.set_stat_i && S.set_stat_i(S.stats, name, (int)value);
+        } else {
+            if (fabs(value) > FLT_MAX) { send_error(s, "value is outside the FLOAT stat's range"); return 0; }
+            ok = S.set_stat_f && S.set_stat_f(S.stats, name, (float)value);
+        }
+        if (!ok) {
+            char text[256];
+            snprintf(text, sizeof text, "SetStat%s failed", stat_type_name(type));
+            send_error(s, text);
+            return 0;
+        }
         send_line(s, "{\"ok\":true}");
         return 0;
     }
@@ -429,9 +535,11 @@ int main(int argc, char **argv) {
     const char *appid_env = getenv("SteamAppId");
     g_appid = appid_env ? (unsigned int)strtoul(appid_env, NULL, 10) : 0;
 
+    /* A stub that was handed an invocation appends, so the transcript keeps
+     * the hand-off line the first stub wrote. */
     char log_path[MAX_PATH];
     snprintf(log_path, sizeof log_path, "%s\\steamstub-%u.log", dir, g_appid);
-    g_log = fopen(log_path, "w");
+    g_log = fopen(log_path, getenv(HANDOFF_VARIABLE) ? "a" : "w");
     snprintf(g_port_path, sizeof g_port_path, "%s\\steamstub-%u.port", dir, g_appid);
 
     logf_("sevo-steamstub %d-bit, appid %u", (int)(sizeof(void *) * 8), g_appid);
@@ -447,13 +555,28 @@ int main(int argc, char **argv) {
         logf_("no steam_api dll under %s", search);
         return 2;
     }
+    /* The dll's bitness is read from its header and decided once: the
+     * sibling's dll is handed to the sibling, a dll of neither bitness ends
+     * here with the machine named, and a stub that was handed an invocation
+     * never hands it back. */
+    WORD machine = pe_machine(dll_path);
+    if (machine == SIBLING_MACHINE) {
+        if (getenv(HANDOFF_VARIABLE)) {
+            logf_("%s has PE machine 0x%04x, which the stub that handed off to this one owns; giving up",
+                  dll_path, machine);
+            return 3;
+        }
+        return reexec_other_bitness(argc, argv) ? 0 : 3;
+    }
+    if (machine != OWN_MACHINE) {
+        logf_("%s has PE machine 0x%04x, which neither stub loads", dll_path, machine);
+        return 3;
+    }
     logf_("loading %s", dll_path);
 
     S.dll = LoadLibraryA(dll_path);
     if (!S.dll) {
-        DWORD err = GetLastError();
-        logf_("LoadLibrary failed: %lu", err);
-        if (err == ERROR_BAD_EXE_FORMAT && reexec_other_bitness(argc, argv)) return 0;
+        logf_("LoadLibrary failed: %lu", GetLastError());
         return 3;
     }
 

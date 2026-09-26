@@ -99,19 +99,28 @@ black screen.
 
 `dlls/winemac.drv/swift/` is built by its own makefile into
 `libwinemacswift.a`, which `dlls/winemac.drv/Makefile.in` names in `UNIX_LIBS`.
-Wine's makefile generator passes a plain path in `UNIX_LIBS` to the link line
-and makes no prerequisite out of it (`add_unix_libraries` in
-`tools/makedep.c` resolves only `-lfoo` to a built library), and the top-level
-Makefile's prologue comes from `configure.ac`, so there is nowhere in the
-repository to express the ordering. **Build the archive before wine**, whenever
-a Swift source changed:
+`add_unix_libraries` in `tools/makedep.c` makes a static archive named by
+path in `UNIX_LIBS` a prerequisite of the unix lib as well as a link input,
+so wine's `make` relinks `winemac.so` after the archive changed. What no
+makefile orders is the archive's own build: wine's makefiles do not know
+Swift. **Build the archive before wine**, whenever a Swift source changed:
 
 ```bash
 make -C $W/wine-src/dlls/winemac.drv/swift
 ```
 
-`package-engine.sh` refuses to package when the archive is missing or newer
-than the staged `winemac.so`, which is the shape a forgotten rebuild takes.
+The archive carries a build id, `sevo:winemacswift=<16 hex>`: the sha256 of
+the Swift sources and their makefile, so the same sources give the same id
+whenever they are built (`make -s -C dlls/winemac.drv/swift build-id` prints
+the id the sources give now). The makefile generates `BuildID.swift` from it,
+the driver prints it in its `sevo:run` line (`swift=…`), and
+`package-engine.sh` reads it out of the archive and the staged `winemac.so`
+with `strings`: it refuses to package when the archive's id is not the one the
+sources give now (a Swift source changed after the archive was built) or when
+the staged driver carries a different id (the driver was not relinked, or
+`install-lib` was not re-run). Timestamps are not consulted: wine's installer
+writes a fresh destination file, so a stale driver is younger than the archive
+it was not linked against.
 
 ## Release names
 
@@ -138,14 +147,55 @@ build-macos/package-engine.sh dormison-r1   # → ~/Library/Application Support/
 ```
 
 `package-engine.sh` takes wine from `stage/` and everything wine does not
-produce (dependency dylibs, DXMT, DXVK, D3DMetal's shims, gecko, mono, the
-dock shim) from the live engine — the one the app has installed, or the
-directory `SEVO_LIVE_ENGINE` names — rewrites install names to
-`@rpath`, re-signs, and writes `engine-info.json` with the commit subjects
-as the patch list, and builds the dock shim from `dock-shim/` into the engine.
+produce (dependency dylibs, DXMT, DXVK, D3DMetal's shims, gecko, mono) from
+the live engine — the one the app has installed, or the directory
+`SEVO_LIVE_ENGINE` names — builds the dock shim, the Steam stub and the
+Discord bridge from `build-macos/`, rewrites install names to `@rpath`,
+re-signs, and writes `engine-info.json` (what the app reads) and
+`engine-manifest.json` beside it.
 To ship a shim change alone, build it the same way into the installed engine
 and ad-hoc sign it (`codesign -s - -f`): the app loads it fresh with every
 spawn, so a running client picks it up at the next launch.
+
+### What packaging checks
+
+Before it copies anything, `package-engine.sh` runs the gates in
+`build-macos/engine-gates.sh`, each over what the files contain and never
+over when they were written. `build-macos/tests/packaging-gates.sh` runs
+them against made-up files, including a stale driver that is younger than
+the archive, and exits 0 when every case is refused or accepted as it should
+be.
+
+- **The tree is committed.** `git status` must show no change to a tracked
+  file, or the script refuses; `--allow-dirty` packages anyway and the
+  manifest records `"dirty": true`. Untracked files do not count.
+- **The Swift archive, its sources and the staged `winemac.so` carry one
+  build id** (`sevo:winemacswift=…`, above).
+- **`wineserver` and `ntdll.so` speak the same server protocol, and it is
+  the one the source defines.** Both carry `sevo:server-protocol=<N>`
+  (`server/main.c`, `dlls/ntdll/unix/server.c`), read with `strings` and
+  compared with `SERVER_PROTOCOL_VERSION` in `include/wine/server_protocol.h`.
+  The server is the native one when `build-native-server.sh` has built it,
+  so a native tree left behind by a protocol change is refused rather than
+  packaged beside a newer ntdll. A binary built from a source without the
+  stamp is refused too: rebuild it.
+
+Any refusal names the file and the command that repairs it.
+
+### The manifest
+
+`engine-manifest.json` lists every file in the engine with its sha256 (or the
+target of a symlink) and where it came from: `build` (wine, from `stage/`),
+`native-server`, `source` (built from `build-macos/`), `deps` (the pinned
+downloads under `deps/` and `deps-raw/`), `gstreamer`, `donor` (copied from
+the live engine) or `packaging` (written by the script). It also records the
+source HEAD, `git describe`, whether the tree was dirty, the donor's path and
+its own `engine-info.json` version and commit, the server's architecture and
+protocol version, and the Swift build id. The payloads under `donor` are the
+part a release still takes from an installed engine; the publish plan's deps
+tarball is the step that replaces them, and the manifest names which files
+that concerns. A file the script did not record an origin for fails the
+packaging, so the list is complete by construction.
 
 DXMT is packaged for both architectures. The x86_64 DLLs sit flat at the top
 of `dxmt/`, which is where the app reads them from; the 32-bit ones go in

@@ -48,6 +48,13 @@ int foreground = 0;
 timeout_t master_socket_timeout = 3 * -TICKS_PER_SEC;  /* master socket timeout, default is 3 seconds */
 const char *server_argv0;
 
+/* Readable with strings(1): build-macos/package-engine.sh packages this server
+ * only beside an ntdll.so that carries the same protocol version. */
+#define SEVO_STRINGIFY_(x) #x
+#define SEVO_STRINGIFY(x) SEVO_STRINGIFY_(x)
+const char __attribute__((used)) sevo_server_protocol_stamp[] =
+    "sevo:server-protocol=" SEVO_STRINGIFY(SERVER_PROTOCOL_VERSION);
+
 /* parse-line args */
 
 static void usage( FILE *fh )

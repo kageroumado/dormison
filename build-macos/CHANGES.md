@@ -28,6 +28,44 @@ uses the section for `r<N>` as the GitHub release body.
   and render pass. A deferred frame whose ready value has not come within that second is
   dropped, at the transition and at the window's detach, rather than holding the frame behind
   it or the presenter.
+- The Steam stub reads the machine field of the Steamworks dll's PE header and decides its
+  bitness once: a dll of the sibling's bitness goes to the sibling stub with a hand-off marker
+  in its environment, so the sibling never hands back, and a dll of neither machine ends the
+  stub with one log line naming the file and its machine. The stub used to load first and
+  hand off on `ERROR_BAD_EXE_FORMAT`, and a dll both bitnesses rejected with that error had
+  the two stubs re-execute each other without end. Each stub also looks for the dll of its
+  own bitness first within a directory, so a handed-off invocation finds the one it can load.
+- `setStat` reads the stat's type from Steamworks: the typed getters answer only for a stat
+  of their type, so the one that answers names the setter, and the answer is kept per stat
+  name. Only when neither getter answers yet is the type guessed from the value, integral to
+  `SetStatInt32` and fractional to `SetStatFloat`, and the log says so. The value is
+  range-checked as the typed value before the cast; a non-finite value is refused. The stub
+  used to send every integral value to `SetStatInt32`, which Steamworks rejects for a stat
+  configured as FLOAT, and cast to `int` before any check.
+- The Discord bridge's client teardown is bounded and cannot miss its own cancellation.
+  Whichever side sees its end close sets a `closing` flag the pipe reader checks before every
+  `ReadFile`, and the cancellation is repeated every 50 ms until the reader says it has left
+  its loop, for at most five seconds; the wait for the relay thread and the flush that lets
+  the game drain the pipe end after five seconds too, the flush by a watchdog that cancels it.
+  One `CancelSynchronousIo` used to be issued once, which found nothing to cancel when the
+  socket's EOF arrived before the reader entered `ReadFile`, and the final `FlushFileBuffers`
+  waited as long as a client that never read. The 30 s grace before the bridge becomes a
+  system process and the backslash `\\?\unix` socket addressing are as they were.
+- Packaging. `package-engine.sh` checks content, never timestamps: the Swift archive carries a
+  build id (the sha256 of its sources), the driver prints it in `sevo:run` (`swift=…`), and
+  the script refuses a staged `winemac.so` that carries another id or an archive whose id is
+  not the one the sources give now; `wineserver` and `ntdll.so` carry
+  `sevo:server-protocol=<N>` and must agree with each other and with
+  `include/wine/server_protocol.h`; the tree must be committed unless `--allow-dirty` is
+  passed. `tools/makedep` makes a static archive named by path in `UNIX_LIBS` a prerequisite
+  of the unix lib, so `winemac.so` relinks after the archive changed. `engine-manifest.json`
+  beside `engine-info.json` lists every file with its sha256 and origin (build, native-server,
+  source, deps, gstreamer, donor, packaging), the source HEAD and dirtiness, the donor's
+  identity, the server's protocol and the Swift build id. The archive used to be a link
+  argument with no prerequisite, the script compared the archive's and the driver's
+  modification times, which wine's installer resets, and took any native server it found;
+  `build-macos/tests/packaging-gates.sh` shows a stale driver younger than the archive
+  refused.
 - A game's own loader copy opened by LaunchServices with no program, from its Dock tile or
   from Finder, opens `sevoflurane://play/<id>` so the game starts through Sevoflurane, where
   it printed wine's usage and quit.

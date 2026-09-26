@@ -132,19 +132,63 @@ static SOCKET connect_to_discord(int *index) {
 
 /* ------------------------------------------------------------- the relay */
 
+/* The longest any step of a client's teardown waits: for the relay thread to
+ * stop, for a cancellation to land, for the game to drain the pipe. */
+#define TEARDOWN_MILLISECONDS 5000
+
+/* How often a cancellation is repeated while the owner has not yet said it
+ * left its read loop. */
+#define CANCEL_RETRY_MILLISECONDS 50
+
 struct client {
     HANDLE pipe;
     SOCKET sock;
-    HANDLE reader;  /* the thread blocked in ReadFile on the pipe */
+    HANDLE owner;            /* the thread that reads the pipe, for CancelSynchronousIo */
+    HANDLE pipe_reads_done;  /* set by the owner once it has left its ReadFile loop */
+    volatile LONG closing;   /* set by whichever side saw its end close */
     int index;
 };
+
+static int is_closing(struct client *c) {
+    return InterlockedCompareExchange(&c->closing, 0, 0) != 0;
+}
+
+/* A blocking call on `thread` that must end by `milliseconds`: the watchdog
+ * cancels the thread's synchronous I/O when `done` is not set in time. */
+struct deadline {
+    HANDLE thread;
+    HANDLE done;
+    DWORD milliseconds;
+};
+
+static DWORD WINAPI cancel_after(LPVOID param) {
+    struct deadline *d = param;
+    if (WaitForSingleObject(d->done, d->milliseconds) == WAIT_TIMEOUT) CancelSynchronousIo(d->thread);
+    return 0;
+}
+
+/** Waits for the game to drain the pipe, for at most `milliseconds`. */
+static void flush_pipe_bounded(HANDLE pipe, HANDLE owner, DWORD milliseconds) {
+    struct deadline d = { .thread = owner, .done = CreateEventA(NULL, TRUE, FALSE, NULL), .milliseconds = milliseconds };
+    HANDLE watchdog = d.done ? CreateThread(NULL, 0, cancel_after, &d, 0, NULL) : NULL;
+    if (!watchdog) {
+        if (d.done) CloseHandle(d.done);
+        return;
+    }
+    if (!FlushFileBuffers(pipe) && GetLastError() == ERROR_OPERATION_ABORTED)
+        say("a client did not drain its pipe within %lu ms; its handle goes anyway", (unsigned long)milliseconds);
+    SetEvent(d.done);
+    WaitForSingleObject(watchdog, INFINITE);
+    CloseHandle(watchdog);
+    CloseHandle(d.done);
+}
 
 /** Reads the socket and writes the pipe until either end closes. */
 static DWORD WINAPI socket_to_pipe(LPVOID param) {
     struct client *c = param;
     char buffer[RELAY_BUFFER];
 
-    for (;;) {
+    while (!is_closing(c)) {
         int got = recv(c->sock, buffer, sizeof(buffer), 0);
         if (got <= 0) break;
         for (int sent = 0; sent < got;) {
@@ -156,10 +200,17 @@ static DWORD WINAPI socket_to_pipe(LPVOID param) {
     }
 done:
     /* Unblock the pipe read so the owning thread can tear the client down.
-     * The pipe stays connected: a disconnect drops whatever the game has not
-     * read yet, and Discord's last frame before it hangs up is usually the
-     * CLOSE that says why. */
-    CancelSynchronousIo(c->reader);
+     * The owner checks `closing` before every ReadFile, and a cancellation
+     * that arrives before it enters one finds nothing to cancel, so the
+     * cancellation is repeated until the owner says it has left the loop, or
+     * the deadline passes. The pipe stays connected: a disconnect drops
+     * whatever the game has not read yet, and Discord's last frame before it
+     * hangs up is usually the CLOSE that says why. */
+    InterlockedExchange(&c->closing, 1);
+    for (DWORD waited = 0; waited < TEARDOWN_MILLISECONDS; waited += CANCEL_RETRY_MILLISECONDS) {
+        CancelSynchronousIo(c->owner);
+        if (WaitForSingleObject(c->pipe_reads_done, CANCEL_RETRY_MILLISECONDS) == WAIT_OBJECT_0) break;
+    }
     return 0;
 }
 
@@ -178,12 +229,17 @@ static DWORD WINAPI serve_client(LPVOID param) {
     say("connected to discord-ipc-%d", c->index);
 
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
-                    GetCurrentProcess(), &c->reader, 0, FALSE, DUPLICATE_SAME_ACCESS);
+                    GetCurrentProcess(), &c->owner, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    c->pipe_reads_done = CreateEventA(NULL, TRUE, FALSE, NULL);
 
-    HANDLE back = CreateThread(NULL, 0, socket_to_pipe, c, 0, NULL);
+    HANDLE back = c->pipe_reads_done ? CreateThread(NULL, 0, socket_to_pipe, c, 0, NULL) : NULL;
+    if (!back) {
+        say("no relay thread for discord-ipc-%d — disconnecting the client", c->index);
+        InterlockedExchange(&c->closing, 1);
+    }
 
     char buffer[RELAY_BUFFER];
-    for (;;) {
+    while (!is_closing(c)) {
         DWORD got = 0;
         if (!ReadFile(c->pipe, buffer, sizeof(buffer), &got, NULL) || got == 0) break;
         for (DWORD sent = 0; sent < got;) {
@@ -193,17 +249,30 @@ static DWORD WINAPI serve_client(LPVOID param) {
         }
     }
 done:
+    InterlockedExchange(&c->closing, 1);
+    if (c->pipe_reads_done) SetEvent(c->pipe_reads_done);
     shutdown(c->sock, SD_BOTH);
     if (back) {
-        WaitForSingleObject(back, INFINITE);
+        /* The relay thread may sit in a WriteFile the game no longer drains:
+         * the wait is bounded and a cancellation follows it. */
+        if (WaitForSingleObject(back, TEARDOWN_MILLISECONDS) == WAIT_TIMEOUT) {
+            CancelSynchronousIo(back);
+            if (WaitForSingleObject(back, TEARDOWN_MILLISECONDS) == WAIT_TIMEOUT) {
+                /* The thread still holds `c`, so nothing of it is freed. */
+                say("the relay thread for discord-ipc-%d did not stop; its client is left to it", c->index);
+                CloseHandle(back);
+                return 0;
+            }
+        }
         CloseHandle(back);
     }
     say("client on discord-ipc-%d disconnected", c->index);
     closesocket(c->sock);
-    CloseHandle(c->reader);
     /* Let the game drain what already arrived before the handle goes. */
-    FlushFileBuffers(c->pipe);
+    flush_pipe_bounded(c->pipe, c->owner, TEARDOWN_MILLISECONDS);
     CloseHandle(c->pipe);
+    CloseHandle(c->owner);
+    if (c->pipe_reads_done) CloseHandle(c->pipe_reads_done);
     free(c);
     return 0;
 }

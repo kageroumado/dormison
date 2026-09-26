@@ -38,6 +38,7 @@
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "macdrv.h"
+#include "sevo_presenter.h"
 #include "sevo_provenance.h"
 #include "sevo_stats.h"
 
@@ -396,8 +397,8 @@ void sevo_provenance_init(int presenter_on, const char *upscaler)
 
     sevo_stats_init((unsigned int)strtoul(appid, NULL, 10), exe);
 
-    fprintf(stderr, "sevo:run pid=%d exe=%s appid=%s engine=%s\n",
-            getpid(), exe[0] ? exe : "unknown", appid, engine);
+    fprintf(stderr, "sevo:run pid=%d exe=%s appid=%s engine=%s swift=%s\n",
+            getpid(), exe[0] ? exe : "unknown", appid, engine, sevo_winemacswift_build_id());
     fflush(stderr);
 
     atexit(note_exit);

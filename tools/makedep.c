@@ -2383,7 +2383,13 @@ static struct strarray add_unix_libraries( const struct makefile *make, struct s
             strarray_add( deps, lib );
             strarray_add( &ret, lib );
         }
-        else strarray_add( &ret, file );
+        else
+        {
+            /* a static archive named by path is built outside these makefiles
+             * (winemac.drv's Swift half), so the unix lib is relinked when it changes */
+            if (strendswith( file, ".a" )) strarray_add( deps, file );
+            strarray_add( &ret, file );
+        }
     }
 
     strarray_addall( &ret, libs );

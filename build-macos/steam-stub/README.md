@@ -21,10 +21,12 @@ make 32         # sevo-steamstub32.exe
 Needs `mingw-w64`. Two bitnesses because the stub loads the game's own dll into
 its own address space: RPG Maker MV ships 32-bit `steam_api.dll`, MZ and
 Unreal titles ship 64-bit `steam_api64.dll`. The shim only ever spawns
-`sevo-steamstub.exe`; when the dll it finds is 32-bit, `LoadLibrary` fails with
-`ERROR_BAD_EXE_FORMAT` and the 64-bit stub hands the whole invocation to
-`sevo-steamstub32.exe` beside it and exits. Both exes must be installed in one
-directory, or the handoff cannot find its sibling.
+`sevo-steamstub.exe`. The stub reads the machine field of the dll's PE header
+before loading it: a 32-bit dll sends the whole invocation to
+`sevo-steamstub32.exe` beside it, once, with `SEVO_STEAM_STUB_HANDOFF=1` in the
+sibling's environment so it never hands back; a dll of neither machine ends
+with one log line naming the file and its machine. Both exes must be installed
+in one directory, or the handoff cannot find its sibling.
 
 ## Running it
 
@@ -70,7 +72,7 @@ failures carry `error`.
 | `{"op":"clearAchievement","name":"ACH_1"}` | `{"ok":true}` after `ClearAchievement`+`StoreStats` |
 | `{"op":"getAchievementNames"}` | `{"ok":true,"names":["ACH_1",…]}` |
 | `{"op":"getNumberOfAchievements"}` | `{"ok":true,"count":5}` |
-| `{"op":"setStat","name":"N","value":3}` | `{"ok":true}` — integral values go to `SetStatInt32`, fractional to `SetStatFloat` |
+| `{"op":"setStat","name":"N","value":3}` | `{"ok":true}` — the stat's INT or FLOAT type is read from Steamworks (the typed getter that answers), and the matching setter is called; when neither getter answers yet, an integral value goes to `SetStatInt32` and a fractional one to `SetStatFloat`, and the log says so |
 | `{"op":"getStat","name":"N"}` | `{"ok":true,"value":3}` |
 | `{"op":"getStatFloat","name":"N"}` | `{"ok":true,"value":3.500000}` |
 | `{"op":"storeStats"}` | `{"ok":true}` |
