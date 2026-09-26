@@ -369,6 +369,7 @@ void sevo_provenance_init(int presenter_on, const char *upscaler)
 {
     char engine_dir[PATH_MAX], engine[NAME_MAX], exe[NAME_MAX], steam_appid[32];
     const char *appid, *msync, *log;
+    const char *swift, *swift_id;
 
     if (provenance_on) return;
     provenance_on = 1;
@@ -397,8 +398,12 @@ void sevo_provenance_init(int presenter_on, const char *upscaler)
 
     sevo_stats_init((unsigned int)strtoul(appid, NULL, 10), exe);
 
+    /* The stamp reads "sevo:winemacswift=<id>"; the line carries the id alone. */
+    swift = sevo_winemacswift_build_id();
+    if ((swift_id = strchr(swift, '='))) swift_id++;
+    else swift_id = swift;
     fprintf(stderr, "sevo:run pid=%d exe=%s appid=%s engine=%s swift=%s\n",
-            getpid(), exe[0] ? exe : "unknown", appid, engine, sevo_winemacswift_build_id());
+            getpid(), exe[0] ? exe : "unknown", appid, engine, swift_id);
     fflush(stderr);
 
     atexit(note_exit);
