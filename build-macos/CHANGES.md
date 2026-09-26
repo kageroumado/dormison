@@ -3,6 +3,29 @@
 One section per release, written when the work lands. `publish-engine.sh`
 uses the section for `r<N>` as the GitHub release body.
 
+## r20
+
+- A game's own loader copy opened by LaunchServices with no program, from its Dock tile or
+  from Finder, opens `sevoflurane://play/<id>` so the game starts through Sevoflurane, where
+  it printed wine's usage and quit.
+- A process started with `SEVO_QUIET=1` in its environment is infrastructure to the dock
+  shim whatever its exe name: its windows never order in and it never becomes a Dock app.
+  Sevoflurane sets it on the frame-rate unlocker it starts beside Genshin Impact, whose
+  window took the foreground from the game, which then minimized itself into the Dock at
+  its next display-mode change, on entering the world.
+- A critical section is released free, and the releasing thread, or any running thread, may
+  take it again before a woken waiter arrives; a woken waiter that loses re-queues. Wine
+  handed the lock to the waiter and queued every thread arriving meanwhile behind it: on
+  `order.exe` a contended section went back to the releasing thread 78–82 % of the time at
+  2–4 threads and 62 % at 16, against Windows' 98 % and 87 %; now 92–94 %. `LockCount`
+  carries the documented post-2003-SP1 encoding (bit 0 clear while held, bit 1 clear while
+  one wake is outstanding, the rest the complement of the queued waiter count), so a program
+  reading it reads what Windows shows. Per-thread shares at 16 threads are less even than
+  Windows' (a 16× spread over 400 000 acquisitions, no thread starved). On syncprof's
+  `critical-section` shape at 16 and 64 threads the round takes a third less wall time and half the
+  involuntary context switches, with p99 1.2–1.8× higher; `barrier-chain` and `job-fork-join`, which
+  wait on SRW locks and events, are unchanged.
+
 ## r19
 
 - A fullscreen game in exclusive fullscreen keeps the menu bar and the Dock as r17 left them
