@@ -90,6 +90,14 @@ static int is_steam_infrastructure(void) {
         // covers the whole screen.
         "gldriverquery.exe", "gldriverquery64.exe",
         "vulkandriverquery.exe", "vulkandriverquery64.exe",
+        // The rest of Steam's bin: the Xbox utility at boot, shader
+        // pre-caching at a launch, the minidump writer at a crash, the
+        // monitor, the streaming client and the launch stubs.
+        "steamxboxutil.exe", "steamxboxutil64.exe",
+        "fossilize-replay.exe", "fossilize-replay64.exe",
+        "x64launcher.exe", "x86launcher.exe", "WriteMiniDump.exe",
+        "steam_monitor.exe", "secure_desktop_capture.exe",
+        "streaming_client.exe", "drivers.exe",
         "hardwareupdater.exe", "steamsysinfo.exe",
         // Wine's own prefix update, run once when an engine is new to the
         // bottle: its wait dialog has no controls and nothing to answer.
