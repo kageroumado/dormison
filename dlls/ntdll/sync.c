@@ -245,7 +245,7 @@ static inline LONG crit_encode( struct crit_state state )
 /* Takes a section that is free, whatever its queue and outstanding wake say. A thread
  * that asks while a woken waiter is still on its way wins here, and that is the point:
  * Windows lets the running thread barge, and a protocol that handed the lock to the
- * waiter instead is the convoy `bispectral/order-probe` measures us losing to. */
+ * waiter instead convoys behind it. */
 static BOOL crit_try_acquire( RTL_CRITICAL_SECTION *crit )
 {
     for (;;)

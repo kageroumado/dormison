@@ -20,8 +20,7 @@ Like the app, it is named after an anesthetic.
 | Game settings | Change per-game settings for the next launch while Steam stays open. |
 | Mac integration | Show a game's title and icon in the Dock, and run supported NW.js games with native macOS NW.js. |
 
-Compatibility depends on the game, Mac and graphics translator. See the
-[DirectX 12 testing notes](#directx-12-testing) for what the sample runs establish.
+Compatibility depends on the game, Mac and graphics translator.
 
 ## Build or contribute
 
@@ -196,19 +195,6 @@ processes from the Dock and gives games their own titles and icons.
 For supported NW.js games, it starts the native runtime. The
 [Steamworks stub](build-macos/steam-stub/README.md) stays in Wine and
 serves achievements and stats to the native game over loopback.
-
-### DirectX 12 testing
-
-[Bispectral's sample results](https://github.com/kageroumado/bispectral/blob/main/dx12-samples/RESULTS.md)
-record Microsoft DirectX-Graphics-Samples runs and comparisons with an
-RTX 4080 SUPER. The archived run combines several invocations and lacks
-verified engine provenance. Its captures are unsynchronized, and its
-`match` classification records matching exit status and window behavior.
-
-Feature support also depends on the Mac and toolkit version. A sample
-completing its run establishes less than a full game playing correctly;
-use the individual results and their recorded limitations when assessing
-compatibility.
 
 ## License
 

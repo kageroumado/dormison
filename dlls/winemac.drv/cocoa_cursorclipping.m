@@ -529,10 +529,8 @@ static void scale_rect_for_retina_mode(BOOL mode, CGRect *cursorClipRect)
  * foreground one, and the shape is intersected with the window's own clip
  * shape — which is also the ClipCursor semantics a game asks for.
  *
- * Signatures, their evidence, and what is still unverified:
- * bispectral/probes/cursorconfine/RESULTS.md. The symbols are resolved by name
- * at runtime, never linked, so a macOS that drops them costs this handler and
- * nothing else.
+ * The symbols are resolved by name at runtime, never linked, so a macOS that
+ * drops them costs this handler and nothing else.
  */
 
 typedef void *SevoRegionRef;

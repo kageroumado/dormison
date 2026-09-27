@@ -213,8 +213,7 @@ Fixes from the 2026-09-26 sync, runtime and graphics reviews.
   inline through `%gs`, which on macOS is the pthread TSD, where the TEB's TLS slots read as
   zero: TABS and Aka Manto faulted on `[null+0x10]` about 170 times and ended in 3–4 s.
   TlsAlloc now hands out indexes in the expansion array, whose pointer each thread mirrors
-  at `%gs:0x1780`, as CrossOver does. `bispectral/mono-shape/tlsprobe` shows every inlined
-  read matching `TlsGetValue`, where none did.
+  at `%gs:0x1780`, as CrossOver does.
 
 ## r16
 
@@ -236,7 +235,7 @@ Fixes from the 2026-09-26 sync, runtime and graphics reviews.
   `explorer.exe /desktop` and idle games stayed alive with no server, one of them at 5 % CPU,
   and a harness that killed wineservers left 1 500 of them on this Mac. Each process now holds a
   dead-name notification on the msync server's port in one parked thread and ends when it
-  fires. Gate: `bispectral/probes/server-death` (`run-idle.sh`).
+  fires.
 - The frame-rate counter can show how the frames were paced, not only how many there were.
   View › Show Frame Time Graph (⌥⌘G, `Mac Driver\FrameRateGraph=Y`, `SEVO_FPS_GRAPH=1`)
   turns the capsule into a card: the rate, the 1 % low and the slowest frame of the last ten

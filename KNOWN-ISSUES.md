@@ -30,8 +30,7 @@ its managed startup never asks for its Steam plugin (`CSteamworks.dll`), and a s
 null object every frame. About one launch in fifteen reaches the title screen and plays; nothing
 we can set makes the difference. Measured and cleared: the Steam client and its IPC (a probe
 launched by Steam in the game's place initializes in 0.4 s on a server where the game fails),
-msync, the loader, the environment, the save. Record: the `astra-huniepop-*` documents in the
-app repository's `Docs/`. If it comes up black, quit and try again later.
+msync, the loader, the environment, the save. If it comes up black, quit and try again later.
 
 ## WaitForMultipleObjects with WaitAll can succeed on a set that was never all signaled — msync, r17 and earlier, fixed in r18
 

@@ -234,9 +234,8 @@ mark in the bottle's ANSI code page, which would garble the Japanese names.
 To add a face: extend `fetch-fonts.sh` (or a sibling script) with the
 archive, its sha256 and its license, add the copy to `package-engine.sh`, and
 add one `HKCU,%FontReplStr%,"<Windows name>",,"<family as win32u enumerates
-it>"` line per name to `[Fonts]`. The exact family string comes from
-`bispectral/probes/fontsubst` (`probe.exe enum` lists what a bottle sees;
-`probe.exe` shows what each Japanese family name resolves to).
+it>"` line per name to `[Fonts]`. The exact family string is the one the bottle's font
+enumeration reports.
 
 ## msync
 
@@ -354,8 +353,8 @@ with `publish-engine.sh`.
 wineserver runs no guest code, so it is the one process in the engine that need not
 be translated; served natively it takes the Rosetta round trip out of every wait,
 handle and APC a game makes. Packaged against the Rosetta server it measures at
-parity on syncprof (`bispectral/native-server/RESULTS.md`, r11 against r10: p50 0.98×,
-p99 1.01×, wall 1.02×, server CPU 0.96×); its case is one translated process fewer. `build-native-server.sh` configures a second,
+parity with it (r11 against r10: p50 0.98×, p99 1.01×, wall 1.02×, server CPU
+0.96×); its case is one translated process fewer. `build-native-server.sh` configures a second,
 arm64 tree for `server/` under `$DORMISON_BUILD/server-native` with
 `-DDORMISON_X86_64_GUEST`, which makes `server/registry.c` report the x86 machines,
 and builds a universal libinotify beside it; `server/mach.c` decides per process
