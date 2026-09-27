@@ -1,5 +1,7 @@
 # Dormison
 
+[English](README.md) · [简体中文](README.zh-CN.md)
+
 Dormison is the Wine engine used by [Sevoflurane](https://github.com/kageroumado/sevoflurane)
 to run Windows Steam games on macOS.
 
