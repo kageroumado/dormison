@@ -127,8 +127,7 @@ it was not linked against.
 A release is `dormison-r<N>` and a beta `dormison-b<N>`, the same `N` when the beta is what
 becomes the release. `kagerou publish dormison -v b<N> -p` writes `channels.beta`;
 `-v r<N>` writes `channels.stable`. The app shows either as "Dormison r<N>" / "Dormison b<N>"
-and takes the channel Settings › Engine names (`sevo engine channel beta`). r15 was published
-to beta under the old naming; from the next release the names above apply.
+and takes the channel Settings › Engine names (`sevo engine channel beta`).
 
 ## Build, stage, package
 
@@ -275,7 +274,7 @@ payload that is no longer the stock v0.80 says so.
 ## Renderer provenance
 
 winemac.drv prints which renderer answered for every process
-(`sevo:gfx … renderer=… d3d11=<sha8>`, see `CHANGES.md` § r5). The values
+(`sevo:gfx … renderer=… d3d11=<sha8>`). The values
 come from `<engine>/renderer-hashes`, which the app writes when it stages a
 renderer into the engine tree: `key=value` lines, `#` comments, the keys
 `renderer` and `toolkit` plus one lower-case sha256 per staged DLL under its
@@ -304,9 +303,9 @@ it was for.
 ## Releasing
 
 ```bash
-build-macos/publish-engine.sh r3 --key <ed25519.pem> --dry-run   # pack, sign, check; nothing leaves the Mac
-build-macos/publish-engine.sh r3 --key <ed25519.pem>             # tag, GitHub release, manifest
-build-macos/publish-engine.sh r4 --key <ed25519.pem> --channel beta
+build-macos/publish-engine.sh r1 --key <ed25519.pem> --dry-run   # pack, sign, check; nothing leaves the Mac
+build-macos/publish-engine.sh r1 --key <ed25519.pem>             # tag, GitHub release, manifest
+build-macos/publish-engine.sh r2 --key <ed25519.pem> --channel beta
 ```
 
 A release is the engine directory `package-engine.sh` assembled, staged as
@@ -353,7 +352,7 @@ with `publish-engine.sh`.
 wineserver runs no guest code, so it is the one process in the engine that need not
 be translated; running natively removes Rosetta translation from the server
 side of every wait, handle and APC a game makes. Packaged against the Rosetta
-server it measures at parity with it (r11 against r10: p50 0.98×, p99 1.01×, wall 1.02×, server CPU
+server it measures at parity with it (p50 0.98×, p99 1.01×, wall 1.02×, server CPU
 0.96×); its case is one translated process fewer. `build-native-server.sh` configures a second,
 arm64 tree for `server/` under `$DORMISON_BUILD/server-native` with
 `-DDORMISON_X86_64_GUEST`, which makes `server/registry.c` report the x86 machines,
