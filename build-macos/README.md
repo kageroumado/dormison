@@ -351,9 +351,9 @@ with `publish-engine.sh`.
 ## The native server
 
 wineserver runs no guest code, so it is the one process in the engine that need not
-be translated; served natively it takes the Rosetta round trip out of every wait,
-handle and APC a game makes. Packaged against the Rosetta server it measures at
-parity with it (r11 against r10: p50 0.98×, p99 1.01×, wall 1.02×, server CPU
+be translated; running natively removes Rosetta translation from the server
+side of every wait, handle and APC a game makes. Packaged against the Rosetta
+server it measures at parity with it (r11 against r10: p50 0.98×, p99 1.01×, wall 1.02×, server CPU
 0.96×); its case is one translated process fewer. `build-native-server.sh` configures a second,
 arm64 tree for `server/` under `$DORMISON_BUILD/server-native` with
 `-DDORMISON_X86_64_GUEST`, which makes `server/registry.c` report the x86 machines,
@@ -366,4 +366,4 @@ build-macos/build-native-server.sh            # once per source change; --reconf
 ```
 
 The x86_64 build's own wineserver stays in `stage/` untouched, so an engine packaged
-without the native tree is the translated one as before.
+without the native tree uses the translated server.

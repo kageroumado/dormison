@@ -78,9 +78,9 @@ Everything below is absent from Wine 11.16 and wine-staging 11.16.
 
 **Processes, sync and memory**
 - msync: Mach-based in-process synchronization (`WINEMSYNC=1`).
-- Critical sections release free, as on Windows: a running thread may take the
-  lock back before a woken waiter arrives, and `LockCount` reads as Windows
-  encodes it.
+- Critical sections leave the lock available on release, as on Windows: a
+  running thread may take the lock back before a woken waiter arrives, and
+  `LockCount` reads as Windows encodes it.
 - Per-program settings files, read at every process start.
 - A native arm64 wineserver.
 - Fixes for Steam's 20-second network wait and for Unity/Mono TLS reads.
@@ -130,8 +130,8 @@ Wine 11.0 with CodeWeavers' patches and no wine-staging.
 - Wine 11.16 and wine-staging.
 - The upscaler, the D3DMetal 4.0 callback table, and the Metal 4 present
   ordering, with presents that do not wait when display sync is off.
-- Critical sections that release free, where CrossOver, like Wine, hands the
-  lock to the next waiter.
+- Critical sections that leave the lock available on release, where CrossOver,
+  like Wine, hands the lock to the next waiter.
 - Per-channel stream volume applied to the samples; CrossOver sets it on the
   device, which moves the Mac's volume.
 - A native arm64 wineserver.

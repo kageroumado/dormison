@@ -557,7 +557,7 @@ a frame ever reached the screen. The lines go straight to stderr, so
   Both come from `<engine>/renderer-hashes`, written by the app when it
   stages a renderer (format in `build-macos/README.md` § Renderer
   provenance); each field is `unknown` when the file or the key is missing.
-  The DLL hashes are the only honest answer, since every renderer spoofs the
+  The DLL hashes identify the renderer, since every renderer spoofs the
   same DXGI adapter string.
 - `sevo:gfx pid=<pid> first present +<N>ms surface=<ptr> layer=on-screen|
   off-screen` — the first frame that reached the compositor, from the client

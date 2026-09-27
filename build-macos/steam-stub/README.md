@@ -1,4 +1,4 @@
-# sevo-steamstub — Steamworks for a game that left the bottle
+# sevo-steamstub — Steamworks for native NW.js games
 
 The app runs NW.js games in native macOS NW.js: the dock shim execs `nwjs` in
 place of the wine process, so Steam keeps counting the same pid as the game.
