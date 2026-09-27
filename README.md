@@ -16,6 +16,7 @@ Like the app, it is named after an anesthetic.
 |---|---|
 | Graphics | DXMT for Direct3D 10/11, DXVK over MoltenVK, D3DMetal from Apple's Game Porting Toolkit, or Wine's wined3d. Choose a renderer per bottle or game in Sevoflurane. |
 | Window scaling | Resize supported game windows while the game keeps drawing at its original resolution. Scale the picture with Lanczos, MetalFX Spatial, Anime4K or CuNNy. |
+| Frame rate | Show a frame-rate counter or a frame-time graph from the game's View menu. |
 | Input | Use raw mouse movement when a game holds the cursor for mouse-look. |
 | Game settings | Change per-game settings for the next launch while Steam stays open. |
 | Mac integration | Show a game's title and icon in the Dock, and run supported NW.js games with native macOS NW.js. |
@@ -57,11 +58,17 @@ Everything below is absent from Wine 11.16 and wine-staging 11.16.
 - `SEVO_GPU_*` adapter identity, plus RTX 50 and RX 7000/9000 device IDs in
   wined3d.
 - Vulkan portability enumeration on, so Windows programs see MoltenVK.
+- On a Metal 4 GPU (M3 and later), a present with display sync off returns at
+  once, and the upscaler encodes one frame at a time.
 
 **Windows, input and the Mac**
 - Each game gets its own Dock tile with its Steam title and icon. Steam's
-  helper processes stay out of the Dock.
-- NW.js games run on native NW.js, with a Steamworks stub for achievements.
+  tools, and any process started with `SEVO_QUIET=1`, stay out of the Dock and
+  off the screen.
+- A game's Dock tile or Finder copy, opened on its own, starts the game
+  through Sevoflurane.
+- NW.js games run on native NW.js, with a Steamworks stub for achievements
+  and stats that loads 32- and 64-bit Steamworks alike.
 - Cursor confinement through the window server; raw mouse movement for
   mouse-look.
 - A "not responding" sheet for a game that ignores quit, and crash reports
@@ -71,6 +78,9 @@ Everything below is absent from Wine 11.16 and wine-staging 11.16.
 
 **Processes, sync and memory**
 - msync: Mach-based in-process synchronization (`WINEMSYNC=1`).
+- Critical sections release free, as on Windows: a running thread may take the
+  lock back before a woken waiter arrives, and `LockCount` reads as Windows
+  encodes it.
 - Per-program settings files, read at every process start.
 - A native arm64 wineserver.
 - Fixes for Steam's 20-second network wait and for Unity/Mono TLS reads.
@@ -79,15 +89,18 @@ Everything below is absent from Wine 11.16 and wine-staging 11.16.
 **Audio, media and text**
 - Bundled GStreamer (LGPL build) for Media Foundation and DirectShow movies,
   MPEG program streams included.
-- CoreAudio streams keep other programs' playback and the Mac's volume
-  intact.
+- CoreAudio applies each stream's volume, channel by channel, to its own
+  samples, so other programs' playback and the Mac's volume stay intact and a
+  muted capture records silence.
 - A Discord Rich Presence bridge.
 - Japanese font families mapped onto the bundled IPAGothic/IPAPGothic and the
   Mac's Hiragino Mincho.
 
 **Release**
 - `wine --version` names the release.
-- Releases are signed, and each ships its diff against `wine-staging-base`.
+- Releases are signed, and each ships its diff against `wine-staging-base`
+  and a manifest of every file with its sha256 and origin. Packaging refuses
+  a driver or server that does not match the sources.
 
 ### Compared to CrossOver
 
@@ -97,7 +110,8 @@ Wine 11.0 with CodeWeavers' patches and no wine-staging.
 **Taken from CrossOver**
 - msync, with fixes CrossOver 26.3 lacks:
   - WaitAll is granted by wineserver under a freeze of the whole set, so a
-    grant is a set that was whole at one instant and is consumed once.
+    grant is a set that was whole at one instant and is consumed once, before
+    the waiting thread returns; a query never reads the set half consumed.
   - WaitAll reports an abandoned mutex.
   - `NtReleaseMutant` reports NT's previous count.
   - Freed object indexes are reused from a stack.
@@ -115,7 +129,11 @@ Wine 11.0 with CodeWeavers' patches and no wine-staging.
 **In Dormison, not in CrossOver 26.3**
 - Wine 11.16 and wine-staging.
 - The upscaler, the D3DMetal 4.0 callback table, and the Metal 4 present
-  ordering.
+  ordering, with presents that do not wait when display sync is off.
+- Critical sections that release free, where CrossOver, like Wine, hands the
+  lock to the next waiter.
+- Per-channel stream volume applied to the samples; CrossOver sets it on the
+  device, which moves the Mac's volume.
 - A native arm64 wineserver.
 - The Steam network-wait fix, Vulkan portability enumeration and
   `SEVO_GPU_*`.
