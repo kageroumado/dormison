@@ -1993,7 +1993,8 @@ static NSView* wine_content_view_of(NSWindow* window)
            different frame under the new style. */
         if (!NSIsEmptyRect(wineContentRect))
             wineFrame = [self frameRectForContentRect:wineContentRect];
-        if ((windowed || programRefusesResize || features_allow_presentation_scaling(wf)) != presentationScalable)
+        if ((windowed || (programRefusesResize && resizable_windows != RESIZABLE_WINDOWS_OFF) ||
+             features_allow_presentation_scaling(wf)) != presentationScalable)
         {
             presentationScalable = !presentationScalable;
             if (!presentationScalable)
@@ -2010,6 +2011,17 @@ static NSView* wine_content_view_of(NSWindow* window)
         [self adjustFeaturesForState];
         [self setHasShadow:wf->shadow];
         [self attachFullScreenToolbar];
+    }
+
+    - (void) reapplyResizableWindows
+    {
+        if ([self styleMask] & NSWindowStyleMaskFullScreen) return;
+        [self setWindowFeatures:&presentationFeatures];
+        /* Places a window the switch just put in a window, and gives one it
+           took the scaler from back its size. */
+        if (!NSIsEmptyRect(wineContentRect))
+            [self setFrameAndWineFrame:[self frameRectForContentRect:wineContentRect]];
+        [self layoutPresentation];
     }
 
     // Indicates if the window would be visible if the app were not hidden.

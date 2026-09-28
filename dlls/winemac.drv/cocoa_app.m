@@ -1104,6 +1104,10 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         item = [view addItemWithTitle:@"Final Filter" action:NULL keyEquivalent:@""];
         [item setSubmenu:filters];
         [view addItem:[NSMenuItem separatorItem]];
+        item = [view addItemWithTitle:@"Resizable Windows" action:@selector(sevoToggleResizableWindows:) keyEquivalent:@"r"];
+        [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
+        [item setTarget:self];
+        [view addItem:[NSMenuItem separatorItem]];
         item = [view addItemWithTitle:@"Show Frame Rate" action:@selector(sevoToggleFrameRate:) keyEquivalent:@"f"];
         [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
         [item setTarget:self];
@@ -1134,6 +1138,12 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
             [menuItem setState:frame_rate_on ? NSControlStateValueOn : NSControlStateValueOff];
         else if (action == @selector(sevoToggleFrameGraph:))
             [menuItem setState:frame_rate_on && frame_graph_on ? NSControlStateValueOn : NSControlStateValueOff];
+        else if (action == @selector(sevoToggleResizableWindows:))
+        {
+            NSWindow* key = [NSApp keyWindow];
+            [menuItem setState:resizable_windows != RESIZABLE_WINDOWS_OFF ? NSControlStateValueOn : NSControlStateValueOff];
+            return !([key styleMask] & NSWindowStyleMaskFullScreen);
+        }
         else if (action == @selector(sevoToggleReadout:))
         {
             [menuItem setState:sevoReadoutShown ? NSControlStateValueOn : NSControlStateValueOff];
@@ -1233,6 +1243,33 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         else
             [sevoFrameRateCounter setGraphShown:on];
         [self sevoStoreSetting:@"fps-graph" value:on ? @"on" : @"off"];
+    }
+
+    /* Off, or back to the level the game started with; a game that started with it off
+       gets the window mode, which also puts a full-screen game in a window. */
+    - (void) sevoToggleResizableWindows:(NSMenuItem*)sender
+    {
+        static int levelWhenOn = RESIZABLE_WINDOWS_OFF;
+        static NSString* const names[] = {
+            [RESIZABLE_WINDOWS_OFF] = @"off", [RESIZABLE_WINDOWS_FIXED] = @"fixed",
+            [RESIZABLE_WINDOWS_ALL] = @"all", [RESIZABLE_WINDOWS_WINDOW] = @"window",
+        };
+
+        if (resizable_windows != RESIZABLE_WINDOWS_OFF)
+        {
+            levelWhenOn = resizable_windows;
+            resizable_windows = RESIZABLE_WINDOWS_OFF;
+        }
+        else
+            resizable_windows = levelWhenOn != RESIZABLE_WINDOWS_OFF ? levelWhenOn : RESIZABLE_WINDOWS_WINDOW;
+
+        for (NSWindow* window in [NSApp windows])
+        {
+            if ([window isKindOfClass:[WineWindow class]])
+                [(WineWindow*)window reapplyResizableWindows];
+        }
+        [self updatePresentationOptions];
+        [self sevoStoreSetting:@"windows" value:names[resizable_windows]];
     }
 
     - (void) sevoToggleReadout:(NSMenuItem*)sender
@@ -1387,6 +1424,14 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
     {
         NSWindow* key = [NSApp keyWindow];
         NSApplicationPresentationOptions options = NSApplicationPresentationDefault;
+
+        /* Native full screen (the green button) sets its own options, and
+           the title bar and menu bar slide in at the top edge only while
+           AppKit keeps them. Replacing them there — as every cursor show,
+           hide and clip change asks — leaves no way out of full screen. */
+        if (([NSApp presentationOptions] & NSApplicationPresentationFullScreen) ||
+            ([key styleMask] & NSWindowStyleMaskFullScreen))
+            return;
 
         if (active && [key isKindOfClass:[WineWindow class]] && [(WineWindow*)key isFullscreen] &&
             [key isOnActiveSpace])

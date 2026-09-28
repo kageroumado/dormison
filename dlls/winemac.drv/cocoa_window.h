@@ -144,6 +144,9 @@
     - (void) setRetinaMode:(BOOL)mode;
 
     - (void) layoutPresentation;
+    /* Applies the window's features again under the current resizable_windows,
+       after the View menu changed it. */
+    - (void) reapplyResizableWindows;
     /* Both points in the top-left-origin screen space the controller's
        mouse handlers work in. */
     - (CGPoint) winePointFromScreenPoint:(CGPoint)point;
