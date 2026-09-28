@@ -2795,7 +2795,9 @@ static NSView* wine_content_view_of(NSWindow* window)
            already see the new content size or it scales for one frame. */
         wineFrame = frame;
         wineContentRect = contentRect;
+        applyingWineFrame = TRUE;
         [self setFrame:realFrame display:YES];
+        applyingWineFrame = FALSE;
 
         roundedWineFrame = self.frame;
         CGFloat junk;
@@ -4002,6 +4004,17 @@ static NSView* wine_content_view_of(NSWindow* window)
         }
 
         if (ignore_windowResize || exitingFullScreen) return;
+
+        /* A size set from outside, by accessibility or a zoom, is a resize the
+           user made as much as a drag is: it gets the same record, so a program
+           that answers it with its old size is found out
+           (programPutBackItsSize:) and scaled from then on. */
+        if (![self inLiveResize] && !applyingWineFrame && !enteringFullScreen &&
+            !([self styleMask] & NSWindowStyleMaskFullScreen) && !NSEqualSizes(frame.size, wineFrame.size))
+        {
+            frameAtResizeStart = wineFrame;
+            liveResizeEndTime = [[NSProcessInfo processInfo] systemUptime];
+        }
 
         if ([self preventResizing])
         {

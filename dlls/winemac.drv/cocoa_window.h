@@ -60,6 +60,8 @@
     NSUInteger lastModifierFlags;
 
     NSRect frameAtResizeStart;
+    /* The frame being set is Wine's own (setFrameAndWineFrame). */
+    BOOL applyingWineFrame;
     BOOL resizingFromLeft, resizingFromTop;
 
     void* himc;
