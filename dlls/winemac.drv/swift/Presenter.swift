@@ -486,9 +486,10 @@ enum PresentVariant: String {
     case afterMinimumDuration = "present(afterMinimumDuration:)"
 }
 
-/// One line on stderr, prefixed so it can be picked out of the wine log.
+/// One line on stderr, prefixed so it can be picked out of the wine log, with the
+/// process's pid: every process of the bottle runs a presenter.
 func log(_ message: String) {
-    fputs("sevo:presenter \(message)\n", stderr)
+    fputs("sevo:presenter pid=\(getpid()) \(message)\n", stderr)
 }
 
 /// The present counter's page, in the driver's C half (`sevo_stats.c`).
@@ -530,6 +531,12 @@ class ViewPresenter: NSObject {
         return framesLastSecond > 0
     }
     private var readoutSizes = ""
+
+    /// What the chain did with the last frame, as the readout and the notice word
+    /// it. Written on the presenting thread, read on the main thread, under `statsLock`.
+    private var effective: EffectiveChain?
+    private var notice: CATextLayer?
+    private var noticeGeneration = 0
 
     private let pixelFormat: MTLPixelFormat
     private let contentsScale: CGFloat
@@ -661,7 +668,9 @@ class ViewPresenter: NSObject {
         let slot = acquisitions % intermediates.count
         let target = real.texture
         noteForReadout(source: source, target: target)
-        let scaled = scaler?.encode(source: source, target: MTLSize(width: target.width, height: target.height, depth: 1), in: commandBuffer) ?? source
+        let upscaled = scaler?.encode(source: source, target: MTLSize(width: target.width, height: target.height, depth: 1), in: commandBuffer)
+        noteEffective(source: source, target: target, upscaled: upscaled != nil)
+        let scaled = upscaled ?? source
         finalPass.encode(
             source: scaled, into: target, filter: filter, pass: renderPass,
             intermediate: { width, height in self.intermediate(slot, width: width, height: height) },
@@ -704,6 +713,74 @@ class ViewPresenter: NSObject {
         builtFrom = options.generation
         filter = options.config.filter
         scaler = shared.makeScaler(options.config)
+    }
+
+    /// Records what the chain did with this frame. A change is logged and put on
+    /// screen for a moment: the setting alone does not say whether a package ran,
+    /// since a package skips a frame its window is not large enough to upscale.
+    private func noteEffective(source: MTLTexture, target: MTLTexture, upscaled: Bool) {
+        let name = Presenter.shared.optionsSnapshot.config.upscalerName
+        let state: EffectiveChain.State
+        if ["off", "lanczos", "passthrough"].contains(name) {
+            state = .filterOnly
+        } else if scaler == nil {
+            state = .unavailable
+        } else {
+            state = upscaled ? .running : .paused
+        }
+        let chain = EffectiveChain(
+            upscaler: name, state: state,
+            scale: Double(target.width) / Double(max(source.width, 1)))
+        statsLock.lock()
+        let changed = effective.map { $0.upscaler != chain.upscaler || $0.state != chain.state } ?? true
+        effective = chain
+        statsLock.unlock()
+        guard changed else { return }
+        log("chain \(chain.logDescription) \(source.width)x\(source.height) -> \(target.width)x\(target.height)")
+        DispatchQueue.main.async { [weak self] in self?.showNotice(chain) }
+    }
+
+    /// A line at the top of the picture for two seconds naming what the upscaler does
+    /// now. A chain that is only the final filter is announced only when it replaces
+    /// an upscaler, not when a game starts without one. Main thread.
+    private func showNotice(_ chain: EffectiveChain) {
+        guard let host = madeOnscreen else { return }
+        if notice == nil, chain.state == .filterOnly { return }
+        let layer: CATextLayer
+        if let notice {
+            layer = notice
+        } else {
+            layer = CATextLayer()
+            layer.font = "Helvetica-Bold" as CFString
+            layer.fontSize = 13
+            layer.alignmentMode = .center
+            layer.foregroundColor = CGColor(gray: 1, alpha: 1)
+            layer.backgroundColor = CGColor(gray: 0, alpha: 0.65)
+            layer.cornerRadius = 12
+            layer.contentsScale = 2
+            layer.zPosition = 1001
+            var top: CALayer = host
+            while let parent = top.superlayer { top = parent }
+            top.addSublayer(layer)
+            notice = layer
+        }
+        let bounds = layer.superlayer?.bounds ?? host.bounds
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.string = chain.noticeText
+        let width = min(max(bounds.width - 32, 120), 460)
+        let y = (layer.superlayer?.isGeometryFlipped ?? false) ? 44 : bounds.height - 44 - 24
+        layer.frame = CGRect(x: (bounds.width - width) / 2, y: y, width: width, height: 24)
+        layer.opacity = 1
+        layer.isHidden = bounds.width < ReadoutMetrics.smallestWindow.width
+            || bounds.height < ReadoutMetrics.smallestWindow.height
+        CATransaction.commit()
+        noticeGeneration += 1
+        let generation = noticeGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self, weak layer] in
+            guard let self, let layer, noticeGeneration == generation else { return }
+            layer.opacity = 0
+        }
     }
 
     /// Counts the frame for the readout and remembers what it was scaled from and to.
@@ -750,8 +827,9 @@ class ViewPresenter: NSObject {
         }
         readout?.isHidden = false
         let config = Presenter.shared.optionsSnapshot.config
-        let chain = scaler == nil && !["off", "lanczos", "passthrough"].contains(config.upscalerName)
-            ? "\(config.upscalerName) (unavailable)" : config.upscalerName
+        statsLock.lock()
+        let chain = effective?.logDescription ?? config.upscalerName
+        statsLock.unlock()
         let rate = frames == 0 ? "picture at rest" : "\(frames) fps"
         showReadout("\(config.engineName) · \(sourceDescription)\n\(sizes.isEmpty ? "no frame yet" : sizes)"
             + " · upscaler \(chain) · filter \(config.filter) · \(rate)")
@@ -1345,6 +1423,46 @@ final class SevoDrawable: NSObject, CAMetalDrawable {
               let signal = presenter.nextReadySignal() else { return }
         queue.signalEvent(signal.event, value: signal.value)
         readySignal = signal
+    }
+}
+
+/// What a view's upscaler did with its last frame.
+struct EffectiveChain {
+    enum State {
+        /// The setting asks for no upscaler: the final filter does the scaling.
+        case filterOnly
+        /// The upscaler wrote the frame.
+        case running
+        /// The upscaler skipped the frame: its package runs only past a scale the
+        /// window does not reach, or the window is no larger than the frame.
+        case paused
+        /// The setting names an upscaler this engine could not load.
+        case unavailable
+    }
+
+    let upscaler: String
+    let state: State
+    /// Output pixels per source pixel, horizontally.
+    let scale: Double
+
+    var logDescription: String {
+        let ratio = String(format: "%.2f×", scale)
+        switch state {
+        case .filterOnly: return "\(upscaler) (final filter only, \(ratio))"
+        case .running: return "\(upscaler) (running, \(ratio))"
+        case .paused: return "\(upscaler) (paused at \(ratio): window too small for it)"
+        case .unavailable: return "\(upscaler) (unavailable)"
+        }
+    }
+
+    var noticeText: String {
+        let ratio = String(format: "%.1f×", scale)
+        switch state {
+        case .filterOnly: return "Upscaler off"
+        case .running: return "\(upscaler) on · \(ratio)"
+        case .paused: return "\(upscaler) paused · enlarge the window"
+        case .unavailable: return "\(upscaler) unavailable"
+        }
     }
 }
 

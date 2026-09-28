@@ -402,8 +402,9 @@ void sevo_provenance_init(int presenter_on, const char *upscaler)
     swift = sevo_winemacswift_build_id();
     if ((swift_id = strchr(swift, '='))) swift_id++;
     else swift_id = swift;
-    fprintf(stderr, "sevo:run pid=%d exe=%s appid=%s engine=%s swift=%s\n",
-            getpid(), exe[0] ? exe : "unknown", appid, engine, swift_id);
+    fprintf(stderr, "sevo:run pid=%d exe=%s appid=%s engine=%s swift=%s wpid=%04x\n",
+            getpid(), exe[0] ? exe : "unknown", appid, engine, swift_id,
+            (unsigned int)GetCurrentProcessId());
     fflush(stderr);
 
     atexit(note_exit);

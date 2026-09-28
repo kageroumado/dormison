@@ -1074,7 +1074,7 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         NSMenuItem* item;
         char* packages = sevo_presenter_package_names();
 
-        for (NSArray* pair in @[@[@"Off", @"off"], @[@"Lanczos", @"lanczos"], @[@"MetalFX", @"metalfx"]])
+        for (NSArray* pair in @[@[@"Off", @"off"], @[@"Final Filter Only", @"lanczos"], @[@"MetalFX", @"metalfx"]])
         {
             item = [upscalers addItemWithTitle:pair[0] action:@selector(sevoChooseUpscaler:) keyEquivalent:@""];
             [item setTarget:self];
@@ -1131,7 +1131,12 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         SEL action = [menuItem action];
 
         if (action == @selector(sevoChooseUpscaler:))
+        {
+            /* The presenter stays in the picture's path until the game ends. */
+            if (presenter_on && [[menuItem representedObject] isEqual:@"off"])
+                [menuItem setTitle:@"Off (Next Launch)"];
             [menuItem setState:!strcasecmp(upscaler_option, [[menuItem representedObject] UTF8String]) ? NSControlStateValueOn : NSControlStateValueOff];
+        }
         else if (action == @selector(sevoChooseFilter:))
             [menuItem setState:!strcasecmp(final_filter_option, [[menuItem representedObject] UTF8String]) ? NSControlStateValueOn : NSControlStateValueOff];
         else if (action == @selector(sevoToggleFrameRate:))

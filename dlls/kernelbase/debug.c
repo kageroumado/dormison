@@ -764,6 +764,30 @@ static BOOL check_resource_write( void *addr )
 }
 
 
+/* One line per process that reaches the unhandled-exception filter, printed
+   before the program's own filter runs: a Unity, Unreal or Mono handler
+   exits quietly with status 1, and Sevoflurane reads this line to tell that
+   exit from a game that quit.
+   `sevo:crash wpid=<wine pid, %04x> code=<%08x> addr=<address> module=<name>` */
+static void report_sevo_crash( const EXCEPTION_RECORD *rec )
+{
+    static LONG reported;
+    WCHAR path[MAX_PATH], *name;
+    char module_name[MAX_PATH] = "?";
+    HMODULE module;
+
+    if (InterlockedExchange( &reported, 1 )) return;
+    if (GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            rec->ExceptionAddress, &module ) &&
+        GetModuleFileNameW( module, path, ARRAY_SIZE(path) ))
+    {
+        name = wcsrchr( path, '\\' );
+        WideCharToMultiByte( CP_UTF8, 0, name ? name + 1 : path, -1, module_name, sizeof(module_name), NULL, NULL );
+    }
+    MESSAGE( "sevo:crash wpid=%04lx code=%08lx addr=%p module=%s\n", GetCurrentProcessId(),
+             rec->ExceptionCode, rec->ExceptionAddress, module_name );
+}
+
 /*******************************************************************
  *         UnhandledExceptionFilter   (kernelbase.@)
  */
@@ -792,6 +816,8 @@ LONG WINAPI UnhandledExceptionFilter( EXCEPTION_POINTERS *epointers )
             /* do not launch the debugger on ^C, simply terminate the process */
             TerminateProcess( GetCurrentProcess(), 1 );
         }
+
+        report_sevo_crash( rec );
 
         nested = rec->ExceptionFlags & EXCEPTION_NESTED_CALL;
         if (top_filter && !nested)
