@@ -740,27 +740,28 @@ class ViewPresenter: NSObject {
         DispatchQueue.main.async { [weak self] in self?.showNotice(chain) }
     }
 
-    /// A line at the top of the picture for two seconds naming what the upscaler does
+    /// A line at the bottom of the picture for two seconds naming what the upscaler does
     /// now. A chain that is only the final filter is announced only when it replaces
     /// an upscaler, not when a game starts without one. Main thread.
     private func showNotice(_ chain: EffectiveChain) {
         guard let host = madeOnscreen else { return }
         if notice == nil, chain.state == .filterOnly { return }
+        let top = Self.topLayer(of: host)
         let layer: CATextLayer
         if let notice {
             layer = notice
+            // The window's layers are remade when it is resized or goes full screen.
+            if layer.superlayer !== top { top.addSublayer(layer) }
         } else {
             layer = CATextLayer()
             layer.font = "Helvetica-Bold" as CFString
-            layer.fontSize = 13
+            layer.fontSize = 16
             layer.alignmentMode = .center
             layer.foregroundColor = CGColor(gray: 1, alpha: 1)
             layer.backgroundColor = CGColor(gray: 0, alpha: 0.65)
-            layer.cornerRadius = 12
+            layer.cornerRadius = 14
             layer.contentsScale = 2
             layer.zPosition = 1001
-            var top: CALayer = host
-            while let parent = top.superlayer { top = parent }
             top.addSublayer(layer)
             notice = layer
         }
@@ -768,9 +769,11 @@ class ViewPresenter: NSObject {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer.string = chain.noticeText
-        let width = min(max(bounds.width - 32, 120), 460)
-        let y = (layer.superlayer?.isGeometryFlipped ?? false) ? 44 : bounds.height - 44 - 24
-        layer.frame = CGRect(x: (bounds.width - width) / 2, y: y, width: width, height: 24)
+        let width = min(max(bounds.width - 32, 120), 420)
+        // Bottom center, above the readout's row: a program's client views can cover
+        // the top of the picture, and they leave the bottom edge alone.
+        let y = (layer.superlayer?.isGeometryFlipped ?? false) ? bounds.height - 56 - 28 : 56
+        layer.frame = CGRect(x: (bounds.width - width) / 2, y: y, width: width, height: 28)
         layer.opacity = 1
         layer.isHidden = bounds.width < ReadoutMetrics.smallestWindow.width
             || bounds.height < ReadoutMetrics.smallestWindow.height
@@ -835,11 +838,22 @@ class ViewPresenter: NSObject {
             + " · upscaler \(chain) · filter \(config.filter) · \(rate)")
     }
 
+    /// The window's topmost layer, where the readout and the notice go: the view that
+    /// hosts the picture sits under the program's client views, and one of those can
+    /// cover it.
+    private static func topLayer(of host: CALayer) -> CALayer {
+        var top: CALayer = host
+        while let parent = top.superlayer { top = parent }
+        return top
+    }
+
     private func showReadout(_ text: String) {
         guard Presenter.shared.showsReadout, let host = madeOnscreen else { return }
+        let top = Self.topLayer(of: host)
         let layer: CATextLayer
         if let readout {
             layer = readout
+            if layer.superlayer !== top { top.addSublayer(layer) }
         } else {
             layer = CATextLayer()
             layer.font = "Menlo-Bold" as CFString
@@ -850,10 +864,6 @@ class ViewPresenter: NSObject {
             layer.contentsScale = 2
             layer.isWrapped = true
             layer.zPosition = 1000
-            // On the window's topmost layer: the view that hosts the picture sits under
-            // the program's client views, and one of those can cover it.
-            var top: CALayer = host
-            while let parent = top.superlayer { top = parent }
             top.addSublayer(layer)
             readout = layer
         }

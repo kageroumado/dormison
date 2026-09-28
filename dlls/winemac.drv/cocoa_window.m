@@ -1942,6 +1942,10 @@ static NSView* wine_content_view_of(NSWindow* window)
         BOOL windowed = features_want_windowing(wf, contentRect);
         NSUInteger newStyle = style_mask_for_features(wf, windowed) | (currentStyle & ~usedStyles);
 
+        /* A program known to put its size back gets no resize handle while the switch is off. */
+        if (programRefusesResize && resizable_windows == RESIZABLE_WINDOWS_OFF && !windowed)
+            newStyle &= ~NSWindowStyleMaskResizable;
+
         presentationFeatures = *wf;
         if (windowed != presentationWindowed)
         {
@@ -2837,8 +2841,19 @@ static NSView* wine_content_view_of(NSWindow* window)
                 /* From here the size is the user's and the program's frame is scaled into
                    it; the branch below for a scaled window keeps the real size. */
                 programRefusesResize = YES;
-                presentationScalable = YES;
-                wineContentRect = contentRect;
+                if (resizable_windows != RESIZABLE_WINDOWS_OFF)
+                {
+                    presentationScalable = YES;
+                    wineContentRect = contentRect;
+                }
+                else
+                {
+                    /* Off, the window stops offering a size the program will not take.
+                       After the drag: the style cannot change under a live resize. */
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [self setWindowFeatures:&presentationFeatures];
+                    });
+                }
                 presentation_log(self, "program refused the resize", self.frame,
                                  [self frameRectForContentRect:contentRect], [wineContentView frame]);
             }
@@ -2905,15 +2920,13 @@ static NSView* wine_content_view_of(NSWindow* window)
 
     /* Whether Wine is answering a resize the user is making, or has just made, with the
        size the window had before it: a program that marks its window resizable and
-       enforces one size all the same (many visual-novel engines do). Only where the
-       fixed-size windows are asked to be resizable, and never for a window already
-       going through the scaler. */
+       enforces one size all the same (many visual-novel engines do). Never for a
+       window already going through the scaler. */
     - (BOOL) programPutBackItsSize:(NSRect)contentRect
     {
         NSSize before, asked, real;
 
         if (presentationScalable || programRefusesResize) return NO;
-        if (resizable_windows != RESIZABLE_WINDOWS_FIXED && resizable_windows != RESIZABLE_WINDOWS_WINDOW) return NO;
         if (![self inLiveResize] &&
             [[NSProcessInfo processInfo] systemUptime] - liveResizeEndTime > 1.0) return NO;
         if (NSIsEmptyRect(frameAtResizeStart)) return NO;
