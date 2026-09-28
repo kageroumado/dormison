@@ -1366,6 +1366,9 @@ static NTSTATUS create_logical_proc_info(void)
     size = sizeof(cores_no);
     if (sysctlbyname("hw.physicalcpu", &cores_no, &size, NULL, 0))
         cores_no = lcpu_no;
+    /* SEVO_CPU_COUNT can leave fewer processors than the machine has cores. */
+    if (cores_no > lcpu_no) cores_no = lcpu_no;
+    if (pkgs_no > cores_no) pkgs_no = cores_no;
 
     TRACE("%u logical CPUs from %u physical cores across %u packages\n",
             lcpu_no, cores_no, pkgs_no);
@@ -1760,6 +1763,17 @@ void init_cpu_info(void)
     num = 1;
     FIXME("Detecting the number of processors is not supported.\n");
 #endif
+    /* SEVO_CPU_COUNT, from a program's env file, is the processor count the
+       program sees. A job system that starts one worker per processor and
+       parks a worker only once none of them is looking for work (Unity 5's
+       JobQueue) never parks under Rosetta on a 16-core Mac: every core spins
+       and the frame thread starves. Fewer workers let them sleep. */
+    {
+        const char *env = getenv( "SEVO_CPU_COUNT" );
+        long wanted = env ? strtol( env, NULL, 10 ) : 0;
+
+        if (wanted >= 1 && wanted < num) num = wanted;
+    }
     peb->NumberOfProcessors = num;
     init_cpu_model();
     get_random( &process_cookie, sizeof(process_cookie) );
