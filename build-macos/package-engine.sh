@@ -5,7 +5,7 @@
 # the live engine, which stays read-only. D3DMetal is not: the app places the user's own
 # copy of Apple's toolkit into each engine it runs.
 #
-# usage: package-engine.sh <version> [--allow-dirty]   e.g. dormison-r1
+# usage: package-engine.sh <version> [--allow-dirty]   e.g. dormison-b1
 #
 # Before anything is copied, the tree is checked by content (engine-gates.sh):
 # the Swift archive carries the build id its sources give now and the staged
@@ -36,7 +36,7 @@ ROOT="${DORMISON_BUILD:-$HOME/dormison-build}"
 STAGE="$ROOT/stage"
 ENGINES="$HOME/Library/Application Support/Sevoflurane/Engines"
 # The newest installed Dormison unless SEVO_LIVE_ENGINE names another.
-LIVE="${SEVO_LIVE_ENGINE:-$ENGINES/$(ls "$ENGINES" 2>/dev/null | grep -E '^dormison-r[0-9]+$' | sort -t- -k2.2 -n | tail -1)}"
+LIVE="${SEVO_LIVE_ENGINE:-$ENGINES/$(ls "$ENGINES" 2>/dev/null | grep -E '^dormison-[rb][0-9]+$' | sort -t- -k2.2 -n | tail -1)}"
 OUT="$ENGINES/$VERSION"
 
 # shellcheck source=engine-gates.sh

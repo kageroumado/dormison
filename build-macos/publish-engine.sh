@@ -1,15 +1,21 @@
 #!/bin/bash
 # Publish one engine release: stage the engine directory package-engine.sh
 # assembled, pack it, sign the tarball and the manifest with the engine key,
-# tag r<N> here, create GitHub release r<N> of this repository (tarball,
+# tag it here, create the GitHub release of this repository (tarball,
 # .sha256, .sig, engine-info.json, the diff against wine-staging-base), then
 # name the release in the manifest the app reads and upload the manifest
 # with its signature.
 #
-# usage: publish-engine.sh r<N> [--channel stable|beta] [--dry-run]
+# usage: publish-engine.sh r<N>|b<N> [--channel stable|beta] [--dry-run]
 #                          [--engine <dir>] [--key <ed25519.pem>]
 #                          [--identity "<Developer ID Application: …>"]
 #                          [--notes-file <file>] [--min-app-version <x.y>]
+#                          [--fresh-manifest]
+#
+# A release r<N> goes to the stable channel and a beta b<N> to the beta
+# channel. --fresh-manifest writes a manifest that names this release alone,
+# instead of adding it to the one already published: every other channel and
+# the component list start empty.
 #
 # The engine key is required (--key, or DORMISON_ED25519_KEY): every release
 # carries a signature the app verifies against the key pinned in
@@ -24,7 +30,7 @@
 # Helpers) for the manifest gate.
 set -euo pipefail
 
-VERSION="${1:?usage: publish-engine.sh r<N> [--channel stable|beta] [--dry-run] [--engine <dir>] [--key <pem>] [--identity <id>] [--notes-file <file>]}"
+VERSION="${1:?usage: publish-engine.sh r<N>|b<N> [--channel stable|beta] [--dry-run] [--engine <dir>] [--key <pem>] [--identity <id>] [--notes-file <file>] [--fresh-manifest]}"
 shift
 CHANNEL=stable
 DRY_RUN=0
@@ -32,6 +38,7 @@ ENGINE_DIR=""
 KEY="${DORMISON_ED25519_KEY:-}"
 IDENTITY="${DORMISON_SIGNING_IDENTITY:-}"
 NOTES_FILE=""
+FRESH_MANIFEST=0
 MIN_APP_VERSION="${SEVO_MIN_APP_VERSION:-1.0}"
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -42,12 +49,15 @@ while [ $# -gt 0 ]; do
         --identity) IDENTITY="$2"; shift 2 ;;
         --notes-file) NOTES_FILE="$2"; shift 2 ;;
         --min-app-version) MIN_APP_VERSION="$2"; shift 2 ;;
+        --fresh-manifest) FRESH_MANIFEST=1; shift ;;
         *) echo "unknown option $1"; exit 2 ;;
     esac
 done
 
-[[ "$VERSION" =~ ^r[0-9]+$ ]] || { echo "version must be r<N>, got $VERSION"; exit 2; }
+[[ "$VERSION" =~ ^[rb][0-9]+$ ]] || { echo "version must be r<N> or b<N>, got $VERSION"; exit 2; }
 [[ "$CHANNEL" =~ ^(stable|beta)$ ]] || { echo "channel must be stable or beta"; exit 2; }
+[ "${VERSION:0:1}" = b ] && [ "$CHANNEL" != beta ] && { echo "a beta ($VERSION) goes to the beta channel: pass --channel beta (kagerou: -p)"; exit 2; }
+[ "${VERSION:0:1}" = r ] && [ "$CHANNEL" != stable ] && { echo "a release ($VERSION) goes to the stable channel"; exit 2; }
 [ -n "$KEY" ] || { echo "no engine key: pass --key <ed25519.pem> or set DORMISON_ED25519_KEY"; exit 2; }
 [ -f "$KEY" ] || { echo "engine key not found at $KEY"; exit 2; }
 [ -z "$NOTES_FILE" ] || [ -f "$NOTES_FILE" ] || { echo "notes file not found at $NOTES_FILE"; exit 2; }
@@ -158,11 +168,15 @@ sign_file() {
 echo "==> signing $NAME.tar.xz"
 sign_file "$TARBALL"
 
-# --- the manifest: the current one, with this release in its channel ---
+# --- the manifest: the current one (or, with --fresh-manifest, none), with this release in its channel ---
 URL="$ENGINE_REPO_URL/releases/download/$VERSION/$NAME.tar.xz"
 MANIFEST="$RELEASES/engine.json"
 echo "==> manifest: $CHANNEL -> $VERSION"
-gh release download engine --repo "$APP_REPO" --pattern engine.json --output "$MANIFEST" --clobber
+if [ "$FRESH_MANIFEST" = 1 ]; then
+    echo '{"schema": 2, "channels": {}, "components": {}}' > "$MANIFEST"
+else
+    gh release download engine --repo "$APP_REPO" --pattern engine.json --output "$MANIFEST" --clobber
+fi
 python3 - "$MANIFEST" "$CHANNEL" "$NAME" "$URL" "$SHA256" "$SIZE" "$MIN_APP_VERSION" "$STAGE/engine-info.json" <<'PY'
 import hashlib, json, sys, urllib.request
 path, channel, version, url, sha256, size, min_app, info_path = sys.argv[1:]

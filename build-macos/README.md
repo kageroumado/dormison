@@ -132,7 +132,7 @@ and takes the channel Settings › Engine names (`sevo engine channel beta`).
 ## Build, stage, package
 
 Packaging needs a donor: an engine Sevoflurane has already installed (the
-newest `dormison-r*` under `~/Library/Application Support/Sevoflurane/Engines`,
+newest `dormison-r*` or `dormison-b*` under `~/Library/Application Support/Sevoflurane/Engines`,
 or the directory `SEVO_LIVE_ENGINE` names). The build produces wine; the
 dependency dylibs (an x86_64 set built with MacPorts), the renderer bundles,
 D3DMetal, gecko, mono and the dock shim are copied from the donor. A clone
@@ -142,7 +142,7 @@ with no engine installed builds wine but cannot package one.
 make -C $W/wine-src/dlls/winemac.drv/swift   # before wine, see above
 make -j10 -C $W/build                        # incremental, minutes
 make -j10 -C $W/build install-lib
-build-macos/package-engine.sh dormison-r1   # → ~/Library/Application Support/Sevoflurane/Engines/<version>
+build-macos/package-engine.sh dormison-b1   # → ~/Library/Application Support/Sevoflurane/Engines/<version>
 ```
 
 `package-engine.sh` takes wine from `stage/` and everything wine does not
@@ -319,9 +319,9 @@ it was for.
 ## Releasing
 
 ```bash
-build-macos/publish-engine.sh r1 --key <ed25519.pem> --dry-run   # pack, sign, check; nothing leaves the Mac
-build-macos/publish-engine.sh r1 --key <ed25519.pem>             # tag, GitHub release, manifest
-build-macos/publish-engine.sh r2 --key <ed25519.pem> --channel beta
+build-macos/publish-engine.sh b1 --key <ed25519.pem> --channel beta --dry-run   # pack, sign, check; nothing leaves the Mac
+build-macos/publish-engine.sh b1 --key <ed25519.pem> --channel beta             # tag, GitHub release, manifest
+build-macos/publish-engine.sh r1 --key <ed25519.pem>                            # a release, on the stable channel
 ```
 
 A release is the engine directory `package-engine.sh` assembled, staged as
@@ -345,7 +345,8 @@ What the app verifies, and the script therefore produces:
 - After the upload, the tarball's digest as GitHub reports it is compared
   with the local sha256; the manifest is published only when they agree.
 
-The script refuses a dirty tree, a version that is not `r<N>`, a tag that
+The script refuses a dirty tree, a version that is not `r<N>` or `b<N>` (a beta
+goes to the beta channel and a release to stable), a tag that
 exists locally or on origin, an engine packaged from a commit other than
 HEAD, and a HEAD that is not on `origin/main`. Binaries carry the ad-hoc
 signature `package-engine.sh` left; `--identity "Developer ID Application:
