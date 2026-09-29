@@ -328,7 +328,8 @@ A release is the engine directory `package-engine.sh` assembled, staged as
 a copy, packed as `dormison-r<N>.tar.xz`, and published as GitHub release
 `r<N>` of this repository with five assets: the tarball, `.sha256`, `.sig`,
 `engine-info.json`, and the diff against `wine-staging-base`. The manifest
-Sevoflurane reads (`engine.json` on the app repository's `engine` release)
+Sevoflurane reads (`engine.json` on this repository's `manifest` release, beside the
+`shaders` release that holds the presenter's shader packages)
 then names it as `channels.stable` (or `channels.beta`) and goes up with its
 own `engine.json.sig`. The release body is the `## r<N>` section of
 `CHANGES.md`, or `--notes-file`.

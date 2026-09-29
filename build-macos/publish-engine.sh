@@ -72,7 +72,6 @@ RELEASES="${DORMISON_RELEASES:-$ROOT/releases}"
 STAGE="$RELEASES/stage/$NAME"
 TARBALL="$RELEASES/$NAME.tar.xz"
 ENGINE_REPO=kageroumado/dormison
-APP_REPO=kageroumado/sevoflurane
 ENGINE_REPO_URL="https://github.com/$ENGINE_REPO"
 
 # --- the tool the manifest gate runs: this build's decoder and pinned key ---
@@ -175,7 +174,7 @@ echo "==> manifest: $CHANNEL -> $VERSION"
 if [ "$FRESH_MANIFEST" = 1 ]; then
     echo '{"schema": 2, "channels": {}, "components": {}}' > "$MANIFEST"
 else
-    gh release download engine --repo "$APP_REPO" --pattern engine.json --output "$MANIFEST" --clobber
+    gh release download manifest --repo "$ENGINE_REPO" --pattern engine.json --output "$MANIFEST" --clobber
 fi
 python3 - "$MANIFEST" "$CHANNEL" "$NAME" "$URL" "$SHA256" "$SIZE" "$MIN_APP_VERSION" "$STAGE/engine-info.json" <<'PY'
 import hashlib, json, sys, urllib.request
@@ -269,6 +268,8 @@ gh release create "$VERSION" --repo "$ENGINE_REPO" --verify-tag --title "Engine 
 UPLOADED="$(gh api "repos/$ENGINE_REPO/releases/tags/$VERSION" -q ".assets[] | select(.name == \"$NAME.tar.xz\") | .digest")"
 [ "$UPLOADED" = "sha256:$SHA256" ] || { echo "GitHub reports $UPLOADED for the tarball, expected sha256:$SHA256 — the manifest was NOT published"; exit 1; }
 
-echo "==> manifest on $APP_REPO"
-gh release upload engine "$MANIFEST" "$MANIFEST.sig" --repo "$APP_REPO" --clobber
+echo "==> manifest on $ENGINE_REPO, release manifest"
+gh release view manifest --repo "$ENGINE_REPO" >/dev/null 2>&1 || gh release create manifest --repo "$ENGINE_REPO" --prerelease \
+    --title "Engine manifest" --notes "The signed manifest Sevoflurane reads: engine.json and engine.json.sig." --target main
+gh release upload manifest "$MANIFEST" "$MANIFEST.sig" --repo "$ENGINE_REPO" --clobber
 echo "==> published $VERSION as $CHANNEL"
