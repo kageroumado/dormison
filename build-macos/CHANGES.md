@@ -9,6 +9,10 @@ release body.
 The first public beta of Dormison: Wine 11.16 with wine-staging 11.16, plus the changes
 Sevoflurane needs to run Windows Steam games on an Apple silicon Mac.
 
+- `sevo-fpsunlock.exe`, Genshin Impact's frame-rate cap raised from beside the game: a two-megabyte
+  program and stub DLL (genshin-fps-unlock's UnlockerStub, MIT) the app starts 30 seconds after the
+  game appears, aiming for the frame rate set in Settings › Games, 120 by default.
+
 - Graphics through DXMT (Direct3D 10/11), DXVK over MoltenVK, D3DMetal from Apple's Game
   Porting Toolkit 3.0 and 4.0 (the user's own copy), or wined3d, chosen per bottle or game.
 - Resizable game windows that keep the game's resolution and aspect ratio, with a

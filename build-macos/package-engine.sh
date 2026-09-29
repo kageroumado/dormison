@@ -226,10 +226,10 @@ mpegpsdemux applemedia deinterlace libav"
         done
         queue="$next"
     done
-    FEATURES='"env-files", "discord-bridge", "media"'
+    FEATURES='"env-files", "discord-bridge", "media", "fps-unlock"'
 else
     echo "warning: no GStreamer at $GST — run build-macos/fetch-gstreamer.sh; video stays silent and black"
-    FEATURES='"env-files", "discord-bridge"'
+    FEATURES='"env-files", "discord-bridge", "fps-unlock"'
 fi
 
 # --- pieces DXMT and D3DMetal contribute that a wine build does not produce ---
@@ -299,6 +299,11 @@ record source "$OUT/sevo-steamstub.exe" "$OUT/sevo-steamstub32.exe"
 make -s -C "$HERE/discord-bridge"
 cp "$HERE/discord-bridge/sevo-discord-bridge.exe" "$OUT/"
 record source "$OUT/sevo-discord-bridge.exe"
+
+# --- Genshin's frame-rate cap raised from beside the game (fps-unlock/README.md) ---
+make -s -C "$HERE/fps-unlock"
+cp "$HERE/fps-unlock/sevo-fpsunlock.exe" "$HERE/fps-unlock/sevo-fpsunlock-stub.dll" "$OUT/"
+record source "$OUT/sevo-fpsunlock.exe" "$OUT/sevo-fpsunlock-stub.dll"
 
 # --- make our binaries resolve the bundled dylibs through @rpath ---
 echo "==> rewriting install names to @rpath"
