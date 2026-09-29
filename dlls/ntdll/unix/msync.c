@@ -404,6 +404,53 @@ static inline void server_remove_wait( unsigned int msgh_id, const int *objs, vo
 #define YIELD_PROCESSOR do {} while (0)
 #endif
 
+#define SEVO_PARK_SLICE_MS_MAX 60000
+
+/* How long one park lasts before the waiter looks at its word again, in nanoseconds;
+ * 0, the default, parks for as long as the caller asked. SEVO_PARK_SLICE_MS sets it. Every
+ * slice is a wakeup of a parked thread, so it stays off unless a wedge is being chased. */
+static uint64_t park_slice_ns(void)
+{
+    /* Published atomically: every thread that races here computes the same value. */
+    static int slice_ms = -1;
+    int value = __atomic_load_n( &slice_ms, __ATOMIC_RELAXED );
+
+    if (value < 0)
+    {
+        value = sevo_env_budget( "SEVO_PARK_SLICE_MS", 0, SEVO_PARK_SLICE_MS_MAX );
+        __atomic_store_n( &slice_ms, value, __ATOMIC_RELAXED );
+    }
+    return (uint64_t)value * 1000000;
+}
+
+/* Parks on a shared word while it holds `expected`, for at most `timeout_ns` (0: no
+ * limit), in slices of park_slice_ns(). A word found changed between slices ends the park
+ * as if woken. Returns what ulock_wait returns: 0 on a wake, -ETIMEDOUT only once
+ * `timeout_ns` has passed. */
+static int ulock_park( void *addr, int expected, uint64_t timeout_ns )
+{
+    uint64_t slice = park_slice_ns(), start = 0;
+    int ret;
+
+    if (!slice) return ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, expected, timeout_ns );
+    if (timeout_ns) start = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+    for (;;)
+    {
+        uint64_t wait = slice;
+
+        if (timeout_ns)
+        {
+            uint64_t spent = clock_gettime_nsec_np( CLOCK_UPTIME_RAW ) - start;
+            if (spent >= timeout_ns) return -ETIMEDOUT;
+            if (timeout_ns - spent < wait) wait = timeout_ns - spent;
+        }
+        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, expected, wait );
+        if (ret != -ETIMEDOUT) return ret;
+        if (timeout_ns && clock_gettime_nsec_np( CLOCK_UPTIME_RAW ) - start >= timeout_ns) return -ETIMEDOUT;
+        if (__atomic_load_n( (const int *)addr, __ATOMIC_ACQUIRE ) != expected) return 0;
+    }
+}
+
 /* Looks at a frozen object's high word this many times before parking on it. The pump's
  * freeze lasts single-digit microseconds unless the pump is preempted. */
 #define FREEZE_SPIN 8192
@@ -423,7 +470,7 @@ static void wait_for_thaw( void *obj, uint64_t seen )
         if (__atomic_load_n( high, __ATOMIC_ACQUIRE ) != frozen) return;
     }
     SEVO_STAT( freeze_parks );
-    do ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, high, frozen, 0 );
+    do ret = ulock_park( high, (int)frozen, 0 );
     while (ret == -EINTR || ret == -EFAULT);
 }
 
@@ -510,7 +557,7 @@ static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
             if (!ns_timeleft) return STATUS_TIMEOUT;
         }
         SEVO_STAT( msync_direct_parks );
-        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, obj_shm, val, ns_timeleft );
+        ret = ulock_park( obj_shm, val, ns_timeleft );
     } while (ret == -EINTR || ret == -EFAULT);
 
     if (ret == -ETIMEDOUT)
@@ -580,7 +627,7 @@ static void wait_for_grant( int *addr, int seen )
         YIELD_PROCESSOR;
         if (__atomic_load_n( addr, __ATOMIC_ACQUIRE ) != seen) return;
     }
-    do ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, seen, 0 );
+    do ret = ulock_park( addr, seen, 0 );
     while (ret == -EINTR || ret == -EFAULT);
 }
 
@@ -678,7 +725,7 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
                         return STATUS_TIMEOUT;
                     }
                 }
-                ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, ACK_PARKED, ns_timeleft );
+                ulock_park( addr, ACK_PARKED, ns_timeleft );
                 continue;
             }
 
@@ -716,7 +763,7 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
             }
         }
         SEVO_STAT( msync_registered_parks );
-        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, TOKEN_REGISTERED, ns_timeleft );
+        ret = ulock_park( addr, TOKEN_REGISTERED, ns_timeleft );
         val = __atomic_load_n( addr, __ATOMIC_ACQUIRE );
         if (!val)
             break;
@@ -835,7 +882,7 @@ static NTSTATUS msync_wait_all( const int *objs, void **objs_shm, int alert_obj,
         }
         else ns_timeleft = 0;
 
-        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, val, ns_timeleft );
+        ret = ulock_park( addr, val, ns_timeleft );
         if (ret == -ETIMEDOUT) goto cancel;
     }
     goto terminal;
