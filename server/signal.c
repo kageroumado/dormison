@@ -34,6 +34,7 @@
 #include "process.h"
 #include "thread.h"
 #include "request.h"
+#include "msync.h"
 
 #if defined(linux) && defined(__SIGRTMIN)
 /* the signal used by linuxthreads as exit signal for clone() threads */
@@ -74,6 +75,7 @@ static struct handler *handler_sigterm;
 static struct handler *handler_sigint;
 static struct handler *handler_sigchld;
 static struct handler *handler_sigio;
+static struct handler *handler_sigusr2;
 
 static int watchdog;
 
@@ -169,6 +171,12 @@ static void sigint_callback(void)
     shutdown_master_socket();
 }
 
+/* SIGUSR2 handler: the msync lost-wake sweep */
+static void do_sigusr2( int signum )
+{
+    do_signal( handler_sigusr2 );
+}
+
 /* SIGHUP handler */
 static void do_sighup( int signum )
 {
@@ -253,6 +261,7 @@ void init_signals(void)
     if (!(handler_sigint  = create_handler( sigint_callback ))) goto error;
     if (!(handler_sigchld = create_handler( sigchld_callback ))) goto error;
     if (!(handler_sigio   = create_handler( sigio_callback ))) goto error;
+    if (!(handler_sigusr2 = create_handler( msync_sweep ))) goto error;
 
     sigemptyset( &blocked_sigset );
     sigaddset( &blocked_sigset, SIGCHLD );
@@ -262,6 +271,7 @@ void init_signals(void)
     sigaddset( &blocked_sigset, SIGIO );
     sigaddset( &blocked_sigset, SIGQUIT );
     sigaddset( &blocked_sigset, SIGTERM );
+    sigaddset( &blocked_sigset, SIGUSR2 );
 #ifdef SIG_PTHREAD_CANCEL
     sigaddset( &blocked_sigset, SIG_PTHREAD_CANCEL );
 #endif
@@ -282,6 +292,8 @@ void init_signals(void)
     action.sa_handler = do_sigterm;
     sigaction( SIGQUIT, &action, NULL );
     sigaction( SIGTERM, &action, NULL );
+    action.sa_handler = do_sigusr2;
+    sigaction( SIGUSR2, &action, NULL );
     if (core_dump_disabled())
     {
         action.sa_handler = do_sigsegv;

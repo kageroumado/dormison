@@ -171,6 +171,17 @@ static void handle_table_destroy( struct object *obj )
     free( table->entries );
 }
 
+/* call func with the object of every handle the process holds */
+void enum_process_objects( struct process *process, void (*func)( struct object *obj, void *arg ), void *arg )
+{
+    struct handle_table *table = process->handles;
+    int i;
+
+    if (!table) return;
+    for (i = 0; i <= table->last; i++)
+        if (table->entries[i].ptr) func( table->entries[i].ptr, arg );
+}
+
 /* close all the process handles and free the handle table */
 void close_process_handles( struct process *process )
 {

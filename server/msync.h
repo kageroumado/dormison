@@ -23,6 +23,13 @@ extern int do_msync(void);
 extern void msync_init_shm(void);
 extern void msync_init(void);
 
+struct process;
+struct thread;
+extern void msync_process_killed( struct process *process );
+extern void msync_process_died( struct process *process );
+extern void msync_thread_died( struct thread *thread );
+extern void msync_sweep(void);
+
 #ifdef __APPLE__
 
 enum msync_type

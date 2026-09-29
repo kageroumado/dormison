@@ -58,7 +58,10 @@
 #include "windef.h"
 #include "winternl.h"
 
+#include "file.h"
 #include "handle.h"
+#include "process.h"
+#include "thread.h"
 #include "request.h"
 #include "msync.h"
 
@@ -1399,6 +1402,332 @@ int msync_grab_object( struct msync *msync )
     return 1;
 }
 
+/*
+ * Sleepers a dead thread leaves behind.
+ *
+ * A set, a release or a mutex release is a compare-and-swap of the object's word and then a
+ * wake of the threads parked on it. A thread that dies between the two leaves those threads
+ * asleep on a word that already says the object is available, and nothing calls for them:
+ * the next set finds the object signaled and wakes nobody. A process's threads die that way
+ * when it exits or is killed, and the objects they were setting are often shared with a
+ * process that lives on, such as the events between a game and steam.exe. So the objects
+ * behind every handle a dead process held are woken as a signal wakes them: once when its
+ * last thread leaves the server's lists, soon enough for a clean exit, and again when the
+ * process is confirmed dead, after any write its threads were still making. A wake that
+ * recovers nothing costs a waiter one look at its word.
+ */
+
+#define RECENT_DEATHS 16
+
+/* A process whose handles' objects were collected when it was killed. While `process` is
+ * set it waits for process_died, matched by address; afterwards it is kept for the sweep's
+ * report, which names the objects a recent death shared. */
+struct death
+{
+    struct process *process;
+    process_id_t    id;
+    char            name[64];
+    timeout_t       when;
+    unsigned int   *indices;
+    unsigned int    count;
+};
+
+static struct death deaths[RECENT_DEATHS];
+static unsigned int next_death;
+
+struct index_set
+{
+    unsigned int *indices;
+    unsigned int  count;
+    unsigned int  capacity;
+};
+
+static void collect_object_index( struct object *obj, void *arg )
+{
+    struct index_set *set = arg;
+    unsigned int shm_idx = get_object_msync_idx( obj ), i;
+
+    if (!shm_idx) return;
+    for (i = 0; i < set->count; i++) if (set->indices[i] == shm_idx) return;
+    set->indices = grown( set->indices, &set->capacity, set->count + 1, sizeof(*set->indices) );
+    set->indices[set->count++] = shm_idx;
+}
+
+/* The executable's file name, ASCII, for log lines. */
+static void process_name( struct process *process, char *buffer, size_t size )
+{
+    const WCHAR *image = process->image, *base = image;
+    size_t i, n = process->imagelen / sizeof(WCHAR), out = 0;
+
+    for (i = 0; i < n; i++) if (image[i] == '\\' || image[i] == '/') base = image + i + 1;
+    for (; base && base < image + n && out + 1 < size; base++) buffer[out++] = *base < 0x80 ? (char)*base : '?';
+    if (!out && size > 1) buffer[out++] = '?';
+    buffer[out] = 0;
+}
+
+static const char *type_name( unsigned short type )
+{
+    switch (type)
+    {
+    case MSYNC_SEMAPHORE:     return "semaphore";
+    case MSYNC_AUTO_EVENT:    return "auto-event";
+    case MSYNC_MANUAL_EVENT:  return "manual-event";
+    case MSYNC_MUTEX:         return "mutex";
+    case MSYNC_AUTO_SERVER:   return "auto-server";
+    case MSYNC_MANUAL_SERVER: return "manual-server";
+    }
+    return "unknown";
+}
+
+/* Whether a thread waiting on the object could take it now. */
+static int object_available( const struct msync_shm *obj, uint64_t word )
+{
+    switch (obj->msync_type)
+    {
+    case MSYNC_SEMAPHORE: return object_low( word ) > 0;
+    case MSYNC_MUTEX:     return !object_low( word ) || object_low( word ) == ~0;
+    }
+    return object_low( word ) != 0;
+}
+
+/* Wakes an object's sleepers as a signal does: threads parked on its word look again, and
+ * the pump evaluates the registrations that list it. Returns whether a thread was parked on
+ * the word. */
+static int wake_object( unsigned int shm_idx )
+{
+    struct msync_shm *obj;
+    int ret;
+
+    if (!shm_idx || shm_idx > highest_allocated_idx) return 0;
+    obj = get_shm( shm_idx );
+    if (!__atomic_load_n( &obj->refcount, __ATOMIC_SEQ_CST )) return 0;
+
+    do ret = __ulock_wake( UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL, (void *)obj, 0 );
+    while (ret == -1 && errno == EINTR);
+    if (__atomic_load_n( &obj->multiple_waiters, __ATOMIC_SEQ_CST )) send_header_message( shm_idx );
+    return !ret;
+}
+
+/* Wakes every object of the set and logs the ones that had a thread parked on them. */
+static void wake_objects( const char *when, process_id_t id, const char *name,
+                          const unsigned int *indices, unsigned int count )
+{
+    char list[160];
+    unsigned int i, woke = 0;
+    int len = 0;
+
+    list[0] = 0;
+    for (i = 0; i < count; i++)
+    {
+        if (!wake_object( indices[i] )) continue;
+        if (woke++ < 6 && len < (int)sizeof(list) - 32)
+            len += snprintf( list + len, sizeof(list) - len, " %u:%s", indices[i],
+                             type_name( ((struct msync_shm *)get_shm( indices[i] ))->msync_type ) );
+    }
+    if (woke)
+        fprintf( stderr, "sevo:msync backstop %s pid=%04x exe=%s objects=%u woke=%u%s\n",
+                 when, id, name, count, woke, list );
+}
+
+void msync_process_killed( struct process *process )
+{
+    struct index_set set = { NULL, 0, 0 };
+    struct death *death;
+
+    if (!do_msync()) return;
+    enum_process_objects( process, collect_object_index, &set );
+    if (!set.count)
+    {
+        free( set.indices );
+        return;
+    }
+
+    death = &deaths[next_death++ % RECENT_DEATHS];
+    free( death->indices );
+    death->process = process;
+    death->id = process->id;
+    death->when = current_time;
+    death->indices = set.indices;
+    death->count = set.count;
+    process_name( process, death->name, sizeof(death->name) );
+
+    wake_objects( "exit", death->id, death->name, death->indices, death->count );
+}
+
+void msync_process_died( struct process *process )
+{
+    unsigned int i;
+
+    if (!do_msync()) return;
+    for (i = 0; i < RECENT_DEATHS; i++)
+    {
+        struct death *death = &deaths[i];
+
+        if (death->process != process) continue;
+        death->process = NULL;
+        death->when = current_time;
+        wake_objects( "confirmed", death->id, death->name, death->indices, death->count );
+    }
+}
+
+/* A thread terminated by another, in a process that lives on: TerminateThread. The
+ * thread is confirmed gone, so one pass over its process's objects is enough. A process
+ * that is terminating is covered by msync_process_killed and msync_process_died. */
+void msync_thread_died( struct thread *thread )
+{
+    struct process *process = thread->process;
+    struct index_set set = { NULL, 0, 0 };
+    char name[64];
+
+    if (!do_msync() || !process || process->is_terminating) return;
+    enum_process_objects( process, collect_object_index, &set );
+    process_name( process, name, sizeof(name) );
+    wake_objects( "thread", process->id, name, set.indices, set.count );
+    free( set.indices );
+}
+
+/*
+ * The lost-wake sweep, run on SIGUSR2.
+ *
+ * It finds threads parked on an object that has been available, with its word unchanged, for
+ * the 100 ms between two passes, wakes them, and says which object held them and who shares
+ * it. A set that is being made wakes its sleepers within microseconds of its compare-and-
+ * swap, so a sleeper still there after 100 ms of an unchanged available word is one nobody
+ * will call for. The first pass only reads; the second wakes, and ulock reports whether a
+ * thread was parked there. The report goes to stderr and to .sevo-msync-sweep.log in the
+ * prefix, which `sevo sync sweep` reads.
+ */
+
+struct stale_object
+{
+    unsigned int shm_idx;
+    uint64_t     word;
+};
+
+static struct stale_object *sweep_candidates;
+static unsigned int sweep_count, sweep_capacity, sweep_scanned;
+static struct timeout_user *sweep_timeout;
+static FILE *sweep_report;
+
+static void sweep_line( const char *format, ... ) __attribute__((format(printf, 1, 2)));
+static void sweep_line( const char *format, ... )
+{
+    va_list args;
+
+    va_start( args, format );
+    vfprintf( stderr, format, args );
+    va_end( args );
+    if (!sweep_report) return;
+    va_start( args, format );
+    vfprintf( sweep_report, format, args );
+    va_end( args );
+}
+
+struct holder_search
+{
+    unsigned int shm_idx;
+    int          found;
+    char         list[256];
+    int          len;
+};
+
+static void find_object_holder( struct object *obj, void *arg )
+{
+    struct holder_search *search = arg;
+    if (!search->found && get_object_msync_idx( obj ) == search->shm_idx) search->found = 1;
+}
+
+/* Appends each process that holds a handle to the object to the search's list. */
+static int note_holder( struct process *process, void *arg )
+{
+    struct holder_search *search = arg;
+    char name[64];
+
+    search->found = 0;
+    enum_process_objects( process, find_object_holder, search );
+    if (!search->found || search->len >= (int)sizeof(search->list) - 80) return 0;
+    process_name( process, name, sizeof(name) );
+    search->len += snprintf( search->list + search->len, sizeof(search->list) - search->len,
+                             " %04x:%s", process->id, name );
+    return 0;
+}
+
+static void report_lost_wake( unsigned int shm_idx, uint64_t word )
+{
+    struct msync_shm *obj = get_shm( shm_idx );
+    struct holder_search search = { shm_idx, 0, "", 0 };
+    unsigned int i, j, shown;
+
+    enum_processes( note_holder, &search );
+    sweep_line( "sevo:msync lost-wake idx=%u type=%s low=%d high=%u registered=%d holders=[%s ]\n",
+                shm_idx, type_name( obj->msync_type ), object_low( word ), object_high( word ),
+                __atomic_load_n( &obj->multiple_waiters, __ATOMIC_SEQ_CST ), search.list );
+    /* The newest deaths first, three at most: the one that matters is usually the last. */
+    for (i = 0, shown = 0; i < RECENT_DEATHS && shown < 3; i++)
+    {
+        const struct death *death = &deaths[(next_death - 1 - i) % RECENT_DEATHS];
+
+        for (j = 0; j < death->count; j++)
+        {
+            if (death->indices[j] != shm_idx) continue;
+            sweep_line( "sevo:msync lost-wake idx=%u shared with pid=%04x exe=%s, dead %lld ms ago\n",
+                        shm_idx, death->id, death->name,
+                        (long long)((current_time - death->when) / (TICKS_PER_SEC / 1000)) );
+            shown++;
+            break;
+        }
+    }
+}
+
+static void sweep_second_pass( void *arg )
+{
+    unsigned int i, lost = 0;
+
+    sweep_timeout = NULL;
+    for (i = 0; i < sweep_count; i++)
+    {
+        struct stale_object *stale = &sweep_candidates[i];
+        struct msync_shm *obj = get_shm( stale->shm_idx );
+
+        if (!__atomic_load_n( &obj->refcount, __ATOMIC_SEQ_CST )) continue;
+        if (load_object( obj ) != stale->word) continue;
+        if (!wake_object( stale->shm_idx )) continue;
+        lost++;
+        report_lost_wake( stale->shm_idx, stale->word );
+    }
+    sweep_line( "sevo:msync sweep objects=%u available=%u lost-wakes=%u\n", sweep_scanned, sweep_count, lost );
+    if (sweep_report) fclose( sweep_report );
+    sweep_report = NULL;
+}
+
+void msync_sweep(void)
+{
+    unsigned int shm_idx;
+    int fd;
+
+    if (!do_msync() || sweep_timeout) return;
+
+    fd = openat( config_dir_fd, ".sevo-msync-sweep.log", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644 );
+    sweep_report = fd == -1 ? NULL : fdopen( fd, "w" );
+    if (!sweep_report && fd != -1) close( fd );
+
+    sweep_count = sweep_scanned = 0;
+    for (shm_idx = 1; shm_idx <= highest_allocated_idx; shm_idx++)
+    {
+        struct msync_shm *obj = get_shm( shm_idx );
+        uint64_t word;
+
+        if (!__atomic_load_n( &obj->refcount, __ATOMIC_SEQ_CST )) continue;
+        sweep_scanned++;
+        word = load_object( obj );
+        if (object_frozen( word ) || !object_available( obj, word )) continue;
+        sweep_candidates = grown( sweep_candidates, &sweep_capacity, sweep_count + 1, sizeof(*sweep_candidates) );
+        sweep_candidates[sweep_count].shm_idx = shm_idx;
+        sweep_candidates[sweep_count++].word = word;
+    }
+    sweep_timeout = add_timeout_user( -TICKS_PER_SEC / 10, sweep_second_pass, NULL );
+}
+
 #else /* __APPLE__ */
 
 int do_msync(void)
@@ -1411,6 +1740,22 @@ void msync_init_shm(void)
 }
 
 void msync_init(void)
+{
+}
+
+void msync_process_killed( struct process *process )
+{
+}
+
+void msync_process_died( struct process *process )
+{
+}
+
+void msync_thread_died( struct thread *thread )
+{
+}
+
+void msync_sweep(void)
 {
 }
 

@@ -1583,6 +1583,7 @@ static void check_terminated( void *arg )
     /* grab reference since object can be destroyed while trying to wake up */
     grab_object( &thread->obj );
     thread->exit_poll = NULL;
+    msync_thread_died( thread );
     signal_sync( thread->sync );
     release_object( &thread->obj );
 }

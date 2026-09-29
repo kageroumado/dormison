@@ -31,9 +31,9 @@ The [build guide](build-macos/README.md) covers the toolchain, configuration,
 packaging and releases. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to
 report a problem and verify a change.
 
-Each release has an `r<N>` tag and includes the engine tarball, checksum,
-Ed25519 signature, `engine-info.json` and the diff against
-`wine-staging-base`. Sevoflurane finds engines through its signed release
+Each release has an `r<N>` tag and each beta a `b<N>` tag. Both include the
+engine tarball, checksum, Ed25519 signature, `engine-info.json` and the diff
+against `wine-staging-base`. Sevoflurane finds engines through its signed release
 manifest.
 
 ## Technical details
@@ -79,7 +79,8 @@ Everything below is absent from Wine 11.16 and wine-staging 11.16.
   keeps the display awake.
 
 **Processes, sync and memory**
-- msync: Mach-based in-process synchronization (`WINEMSYNC=1`).
+- msync+: Mach-based in-process synchronization (`WINEMSYNC=1`), Dormison's
+  fork of CrossOver's msync.
 - Critical sections leave the lock available on release, as on Windows: a
   running thread may take the lock back before a woken waiter arrives, and
   `LockCount` reads as Windows encodes it.
@@ -110,7 +111,7 @@ This comparison is against the CrossOver 26.3 source release, which is
 Wine 11.0 with CodeWeavers' patches and no wine-staging.
 
 **Taken from CrossOver**
-- msync, with fixes CrossOver 26.3 lacks:
+- msync, forked as msync+ with fixes CrossOver 26.3 lacks:
   - WaitAll is granted by wineserver under a freeze of the whole set, so a
     grant is a set that was whole at one instant and is consumed once, before
     the waiting thread returns; a query never reads the set half consumed.
@@ -118,6 +119,14 @@ Wine 11.0 with CodeWeavers' patches and no wine-staging.
   - `NtReleaseMutant` reports NT's previous count.
   - Freed object indexes are reused from a stack.
   - A process exits when its wineserver dies.
+  - A thread that dies between setting an object and waking its sleepers
+    leaves them asleep on an object that reads available. When a process
+    dies, wineserver wakes every object it held a handle to, once when its
+    last thread is gone and again when its death is confirmed, and does the
+    same for a thread terminated in a process that lives on.
+  - `SIGUSR2` to wineserver sweeps for threads asleep on an object that has
+    stayed available and unchanged for 100 ms, wakes them, and reports each
+    object, its holders and any recent death that shared it.
 - Rosetta workarounds: the `lretq` 32→64 transition, MXCSR restore,
   XGETBV/CET/debug-register handling, and retranslation of written code.
   Dormison's cross-process write invalidation walks the range region by
@@ -190,7 +199,7 @@ raw displacement when the program holds the cursor for mouse-look.
 
 ### Processes and compatibility
 
-Dormison includes CrossOver's msync implementation, which synchronizes in
+Dormison includes msync+, its fork of CrossOver's msync, which synchronizes in
 process through shared memory, `__ulock` waits and a Mach port to wineserver
 (`WINEMSYNC=1`). It is maintained as commits on `main`. Rosetta workarounds cover
 32-to-64-bit transitions, written executable code and signal contexts.

@@ -236,12 +236,28 @@ add one `HKCU,%FontReplStr%,"<Windows name>",,"<family as win32u enumerates
 it>"` line per name to `[Fonts]`. The exact family string is the one the bottle's font
 enumeration reports.
 
-## msync
+## msync+
 
-msync started from CrossOver 26.3's (LGPL) and is maintained as commits on
+msync+ started from CrossOver 26.3's msync (LGPL) and is maintained as commits on
 `main`: the backend in `server/msync.c` and `dlls/ntdll/unix/msync.c`, and its
 hooks in the server and ntdll files around them. A rebase carries it like any
-other commit.
+other commit. The code, `WINEMSYNC` and the log prefixes keep the name msync.
+
+A thread that dies between an object's compare-and-swap and the wake after it
+leaves the object's sleepers asleep on a word that reads available. wineserver
+wakes every object behind a dead process's handles when its last thread leaves
+(`msync_process_killed`) and again at confirmed death (`msync_process_died`),
+and a thread terminated in a live process gets the same pass once confirmed
+(`msync_thread_died`). A pass that finds a sleeper logs
+`sevo:msync backstop <exit|confirmed|thread> pid=… exe=… objects=… woke=…`.
+
+`kill -USR2 <wineserver pid>` runs the lost-wake sweep: two passes 100 ms
+apart, and every object that stayed available and unchanged between them is
+woken. Each one that had a sleeper is reported as `sevo:msync lost-wake`, with
+the processes that hold it and any of the last 16 deaths that shared it, on
+wineserver's stderr and in `<prefix>/.sevo-msync-sweep.log`. `sevo sync sweep`
+sends the signal and prints the log. `bispectral/lost-wake` measures the
+backstop: it kills a process that sets an event another process sleeps on.
 
 ## DXMT
 

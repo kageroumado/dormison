@@ -398,6 +398,18 @@ static int get_obj_inproc_sync( struct object *obj, int *type )
     return shm_idx;
 }
 
+/* The msync index behind a waitable object, 0 for an object that has none. */
+unsigned int get_object_msync_idx( struct object *obj )
+{
+    struct object *sync;
+    unsigned int shm_idx = 0;
+
+    if (!do_msync() || !(sync = get_obj_sync( obj ))) return 0;
+    if (sync->ops == &inproc_sync_ops) shm_idx = ((struct inproc_sync *)sync)->msync->shm_idx;
+    release_object( sync );
+    return shm_idx;
+}
+
 #else /* NTSYNC_IOC_EVENT_READ */
 
 int get_inproc_device_fd(void)

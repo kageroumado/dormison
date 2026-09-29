@@ -29,7 +29,7 @@ Sevoflurane 会下载引擎并管理它的设置。想直接用它玩游戏，�
 [构建指南](build-macos/README.md)介绍了工具链、配置、打包和发布流程。
 [CONTRIBUTING.md](CONTRIBUTING.md)说明了如何报告问题、验证改动。
 
-每个版本都有一个 `r<N>` 标签，附带引擎 tar 包、校验和、Ed25519 签名、
+每个正式版本都有一个 `r<N>` 标签，每个测试版本都有一个 `b<N>` 标签，附带引擎 tar 包、校验和、Ed25519 签名、
 `engine-info.json`，以及相对 `wine-staging-base` 的差异文件。
 Sevoflurane 通过带签名的发布清单查找引擎版本。
 
@@ -71,7 +71,7 @@ Sevoflurane 通过带签名的发布清单查找引擎版本。
 
 **进程、同步与内存**
 
-- msync：基于 Mach 的进程内同步（`WINEMSYNC=1`）。
+- msync+：基于 Mach 的进程内同步（`WINEMSYNC=1`），是 Dormison 对 CrossOver msync 的分支。
 - 临界区释放时让锁重新可用，与 Windows 的行为一致：正在运行的线程可以在被唤醒的等待线程
   接手前重新取得锁，`LockCount` 的值也按 Windows 的方式编码。
 - 每个程序可以有自己的设置文件，在进程启动时读取。
@@ -101,13 +101,18 @@ Sevoflurane 通过带签名的发布清单查找引擎版本。
 
 **来自 CrossOver 的部分**
 
-- msync，并加入了 CrossOver 26.3 尚未包含的修复：
+- msync，以 msync+ 分支维护，并加入了 CrossOver 26.3 尚未包含的修复：
   - wineserver 在冻结整个对象集合的状态下批准 WaitAll，确保获准的是同一时刻全部满足条件的集合，
     并在等待线程返回前一次性消耗；查询不会读到只消耗了一部分的状态。
   - WaitAll 能报告被遗弃的互斥锁。
   - `NtReleaseMutant` 返回 NT 语义下的前一次计数。
   - 用栈复用已释放的对象索引。
   - wineserver 终止时，其进程也会退出。
+  - 线程若在设置对象之后、唤醒等待线程之前终止，等待线程会一直睡在一个已可用的对象上。
+    进程终止时，wineserver 会唤醒它持有句柄的每个对象：一次在它最后一个线程离开时，
+    一次在确认它已终止时；进程仍在运行、只有线程被终止时也会这样做。
+  - 向 wineserver 发送 `SIGUSR2` 会扫描那些已可用且 100 毫秒内未变化、却仍有线程在等待的对象，
+    唤醒这些线程，并报告对象、持有者以及与之共享该对象的最近终止的进程。
 - Rosetta 兼容处理：通过 `lretq` 完成 32→64 位切换、恢复 MXCSR、处理
   XGETBV/CET/调试寄存器，以及重新转译被写入的代码。跨进程写入使转译失效时，
   Dormison 逐个内存区域处理；CrossOver 则将第一页的保护属性恢复到整个范围。
@@ -170,7 +175,7 @@ Show Frame Time Graph（显示帧时间图，`FrameRateGraph=Y` 或 `SEVO_FPS_GR
 
 ### 进程与兼容性
 
-Dormison 包含 CrossOver 的 msync 实现，通过共享内存、`__ulock` 等待
+Dormison 包含 msync+，即它对 CrossOver msync 实现的分支，通过共享内存、`__ulock` 等待
 和连接到 wineserver 的 Mach 端口，在进程内完成同步（`WINEMSYNC=1`）。
 这些改动以提交的形式维护在 `main` 上。Rosetta 兼容处理涵盖 32→64 位切换、
 被写入的可执行代码和信号上下文。位宽切换使用 `lretq`，
