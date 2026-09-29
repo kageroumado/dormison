@@ -97,6 +97,14 @@
        the window is presented through the scaler from then on. */
     BOOL programRefusesResize;
     NSTimeInterval liveResizeEndTime;
+    /* The drag in progress keeps the program's size and scales the stage. */
+    BOOL liveResizeScaled;
+    /* A window the stage does not scale is scaled through a live drag all
+       the same, so the program is told its new size once, when the drag
+       ends, instead of at every step: a program that rebuilds its swapchain
+       on each WM_SIZE shows nothing for as long as the sizes keep coming.
+       Set through the drag and until the program's answer has landed. */
+    BOOL liveResizeDeferred;
     /* A borderless window covering a screen, shown in a titled window at a
        smaller size (RESIZABLE_WINDOWS_WINDOW). Placed once, at the default
        windowed frame; after that the real frame is the user's alone. */

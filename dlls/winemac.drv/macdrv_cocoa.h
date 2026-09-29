@@ -496,6 +496,9 @@ typedef struct macdrv_query {
             unsigned int    from_left : 1;
             unsigned int    from_top : 1;
         }                                           resize_size;
+        struct {
+            unsigned int    scaled : 1;
+        }                                           resize_start;
     };
 } macdrv_query;
 

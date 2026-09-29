@@ -2234,14 +2234,17 @@ BOOL query_resize_size(HWND hwnd, macdrv_query *query)
  *
  * Handler for QUERY_RESIZE_START query.
  */
-BOOL query_resize_start(HWND hwnd)
+BOOL query_resize_start(HWND hwnd, BOOL scaled)
 {
-    TRACE("hwnd %p\n", hwnd);
+    TRACE("hwnd %p scaled %d\n", hwnd, scaled);
 
     NtUserClipCursor(NULL);
 
     sync_window_min_max_info(hwnd);
-    send_message(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+    /* A scaled resize keeps the window's size, which is the program's whole
+       view of it; WM_ENTERSIZEMOVE would stop a game that pauses in a
+       size-move loop for as long as the drag lasts. */
+    if (!scaled) send_message(hwnd, WM_ENTERSIZEMOVE, 0, 0);
 
     return TRUE;
 }

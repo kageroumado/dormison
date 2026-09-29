@@ -396,6 +396,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
 
 @interface WineBaseView : NSView
+    - (void) finishPresenterLiveResize;
 @end
 
 
@@ -637,6 +638,13 @@ static NSView* wine_content_view_of(NSWindow* window)
 
 
 @implementation WineBaseView
+
+    - (void) finishPresenterLiveResize
+    {
+        for (NSView* subview in [self subviews])
+            if ([subview isKindOfClass:[WineBaseView class]])
+                [(WineBaseView*)subview finishPresenterLiveResize];
+    }
 
     - (void) setRetinaMode:(BOOL)mode
     {
@@ -960,6 +968,7 @@ static NSView* wine_content_view_of(NSWindow* window)
         _metalView = view;
         [self applyPresentationFilters];
 
+        [[(WineWindow*)self.window wineContentView] layer].backgroundColor = CGColorGetConstantColor(kCGColorBlack);
         [(WineWindow*)self.window windowDidDrawContent];
 
         return _metalView;
@@ -1324,6 +1333,16 @@ static NSView* wine_content_view_of(NSWindow* window)
         return (CALayer*)sevo_presenter_onscreen_layer(_presenter);
     }
 
+    - (BOOL) wantsUpdateLayer
+    {
+        return _presenter != NULL;
+    }
+
+    - (void) updateLayer
+    {
+        if (_presenter) sevo_presenter_refresh(_presenter);
+    }
+
     - (CAMetalLayer*) rendererLayer
     {
         return _rendererLayer ? _rendererLayer : (CAMetalLayer*)self.layer;
@@ -1345,8 +1364,17 @@ static NSView* wine_content_view_of(NSWindow* window)
             deviceScale = [window backingScaleFactor];
         if (deviceScale <= 0) deviceScale = 1;
         sevo_stats_note_window((unsigned long long)window.windowNumber);
+        if ([window inLiveResize]) sevo_presenter_set_live_resize(_presenter, TRUE);
         sevo_presenter_layout(_presenter, deviceScale, retina_on ? 2.0 : 1.0,
                               NSWidth([self bounds]), NSHeight([self bounds]));
+        if (![window inLiveResize]) sevo_presenter_set_live_resize(_presenter, FALSE);
+    }
+
+    - (void) finishPresenterLiveResize
+    {
+        [super finishPresenterLiveResize];
+        [self presentationLayoutChanged];
+        if (_presenter) sevo_presenter_set_live_resize(_presenter, FALSE);
     }
 
     - (void) setFrameSize:(NSSize)size
@@ -1493,8 +1521,17 @@ static NSView* wine_content_view_of(NSWindow* window)
             deviceScale = [window backingScaleFactor];
         if (deviceScale <= 0) deviceScale = 1;
         sevo_stats_note_window((unsigned long long)window.windowNumber);
+        if ([window inLiveResize]) sevo_presenter_set_live_resize(_presenter, TRUE);
         sevo_presenter_layout(_presenter, deviceScale, retina_on ? 2.0 : 1.0,
                               NSWidth([self bounds]), NSHeight([self bounds]));
+        if (![window inLiveResize]) sevo_presenter_set_live_resize(_presenter, FALSE);
+    }
+
+    - (void) finishPresenterLiveResize
+    {
+        [super finishPresenterLiveResize];
+        [self presentationLayoutChanged];
+        if (_presenter) sevo_presenter_set_live_resize(_presenter, FALSE);
     }
 
     - (void) setFrameSize:(NSSize)size
@@ -1673,11 +1710,19 @@ static NSView* wine_content_view_of(NSWindow* window)
         return presentationWindowed;
     }
 
+    /* Whether the real frame may differ from Wine's, the stage scaling the
+       difference away: a scalable window always, any other through a live
+       drag. */
+    - (BOOL) stageScales
+    {
+        return presentationScalable || liveResizeDeferred;
+    }
+
     - (BOOL) presentationScaled
     {
         NSSize real, wine;
 
-        if (!presentationScalable || NSIsEmptyRect(wineContentRect)) return NO;
+        if (!self.stageScales || NSIsEmptyRect(wineContentRect)) return NO;
         real = [self contentRectForFrameRect:self.frame].size;
         wine = [self wineContentSize];
         return fabs(real.width - wine.width) >= 0.5 || fabs(real.height - wine.height) >= 0.5;
@@ -1771,7 +1816,7 @@ static NSView* wine_content_view_of(NSWindow* window)
         NSRect box;
         BOOL scaled;
 
-        if (!presentationScalable || !wineContentView || !stage) return;
+        if (!self.stageScales || !wineContentView || !stage) return;
 
         area = [stage bounds].size;
         wine = [self wineContentSize];
@@ -1799,6 +1844,19 @@ static NSView* wine_content_view_of(NSWindow* window)
         [stage layer].backgroundColor = scaled ? CGColorGetConstantColor(kCGColorBlack) : NULL;
         [wineContentView setPresentationDeviceScale:(scaled ? box.size.width / wine.width : 1.0)
                                                     * [self backingScaleFactor]];
+        notify_metal_views(wineContentView);
+    }
+
+    /* Wine's content view back at the stage's size, 1:1, with no stage
+       showing behind it. */
+    - (void) restoreUnscaledPresentation
+    {
+        NSView* stage = [self contentView];
+
+        [wineContentView setFrame:[stage bounds]];
+        [wineContentView setBoundsSize:[stage bounds].size];
+        [stage layer].backgroundColor = NULL;
+        [wineContentView setPresentationDeviceScale:[self backingScaleFactor]];
         notify_metal_views(wineContentView);
     }
 
@@ -2004,12 +2062,8 @@ static NSView* wine_content_view_of(NSWindow* window)
             if (!presentationScalable)
             {
                 /* Back to the window Wine believes in, at Wine's own size. */
-                NSView* stage = [self contentView];
                 [self setFrame:wineFrame display:YES];
-                [wineContentView setFrame:[stage bounds]];
-                [wineContentView setBoundsSize:[stage bounds].size];
-                [stage layer].backgroundColor = NULL;
-                [wineContentView setPresentationDeviceScale:[self backingScaleFactor]];
+                [self restoreUnscaledPresentation];
             }
         }
         [self adjustFeaturesForState];
@@ -2085,11 +2139,16 @@ static NSView* wine_content_view_of(NSWindow* window)
         macdrv_release_event(event);
     }
 
+    /* A drag the stage scales keeps the program's size, so the program is
+       not told a size-move loop began: a game that stops rendering inside
+       that loop would leave the window without a picture for the whole drag. */
     - (void) sendResizeStartQuery
     {
         macdrv_query* query = macdrv_create_query();
         query->type = QUERY_RESIZE_START;
         query->window = (macdrv_window)[self retain];
+        liveResizeScaled = self.stageScales;
+        query->resize_start.scaled = liveResizeScaled;
 
         [self.queue query:query timeout:0.3];
         macdrv_release_query(query);
@@ -2713,7 +2772,7 @@ static NSView* wine_content_view_of(NSWindow* window)
     - (void) updateFullscreen
     {
         /* A scaled window is as large as it looks, whatever Wine believes. */
-        NSRect contentRect = [self contentRectForFrameRect:presentationScalable ? self.frame : self.wine_fractionalFrame];
+        NSRect contentRect = [self contentRectForFrameRect:self.stageScales ? self.frame : self.wine_fractionalFrame];
         BOOL nowFullscreen = !([self styleMask] & NSWindowStyleMaskFullScreen) && screen_covered_by_rect(contentRect, [NSScreen screens]);
 
         if (nowFullscreen != fullscreen)
@@ -2798,6 +2857,13 @@ static NSView* wine_content_view_of(NSWindow* window)
         applyingWineFrame = TRUE;
         [self setFrame:realFrame display:YES];
         applyingWineFrame = FALSE;
+        /* The program's answer to the drag has landed: the size is its
+           again, whether it took the user's or put its own back. */
+        if (liveResizeDeferred)
+        {
+            liveResizeDeferred = NO;
+            if (!presentationScalable) [self restoreUnscaledPresentation];
+        }
 
         roundedWineFrame = self.frame;
         CGFloat junk;
@@ -3911,11 +3977,22 @@ static NSView* wine_content_view_of(NSWindow* window)
     - (void) windowDidEndLiveResize:(NSNotification *)notification
     {
         liveResizeEndTime = [[NSProcessInfo processInfo] systemUptime];
-        if (!maximized)
+        [wineContentView finishPresenterLiveResize];
+        if (!maximized && !liveResizeScaled)
         {
             macdrv_event* event = macdrv_create_event(WINDOW_RESIZE_ENDED, self);
             [queue postEvent:event];
             macdrv_release_event(event);
+        }
+        if (liveResizeDeferred)
+        {
+            /* The program hears of the drag now, as one resize inside its own
+               size-move loop; its answer (setFrameFromWine:) ends the
+               deferral. A drag that changed nothing has nothing to tell. */
+            if (self.presentationScaled)
+                [self postWindowFrameChanged:self.frame fullscreen:FALSE resizing:FALSE skipSizeMove:FALSE];
+            else
+                liveResizeDeferred = NO;
         }
     }
 
@@ -3988,7 +4065,7 @@ static NSView* wine_content_view_of(NSWindow* window)
     {
         NSRect frame;
 
-        if (presentationScalable)
+        if (self.stageScales)
         {
             [self syncWineFrameToRealFrame];
             [self layoutPresentation];
@@ -4122,6 +4199,9 @@ static NSView* wine_content_view_of(NSWindow* window)
 
     - (NSSize) windowWillResize:(NSWindow*)sender toSize:(NSSize)frameSize
     {
+        /* The program is out of the drag; the window's own minimum and
+           maximum are the only rule until it answers the final size. */
+        if (liveResizeDeferred) return frameSize;
         if (presentationScalable)
         {
             /* The program is not asked — it would answer with the size it
@@ -4179,6 +4259,9 @@ static NSView* wine_content_view_of(NSWindow* window)
     - (void) windowWillStartLiveResize:(NSNotification *)notification
     {
         [self endWindowDragging];
+        liveResizeScaled = NO;
+        liveResizeDeferred = !presentationScalable && !maximized && !NSIsEmptyRect(wineContentRect) &&
+                             !([self styleMask] & NSWindowStyleMaskFullScreen);
 
         if (maximized)
         {

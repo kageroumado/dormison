@@ -246,7 +246,7 @@ extern void macdrv_window_drag_begin(HWND hwnd, const macdrv_event *event);
 extern void macdrv_window_drag_end(HWND hwnd);
 extern void macdrv_reassert_window_position(HWND hwnd);
 extern BOOL query_resize_size(HWND hwnd, macdrv_query *query);
-extern BOOL query_resize_start(HWND hwnd);
+extern BOOL query_resize_start(HWND hwnd, BOOL scaled);
 extern BOOL query_min_max_info(HWND hwnd);
 
 extern void macdrv_mouse_button(HWND hwnd, const macdrv_event *event);

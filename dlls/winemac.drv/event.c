@@ -351,7 +351,7 @@ static void macdrv_query_event(HWND hwnd, const macdrv_event *event)
             break;
         case QUERY_RESIZE_START:
             TRACE("QUERY_RESIZE_START\n");
-            success = query_resize_start(hwnd);
+            success = query_resize_start(hwnd, query->resize_start.scaled);
             break;
         case QUERY_MIN_MAX_INFO:
             TRACE("QUERY_MIN_MAX_INFO\n");

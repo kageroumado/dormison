@@ -52,7 +52,7 @@ extern void *sevo_presenter_attach_surface(void *bits, size_t size, int stride, 
    staging is all in flight and the caller keeps the rectangle dirty for
    its next flush. */
 extern int sevo_presenter_surface_flush(void *presenter, int left, int top, int right, int bottom);
-/* The window wants a surface's or an OpenGL drawable's picture on screen
+/* The window wants its Metal, OpenGL, or surface picture on screen
    again: presenting the last frame afresh gives a layer the system emptied
    behind a covered window its picture back. */
 extern void sevo_presenter_refresh(void *presenter);
@@ -80,6 +80,9 @@ extern void *sevo_presenter_onscreen_layer(void *presenter);       /* CAMetalLay
    contentsScale, or the DIB's density), and the bounds in points. */
 extern void sevo_presenter_layout(void *presenter, double device_scale, double renderer_scale,
                                   double width, double height);
+/* Holds output resolution through a live drag; ending it applies the latest
+   layout and redraws the retained picture. Main thread. */
+extern void sevo_presenter_set_live_resize(void *presenter, int resizing);
 /* id<CAMetalDrawable>, autoreleased, or NULL; NULL for a surface's presenter. */
 extern void *sevo_presenter_next_drawable(void *presenter);
 /* Lets the handle go. A surface's presenter stops its display link here,

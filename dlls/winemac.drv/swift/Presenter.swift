@@ -202,6 +202,13 @@ public func sevoPresenterLayout(
     presenter.layout(deviceScale: deviceScale, rendererScale: rendererScale, size: CGSize(width: width, height: height))
 }
 
+/// Freezes the output resolution during a live resize, then applies the latest
+/// layout and redraws when the drag ends. Main thread.
+@_cdecl("sevo_presenter_set_live_resize")
+public func sevoPresenterSetLiveResize(_ handle: UnsafeMutableRawPointer, _ resizing: Int32) {
+    Unmanaged<ViewPresenter>.fromOpaque(handle).takeUnretainedValue().setLiveResize(resizing != 0)
+}
+
 /// A drawable for the renderer to draw the next frame into, autoreleased the
 /// way `-[CAMetalLayer nextDrawable]` returns its own, or NULL when no frame
 /// can be taken right now.
@@ -575,6 +582,7 @@ class ViewPresenter: NSObject {
         layer.device = device
         layer.framebufferOnly = true
         layer.isOpaque = true
+        layer.contentsGravity = .resize
         layer.backgroundColor = CGColor(gray: 0, alpha: 1)
         layer.magnificationFilter = .nearest
         layer.minificationFilter = .nearest
@@ -628,13 +636,31 @@ class ViewPresenter: NSObject {
 
     // MARK: Geometry (main thread)
 
+    private var liveResize = false
+    private var pendingPixels = CGSize.zero
+    private var pendingScale: CGFloat = 1
+
+    func setLiveResize(_ resizing: Bool) {
+        guard liveResize != resizing else { return }
+        liveResize = resizing
+        if !resizing {
+            applyDrawableSize()
+            CATransaction.setCompletionBlock { [weak self] in self?.refresh() }
+        }
+    }
+
+    private func applyDrawableSize() {
+        guard pendingPixels.width >= 1, pendingPixels.height >= 1 else { return }
+        if onscreen.contentsScale != pendingScale { onscreen.contentsScale = pendingScale }
+        if onscreen.drawableSize != pendingPixels { onscreen.drawableSize = pendingPixels }
+    }
+
     func layout(deviceScale: Double, rendererScale: Double, size: CGSize) {
         let scale = deviceScale > 0 ? deviceScale : 1
         let pixels = CGSize(width: (size.width * scale).rounded(), height: (size.height * scale).rounded())
-        if onscreen.contentsScale != scale { onscreen.contentsScale = scale }
-        if onscreen.drawableSize != pixels, pixels.width >= 1, pixels.height >= 1 {
-            onscreen.drawableSize = pixels
-        }
+        pendingScale = scale
+        pendingPixels = pixels
+        if !liveResize { applyDrawableSize() }
         layoutChanged(rendererScale: rendererScale, size: size)
         if Presenter.shared.tracing {
             log("layout view \(Int(size.width))x\(Int(size.height)) scale \(scale) -> onscreen \(Int(pixels.width))x\(Int(pixels.height)) source scale \(rendererScale)")
@@ -904,9 +930,10 @@ class ViewPresenter: NSObject {
 ///
 /// A source texture is leased: the proxy drawable holds it while the
 /// renderer has it, and each command buffer that presents it holds it until
-/// that buffer completes. The lease ends when both have let go, and only
-/// then can the texture back another drawable. A caller past the ring's
-/// depth waits for a lease to end, the way `-[CAMetalLayer nextDrawable]`
+/// that buffer completes. The last presented frame holds an additional lease
+/// for redraws. Once every holder lets go, the texture can back another
+/// drawable. A caller past the ring's depth waits for a lease to end,
+/// the way `-[CAMetalLayer nextDrawable]`
 /// waits for a drawable, honoring the renderer layer's
 /// `allowsNextDrawableTimeout`: one second and then `nil` when it is set,
 /// indefinitely when the renderer turned it off.
@@ -925,10 +952,9 @@ final class MetalViewPresenter: ViewPresenter {
     /// `pixelFormat` the renderer sets on it.
     let rendererLayer: CAMetalLayer
 
-    /// Source textures the ring holds. Two more than the on-screen layer
-    /// keeps in flight, so a renderer drawing a frame ahead of the one being
-    /// presented and a dropped drawable held back both have a texture to use.
-    static let ringDepth = 5
+    /// Source textures for the on-screen frames, a renderer drawing ahead,
+    /// a dropped drawable held back, and the last frame kept for redraws.
+    static let ringDepth = 6
 
     /// Guards every count and list below. Completion handlers and drawable
     /// deinits take it and never wait on anything while holding it.
@@ -950,6 +976,16 @@ final class MetalViewPresenter: ViewPresenter {
     private var presentsSubmitted = 0
     private var nextDrawableID = 0
     private var fallbackQueue: MTLCommandQueue?
+    /// The latest submitted picture, leased until another replaces it. Its
+    /// command buffer must complete before a refresh can sample its texture.
+    private var lastFrame: SourceSlot?
+    private var lastFrameSequence = 0
+    private var lastFrameReady = false
+    private var refreshRequested = false
+    private var detached = false
+    private let refreshQueue = DispatchQueue(label: "sevo.metal.refresh", qos: .userInteractive)
+    /// Used only while holding `encoding`.
+    private var refreshCommandQueue: MTLCommandQueue?
 
     /// Signaled by a Metal 4 renderer queue when its work on a drawable is done
     /// (``SevoDrawable/signalOnCommandQueue(_:)``), one value per drawable; the direct
@@ -1111,7 +1147,7 @@ final class MetalViewPresenter: ViewPresenter {
         commandBuffer.waitUntilCompleted()
     }
 
-    /// The proxy drawable let go of its slot.
+    /// A proxy, retained picture, or refresh command buffer let go of its slot.
     func drop(_ slot: SourceSlot) {
         lock.lock()
         slot.uses -= 1
@@ -1134,8 +1170,16 @@ final class MetalViewPresenter: ViewPresenter {
 
     /// A command buffer that presented `slot` completed; `sequence` is the
     /// on-screen present it carried, 0 when the frame was dropped.
-    private func presentCompleted(_ slot: SourceSlot, sequence: Int) {
+    private func presentCompleted(_ slot: SourceSlot, sequence: Int, succeeded: Bool) {
         lock.lock()
+        if lastFrame === slot, lastFrameSequence == sequence {
+            lastFrameReady = succeeded
+            if !succeeded {
+                lastFrame = nil
+                slot.uses -= 1
+            }
+        }
+        let needsRefresh = refreshRequested && lastFrameReady && !detached
         for held in deferred where sequence > held.droppedAfter { held.presentsSince += 1 }
         deferred.removeAll { held in
             guard held.presentsSince >= 2 else { return false }
@@ -1146,6 +1190,48 @@ final class MetalViewPresenter: ViewPresenter {
         slot.uses -= 1
         if slot.uses == 0 { settle(slot) }
         lock.unlock()
+        if needsRefresh { refresh() }
+    }
+
+    override func optionsChanged() { refresh() }
+
+    /// Coalesces redraw requests on a worker queue so drawable acquisition
+    /// leaves the main thread free to process window events.
+    override func refresh() {
+        lock.lock()
+        guard !detached else {
+            lock.unlock()
+            return
+        }
+        refreshRequested = true
+        lock.unlock()
+        refreshQueue.async { [weak self] in self?.refreshLastFrame() }
+    }
+
+    private func refreshLastFrame() {
+        encoding.lock()
+        defer { encoding.unlock() }
+        lock.lock()
+        guard !detached, refreshRequested, lastFrameReady, let slot = lastFrame else {
+            lock.unlock()
+            return
+        }
+        refreshRequested = false
+        slot.uses += 1
+        lock.unlock()
+        guard madeOnscreen != nil,
+              let queue = refreshCommandQueue ?? device.makeCommandQueue(),
+              let commandBuffer = queue.makeCommandBuffer() else {
+            drop(slot)
+            return
+        }
+        refreshCommandQueue = queue
+        commandBuffer.label = "sevo metal refresh"
+        commandBuffer.addCompletedHandler { [self] _ in drop(slot) }
+        if let real = encodeFrame(source: slot.texture, in: commandBuffer) {
+            commandBuffer.present(real)
+        }
+        commandBuffer.commit()
     }
 
     // MARK: The present
@@ -1179,7 +1265,6 @@ final class MetalViewPresenter: ViewPresenter {
     /// holds the slot until it completes whether or not a real drawable was
     /// had: the renderer's work on the texture is in it either way.
     func present(_ proxy: SevoDrawable, in commandBuffer: MTLCommandBuffer, presentReal: (CAMetalDrawable) -> Void) {
-        mirrorLayerProperties()
         let slot = proxy.slot
         lock.lock()
         slot.uses += 1
@@ -1187,16 +1272,30 @@ final class MetalViewPresenter: ViewPresenter {
         lock.unlock()
         var sequence = 0
         encoding.lock()
+        mirrorLayerProperties()
         if let real = encodeFrame(source: slot.texture, in: commandBuffer) {
             proxy.forwardHandlers(to: real)
             presentReal(real)
             lock.lock()
             presentsSubmitted += 1
             sequence = presentsSubmitted
+            if !detached {
+                let previous = lastFrame
+                slot.uses += 1
+                lastFrame = slot
+                lastFrameSequence = sequence
+                lastFrameReady = false
+                if let previous {
+                    previous.uses -= 1
+                    if previous.uses == 0 { settle(previous) }
+                }
+            }
             lock.unlock()
         }
         encoding.unlock()
-        commandBuffer.addCompletedHandler { [self] _ in presentCompleted(slot, sequence: sequence) }
+        commandBuffer.addCompletedHandler { [self] buffer in
+            presentCompleted(slot, sequence: sequence, succeeded: buffer.status == .completed)
+        }
     }
 
     /// A present called on the drawable itself rather than on a command
@@ -1292,6 +1391,16 @@ final class MetalViewPresenter: ViewPresenter {
     /// Frames already handed over go up before the driver lets go; those whose ready value
     /// has not come within a second are dropped.
     override func willDetach() {
+        lock.lock()
+        detached = true
+        refreshRequested = false
+        if let slot = lastFrame {
+            lastFrame = nil
+            slot.uses -= 1
+            if slot.uses == 0 { settle(slot) }
+        }
+        lock.unlock()
+        refreshQueue.sync {}
         if deferredFrames.wait(timeout: .now() + .seconds(1)) == .timedOut { abandonWaitingFrames() }
     }
 
@@ -1327,7 +1436,8 @@ final class SourceSlot {
     /// The ring this slot was made for.
     let ring: Int
     /// Holders: the proxy drawable while it lives, plus one per command
-    /// buffer presenting it until that buffer completes.
+    /// buffer presenting or refreshing it until that buffer completes, and
+    /// one while it is the last frame retained for redraws.
     var uses = 0
     /// Whether a present hook has seen this lease; a lease dropped without
     /// one is held back instead of freed.

@@ -14,6 +14,9 @@ Sevoflurane needs to run Windows Steam games on an Apple silicon Mac.
 - Resizable game windows that keep the game's resolution and aspect ratio, with a
   present-time upscaler for Metal, OpenGL and GDI windows: Lanczos, MetalFX Spatial, Anime4K
   and CuNNy, switched from the game's View menu.
+- Dragging a game window's corner keeps the picture on screen through the drag: the stage
+  scales the last frame, the presenter holds its output resolution, and the program hears of
+  the new size once, when the drag ends.
 - A frame-rate counter and frame-time graph from the View menu, and per-run frame traces the
   app reads.
 - Raw mouse movement for games that hold the cursor for mouse-look.
