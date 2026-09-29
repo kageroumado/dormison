@@ -1315,6 +1315,23 @@ NTSTATUS msync_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION *info )
     return STATUS_SUCCESS;
 }
 
+/* SEVO_FAULT_SKIP_WAKE=1 makes a set leave out the wake after its compare-and-swap: the
+ * state a thread leaves when it dies between the two. bispectral/lost-wake uses it to test
+ * wineserver's death backstop and lost-wake sweep. */
+static BOOL fault_skip_wake(void)
+{
+    /* Published atomically: every thread that races here computes the same value. */
+    static int skip = -1;
+    int value = __atomic_load_n( &skip, __ATOMIC_RELAXED );
+
+    if (value < 0)
+    {
+        value = sevo_env_budget( "SEVO_FAULT_SKIP_WAKE", 0, 1 );
+        __atomic_store_n( &skip, value, __ATOMIC_RELAXED );
+    }
+    return value;
+}
+
 NTSTATUS msync_set_event_obj( int obj, LONG *prev_state )
 {
     struct event *event = get_shm( obj );
@@ -1327,7 +1344,7 @@ NTSTATUS msync_set_event_obj( int obj, LONG *prev_state )
         if ((current = object_low( word ))) break;
         if (swap_object( event, &word, make_object( 1, object_high( word ) ) ))
         {
-            signal_all( (void *)event, obj );
+            if (!fault_skip_wake()) signal_all( (void *)event, obj );
             break;
         }
     }
