@@ -1,11 +1,12 @@
 # Engine releases
 
 One section per release, written when the work lands. `publish-engine.sh`
-uses the section for `r<N>` as the GitHub release body.
+uses the section for the version (`r<N>` for a release, `b<N>` for a beta) as the GitHub
+release body.
 
-## r1
+## b1
 
-The first public release of Dormison: Wine 11.16 with wine-staging 11.16, plus the changes
+The first public beta of Dormison: Wine 11.16 with wine-staging 11.16, plus the changes
 Sevoflurane needs to run Windows Steam games on an Apple silicon Mac.
 
 - Graphics through DXMT (Direct3D 10/11), DXVK over MoltenVK, D3DMetal from Apple's Game
@@ -16,12 +17,26 @@ Sevoflurane needs to run Windows Steam games on an Apple silicon Mac.
 - A frame-rate counter and frame-time graph from the View menu, and per-run frame traces the
   app reads.
 - Raw mouse movement for games that hold the cursor for mouse-look.
-- msync synchronization with a wineserver that commits WaitAll sets whole.
+- msync+ synchronization, Dormison's fork of CrossOver's msync, with a wineserver that commits
+  WaitAll sets whole. When a process dies, wineserver wakes every object it held, so a game
+  that exits in the middle of setting an event cannot leave steam.exe asleep on it; `SIGUSR2`
+  to wineserver sweeps for any sleeper left on an available object, wakes it, and says which
+  object held it and who shares it.
 - Per-bottle and per-game settings read from env files at each launch, so a change needs no
   Steam restart.
 - Each game's title and icon in the Dock, and native macOS NW.js for supported RPG Maker MV
   and MZ games.
 - CoreAudio streams that apply WASAPI per-channel volume, and a GStreamer media back end.
+- View › Resizable Windows switches scaling on and off in a running game, and a short notice
+  over the picture says when the upscaler runs and when a window is too small for it to.
+- Native full screen keeps its top-edge title bar and menu bar for every game, so it can
+  always be left.
+- A program that crashes prints a `sevo:crash` line before its own crash handler runs, so
+  Sevoflurane can tell a crash from a quit.
+- `SEVO_CPU_COUNT` caps the processors a game sees, which lets Unity 5-era job systems rest
+  on Macs with many cores.
+- An idle `winedevice.exe` wakes 4 times a second instead of 250: its SDL bus polls every
+  250 ms while no controller is open.
 
 `git diff wine-staging-base` is the complete change; the README's "Changes from Wine" lists
 it by area.
