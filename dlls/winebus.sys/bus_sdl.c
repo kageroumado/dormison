@@ -1199,26 +1199,40 @@ NTSTATUS sdl_bus_wait(void *args)
 
     /* SDL_WaitEventTimeout() with no video subsystem sleeps 1 ms between
      * pumps, which keeps winedevice.exe at ~1000 wakeups/s while idle. Drain
-     * what SDL has queued and sleep SDL_BUS_POLL_MS between empty polls
-     * instead: SDL_PollEvent() pumps the joystick backends itself, and a
-     * Bluetooth pad reports at about 125 Hz. Effects are still checked every
-     * 10 ms of idle, as before. */
+     * what SDL has queued and sleep between empty polls instead:
+     * SDL_PollEvent() pumps the joystick backends itself. With a pad open the
+     * sleep is SDL_BUS_POLL_MS, as a Bluetooth pad reports at about 125 Hz and
+     * effects are checked every 10 ms of idle; with none, the poll only has to
+     * notice a pad arriving, and SDL_BUS_HOTPLUG_MS keeps an idle bottle's
+     * winedevice.exe at a few wakeups a second. */
 #define SDL_BUS_POLL_MS 4
+#define SDL_BUS_HOTPLUG_MS 250
     do
     {
+        BOOL have_devices;
+
         if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;
         event.type = 0;
         if (pSDL_PollEvent(&event)) process_device_event(&event);
         else
         {
-            usleep(SDL_BUS_POLL_MS * 1000);
-            if ((idle_ms += SDL_BUS_POLL_MS) >= 10)
+            pthread_mutex_lock(&sdl_cs);
+            have_devices = !list_empty(&device_list);
+            pthread_mutex_unlock(&sdl_cs);
+
+            if (!have_devices) usleep(SDL_BUS_HOTPLUG_MS * 1000);
+            else
             {
-                idle_ms = 0;
-                check_all_devices_effects_state();
+                usleep(SDL_BUS_POLL_MS * 1000);
+                if ((idle_ms += SDL_BUS_POLL_MS) >= 10)
+                {
+                    idle_ms = 0;
+                    check_all_devices_effects_state();
+                }
             }
         }
     } while (event.type != quit_event);
+#undef SDL_BUS_HOTPLUG_MS
 #undef SDL_BUS_POLL_MS
 
     TRACE("SDL main loop exiting\n");
