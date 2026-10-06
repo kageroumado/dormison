@@ -56,7 +56,10 @@ Everything below is absent from Wine 11.16 and wine-staging 11.16.
 - wined3d hands the upscaler the game's own frame, at its own resolution.
 - Resizable game windows that keep the game's resolution and aspect ratio.
 - An FPS counter and frame-time graph, fed by a per-process stats page that
-  the app also reads.
+  the app also reads, with a detail level that adds the game's CPU, the GPU's
+  load, power and temperature.
+- A frame limiter on every Metal and OpenGL present path, set per game or
+  from the View menu while the game runs.
 - `SEVO_GPU_*` adapter identity, plus RTX 50 and RX 7000/9000 device IDs in
   wined3d.
 - Vulkan portability enumeration on, so Windows programs see MoltenVK.
@@ -75,6 +78,8 @@ Everything below is absent from Wine 11.16 and wine-staging 11.16.
   mouse-look.
 - A "not responding" sheet for a game that ignores quit, and crash reports
   for faults on threads Wine did not create.
+- A program's own Win32 menu bar can live in the macOS menu bar, with the
+  strip in its window cropped away.
 - Tray icons can stay out of the menu bar. A background program no longer
   keeps the display awake.
 

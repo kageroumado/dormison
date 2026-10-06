@@ -4,6 +4,23 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>` for a release, `b<N>` for a beta) as the GitHub
 release body.
 
+## b2
+
+- A frame limiter for every game the engine presents: Metal (D3DMetal, DXMT, DXVK over
+  MoltenVK) and OpenGL, with or without the upscaler. View › Frame Rate Limit (Off, 30, 40,
+  45, 60, 90, 120) switches it in a running game; `SEVO_FPS_LIMIT=<n>` or
+  `Mac Driver\FrameRateLimit` sets it from the start. Frames leave on fixed deadlines, so
+  the rate holds without drift, and the frame-rate counter names the limit beside the number.
+- View › Overlay Detail: the frame rate alone, the frame-time card, or the card with a row
+  for the game's CPU, the GPU's load, the Mac's power draw and its CPU temperature, read twice
+  a second off the game's threads (`SEVO_OVERLAY_LEVEL=1|2|3`, `Mac Driver\OverlayLevel`).
+- A program's own menu bar in the macOS menu bar, between the app menu and View, behind
+  `SEVO_MENU_BAR=1` or `Mac Driver\NativeMenuBar=Y` and off by default. The strip in the
+  window is gone while the program's geometry stays as on Windows; menus show the program's
+  check marks and disabled items as it sets them when a menu opens, Ctrl+letter shortcuts
+  appear as their Command equivalents, and a modal dialog disables the menus as it disables
+  the window. The driver's View menu reads Picture when the program has a View of its own.
+
 ## b1
 
 The first public beta of Dormison: Wine 11.16 with wine-staging 11.16, plus the changes
