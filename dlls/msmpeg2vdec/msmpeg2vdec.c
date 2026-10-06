@@ -31,6 +31,8 @@ HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void **out)
 {
     if (IsEqualGUID(clsid, &CLSID_MSH264DecoderMFT))
         return IClassFactory_QueryInterface(&h264_decoder_factory, riid, out);
+    if (IsEqualGUID(clsid, &CLSID_MSH265DecoderMFT))
+        return IClassFactory_QueryInterface(&hevc_decoder_factory, riid, out);
 
     *out = NULL;
     FIXME("Unknown clsid %s.\n", debugstr_guid(clsid));
@@ -55,6 +57,11 @@ HRESULT WINAPI DllRegisterServer(void)
         {MFMediaType_Video, MFVideoFormat_I420},
         {MFMediaType_Video, MFVideoFormat_YUY2},
     };
+    MFT_REGISTER_TYPE_INFO hevc_decoder_mft_inputs[] =
+    {
+        {MFMediaType_Video, MFVideoFormat_HEVC},
+        {MFMediaType_Video, MFVideoFormat_HEVC_ES},
+    };
     HRESULT hr;
 
     TRACE("\n");
@@ -64,6 +71,11 @@ HRESULT WINAPI DllRegisterServer(void)
     if (FAILED(hr = MFTRegister(CLSID_MSH264DecoderMFT, MFT_CATEGORY_VIDEO_DECODER,
             (WCHAR *)L"Microsoft H264 Video Decoder MFT", MFT_ENUM_FLAG_SYNCMFT,
             ARRAY_SIZE(h264_decoder_mft_inputs), h264_decoder_mft_inputs,
+            ARRAY_SIZE(h264_decoder_mft_outputs), h264_decoder_mft_outputs, NULL)))
+        return hr;
+    if (FAILED(hr = MFTRegister(CLSID_MSH265DecoderMFT, MFT_CATEGORY_VIDEO_DECODER,
+            (WCHAR *)L"Microsoft H265 Video Decoder MFT", MFT_ENUM_FLAG_SYNCMFT,
+            ARRAY_SIZE(hevc_decoder_mft_inputs), hevc_decoder_mft_inputs,
             ARRAY_SIZE(h264_decoder_mft_outputs), h264_decoder_mft_outputs, NULL)))
         return hr;
 
@@ -82,6 +94,8 @@ HRESULT WINAPI DllUnregisterServer(void)
     if (FAILED(hr = __wine_unregister_resources()))
         return hr;
     if (FAILED(hr = MFTUnregister(CLSID_MSH264DecoderMFT)))
+        return hr;
+    if (FAILED(hr = MFTUnregister(CLSID_MSH265DecoderMFT)))
         return hr;
 
     return S_OK;

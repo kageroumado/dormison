@@ -1749,6 +1749,59 @@ HRESULT h264_decoder_create(REFIID riid, void **out)
     return hr;
 }
 
+static const GUID *const hevc_decoder_input_types[] =
+{
+    &MFVideoFormat_HEVC,
+    &MFVideoFormat_HEVC_ES,
+};
+
+/* GStreamer picks the decoder by rank, which puts VideoToolbox's vtdec_hw ahead of libav's
+   avdec_h265 wherever the Mac decodes HEVC in hardware. */
+HRESULT hevc_decoder_create(REFIID riid, void **out)
+{
+    const MFVIDEOFORMAT output_format =
+    {
+        .dwSize = sizeof(MFVIDEOFORMAT),
+        .videoInfo = {.dwWidth = 1920, .dwHeight = 1080},
+        .guidFormat = MFVideoFormat_I420,
+    };
+    const MFVIDEOFORMAT input_format =
+    {
+        .dwSize = sizeof(MFVIDEOFORMAT),
+        .guidFormat = MFVideoFormat_HEVC,
+    };
+    struct video_decoder *decoder;
+    HRESULT hr;
+
+    TRACE("riid %s, out %p.\n", debugstr_guid(riid), out);
+
+    if (FAILED(hr = check_video_transform_support(&input_format, &output_format)))
+    {
+        ERR_(winediag)("GStreamer doesn't support HEVC decoding, please install appropriate plugins\n");
+        return hr;
+    }
+
+    if (FAILED(hr = video_decoder_create_with_types(hevc_decoder_input_types, ARRAY_SIZE(hevc_decoder_input_types),
+            video_decoder_output_types, ARRAY_SIZE(video_decoder_output_types), NULL, &decoder)))
+        return hr;
+
+    decoder->input_info.dwFlags = MFT_INPUT_STREAM_WHOLE_SAMPLES | MFT_INPUT_STREAM_SINGLE_SAMPLE_PER_BUFFER
+            | MFT_INPUT_STREAM_FIXED_SAMPLE_SIZE;
+    decoder->input_info.cbSize = 0x1000;
+    decoder->output_info.dwFlags = MFT_OUTPUT_STREAM_WHOLE_SAMPLES | MFT_OUTPUT_STREAM_SINGLE_SAMPLE_PER_BUFFER
+            | MFT_OUTPUT_STREAM_FIXED_SAMPLE_SIZE;
+    decoder->output_info.cbSize = 1920 * 1088 * 2;
+
+    decoder->wg_transform_attrs.output_plane_align = 15;
+    decoder->wg_transform_attrs.allow_format_change = TRUE;
+
+    TRACE("Created hevc transform %p.\n", &decoder->IMFTransform_iface);
+
+    hr = IMFTransform_QueryInterface(&decoder->IMFTransform_iface, riid, out);
+    IMFTransform_Release(&decoder->IMFTransform_iface);
+    return hr;
+}
+
 extern GUID MFVideoFormat_IV50;
 static const GUID *const iv50_decoder_input_types[] =
 {

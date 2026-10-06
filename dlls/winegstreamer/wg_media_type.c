@@ -304,6 +304,23 @@ static void init_caps_from_video_h264(GstCaps *caps, const MFVIDEOFORMAT *format
     }
 }
 
+/* An Annex-B stream, which h265parse turns into the hvc1 VideoToolbox's decoder takes. */
+static void init_caps_from_video_hevc(GstCaps *caps, const MFVIDEOFORMAT *format, UINT format_size)
+{
+    GstBuffer *buffer;
+
+    gst_structure_remove_field(gst_caps_get_structure(caps, 0), "format");
+    gst_structure_set_name(gst_caps_get_structure(caps, 0), "video/x-h265");
+    gst_caps_set_simple(caps, "stream-format", G_TYPE_STRING, "byte-stream", NULL);
+
+    if (format_size > sizeof(*format) && (buffer = gst_buffer_new_and_alloc(format_size - sizeof(*format))))
+    {
+        gst_buffer_fill(buffer, 0, format + 1, format_size - sizeof(*format));
+        gst_caps_set_simple(caps, "streamheader", GST_TYPE_BUFFER, buffer, NULL);
+        gst_buffer_unref(buffer);
+    }
+}
+
 static void init_caps_from_video_wmv(GstCaps *caps, const MFVIDEOFORMAT *format, UINT format_size,
         int wmv_version, const char *wmv_format)
 {
@@ -341,6 +358,8 @@ static void init_caps_from_video_subtype(GstCaps *caps, const GUID *subtype, con
         return init_caps_from_video_cinepak(caps, format, format_size);
     if (IsEqualGUID(subtype, &MFVideoFormat_H264))
         return init_caps_from_video_h264(caps, format, format_size);
+    if (IsEqualGUID(subtype, &MFVideoFormat_HEVC) || IsEqualGUID(subtype, &MFVideoFormat_HEVC_ES))
+        return init_caps_from_video_hevc(caps, format, format_size);
     if (IsEqualGUID(subtype, &MFVideoFormat_WMV1))
         return init_caps_from_video_wmv(caps, format, format_size, 1, "WMV1");
     if (IsEqualGUID(subtype, &MFVideoFormat_WMV2))

@@ -41,6 +41,24 @@ static const IClassFactoryVtbl h264_decoder_factory_vtbl =
 
 IClassFactory h264_decoder_factory = {&h264_decoder_factory_vtbl};
 
+static HRESULT WINAPI hevc_decoder_factory_CreateInstance(IClassFactory *iface, IUnknown *outer,
+        REFIID riid, void **out)
+{
+    static const GUID CLSID_wg_hevc_decoder = {0x9b1c5e2a,0x7d40,0x4f6e,{0xa8,0x13,0x5c,0x2e,0x90,0x47,0xd1,0x6b}};
+    return CoCreateInstance(&CLSID_wg_hevc_decoder, outer, CLSCTX_INPROC_SERVER, riid, out);
+}
+
+static const IClassFactoryVtbl hevc_decoder_factory_vtbl =
+{
+    class_factory_QueryInterface,
+    class_factory_AddRef,
+    class_factory_Release,
+    hevc_decoder_factory_CreateInstance,
+    class_factory_LockServer,
+};
+
+IClassFactory hevc_decoder_factory = {&hevc_decoder_factory_vtbl};
+
 static HRESULT WINAPI wmv_decoder_factory_CreateInstance(IClassFactory *iface, IUnknown *outer,
         REFIID riid, void **out)
 {

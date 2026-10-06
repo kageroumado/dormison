@@ -23,3 +23,9 @@
     uuid(62ce7e72-4c71-4d20-b15d-452831a87d9d)
 ]
 coclass CMSH264DecoderMFT {}
+
+[
+    threading(both),
+    uuid(420a51a3-d605-430c-b4fc-45274fa6c562)
+]
+coclass CMSH265DecoderMFT {}

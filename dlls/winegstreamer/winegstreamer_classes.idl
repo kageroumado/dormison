@@ -97,6 +97,12 @@ coclass wg_h264_decoder {}
 
 [
     threading(both),
+    uuid(9b1c5e2a-7d40-4f6e-a813-5c2e9047d16b)
+]
+coclass wg_hevc_decoder {}
+
+[
+    threading(both),
     uuid(6c34de69-4670-46cd-8cb4-1f2fa1dffb65)
 ]
 coclass wg_h264_encoder {}
