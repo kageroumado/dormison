@@ -52,6 +52,9 @@ static DEVICE_OBJECT *bus_pdo;
 static DEVICE_OBJECT *bus_fdo;
 
 static struct bus_options options = {.devices = LIST_INIT(options.devices)};
+/* SDL or the udev input bus started and delivers gamepads; IOHID's copy of one is then a
+   duplicate unless the pad needs raw HID. */
+static BOOL gamepad_bus_running;
 static HANDLE driver_key;
 
 struct hid_report
@@ -562,7 +565,9 @@ static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages, 
     }
     if (usages->Usage != HID_USAGE_GENERIC_GAMEPAD && usages->Usage != HID_USAGE_GENERIC_JOYSTICK) return TRUE;
 
-    if (options.disable_sdl && options.disable_input) prefer_hidraw = TRUE;
+    /* With neither SDL nor the udev input bus running, as on a Mac with SDL off or failed,
+       nothing else delivers this pad: the raw HID copy is the only one. */
+    if (!gamepad_bus_running) prefer_hidraw = TRUE;
     if (is_dualshock4_gamepad(vid, pid)) prefer_hidraw = TRUE;
     if (is_dualsense_gamepad(vid, pid)) prefer_hidraw = TRUE;
 
@@ -1304,6 +1309,7 @@ static NTSTATUS iohid_driver_init(void)
 static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
 {
     IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation(irp);
+    BOOL input_disabled;
     NTSTATUS ret;
 
     switch (irpsp->MinorFunction)
@@ -1317,8 +1323,13 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
         mouse_device_create();
         keyboard_device_create();
 
-        if (!sdl_driver_init()) options.disable_input = TRUE;
-        udev_driver_init();
+        input_disabled = options.disable_input;
+        if (!sdl_driver_init())
+        {
+            options.disable_input = TRUE;
+            gamepad_bus_running = TRUE;
+        }
+        if (!udev_driver_init() && !input_disabled) gamepad_bus_running = TRUE;
         iohid_driver_init();
 
         irp->IoStatus.Status = STATUS_SUCCESS;
