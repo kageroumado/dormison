@@ -44,6 +44,8 @@ static char kMenuPathKey;
     NSString* shortcut;
     unsigned int commandID;
     unsigned int flags;
+    uint64_t menu;
+    unsigned int position;
     uint64_t popup;
     NSMutableArray* children;
 }
@@ -83,6 +85,8 @@ CFTypeRef macdrv_create_menu_snapshot(const struct macdrv_menu_item *items, int 
             entry->shortcut = [(NSString*)items[i].shortcut copy];
             entry->commandID = items[i].id;
             entry->flags = items[i].flags;
+            entry->menu = items[i].menu;
+            entry->position = items[i].position;
             entry->popup = items[i].popup;
             if (items[i].popup) entry->children = [[NSMutableArray alloc] init];
             entries[i] = entry;
@@ -369,7 +373,7 @@ static BOOL key_equivalent_for_shortcut(NSString* shortcut, NSString** key, NSEv
 
         [item setTarget:self];
         [item setAction:@selector(chooseItem:)];
-        [item setTag:entry->commandID];
+        [item setRepresentedObject:entry];
         if (entry->shortcut && key_equivalent_for_shortcut(entry->shortcut, &key, &modifiers))
         {
             [item setKeyEquivalent:key];
@@ -409,7 +413,7 @@ static BOOL key_equivalent_for_shortcut(NSString* shortcut, NSString** key, NSEv
                     break;
                 if ([item isSeparatorItem]) continue;
                 if (![[item title] isEqualToString:child->title]) [item setTitle:child->title];
-                [item setTag:child->commandID];
+                [item setRepresentedObject:child];
                 [item setEnabled:enabled && !(child->flags & MACDRV_MENU_ITEM_DISABLED)];
                 [item setState:(child->flags & MACDRV_MENU_ITEM_CHECKED) ? NSControlStateValueOn : NSControlStateValueOff];
             }
@@ -430,11 +434,15 @@ static BOOL key_equivalent_for_shortcut(NSString* shortcut, NSString** key, NSEv
 
     - (void) chooseItem:(NSMenuItem*)item
     {
+        WineMenuEntry* entry = [item representedObject];
         macdrv_event* event;
 
-        if (!shownWindow || ![shownWindow queue]) return;
+        if (!entry || !shownWindow || ![shownWindow queue]) return;
         event = macdrv_create_event(WINDOW_MENU_COMMAND, shownWindow);
-        event->window_menu_command.id = (unsigned int)[item tag];
+        event->window_menu_command.id = entry->commandID;
+        event->window_menu_command.menu = entry->menu;
+        event->window_menu_command.position = entry->position;
+        event->window_menu_command.by_position = (entry->flags & MACDRV_MENU_ITEM_BY_POSITION) != 0;
         [[shownWindow queue] postEvent:event];
         macdrv_release_event(event);
     }

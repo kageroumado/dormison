@@ -23,7 +23,8 @@
    in SetWindowPos with SWP_FRAMECHANGED. State an application sets only when a menu opens is
    read again then, through QUERY_MENU_INIT, which sends WM_INITMENU and WM_INITMENUPOPUP
    first. A chosen item comes back as WINDOW_MENU_COMMAND on the window's own thread and is
-   posted as WM_COMMAND, as Windows does for a menu bar item. */
+   posted as Windows posts a menu bar choice: WM_MENUCOMMAND with the item's position and
+   menu when that menu or the bar has MNS_NOTIFYBYPOS, WM_COMMAND with its id otherwise. */
 
 #if 0
 #pragma makedep unix
@@ -84,9 +85,19 @@ static CFStringRef copy_title(const WCHAR *text, UINT length, CFStringRef *short
     return CFStringCreateWithCharacters(NULL, (const UniChar *)title, n);
 }
 
-static void add_menu_items(struct snapshot_builder *builder, HMENU menu, int parent, int depth)
+/* A menu's MNS_* style. */
+static DWORD menu_style(HMENU menu)
+{
+    MENUINFO info = { sizeof(info), MIM_STYLE };
+
+    return NtUserGetMenuInfo(menu, &info) ? info.dwStyle : 0;
+}
+
+static void add_menu_items(struct snapshot_builder *builder, HMENU menu, DWORD bar_style,
+                           int parent, int depth)
 {
     UINT count = NtUserGetMenuItemCount(menu), i;
+    BOOL by_position = (menu_style(menu) | bar_style) & MNS_NOTIFYBYPOS;
 
     for (i = 0; i < count && builder->count < MAX_MENU_ITEMS; i++)
     {
@@ -107,6 +118,8 @@ static void add_menu_items(struct snapshot_builder *builder, HMENU menu, int par
         memset(item, 0, sizeof(*item));
         item->parent = parent;
         item->id = info.wID;
+        item->menu = (UINT_PTR)menu;
+        item->position = i;
         item->popup = (UINT_PTR)info.hSubMenu;
         if (info.fType & MFT_SEPARATOR)
             item->flags |= MACDRV_MENU_ITEM_SEPARATOR;
@@ -119,10 +132,11 @@ static void add_menu_items(struct snapshot_builder *builder, HMENU menu, int par
         if (info.fState & (MFS_DISABLED | MFS_GRAYED)) item->flags |= MACDRV_MENU_ITEM_DISABLED;
         if (info.fState & MFS_CHECKED) item->flags |= MACDRV_MENU_ITEM_CHECKED;
         if (info.fType & MFT_RADIOCHECK) item->flags |= MACDRV_MENU_ITEM_RADIO;
+        if (by_position) item->flags |= MACDRV_MENU_ITEM_BY_POSITION;
         builder->count++;
 
         if (info.hSubMenu && depth < MAX_MENU_DEPTH)
-            add_menu_items(builder, info.hSubMenu, index, depth + 1);
+            add_menu_items(builder, info.hSubMenu, bar_style, index, depth + 1);
     }
 }
 
@@ -134,7 +148,7 @@ static CFTypeRef create_snapshot(HMENU menu)
 
     if (!menu || !(builder = malloc(sizeof(*builder)))) return NULL;
     builder->count = 0;
-    add_menu_items(builder, menu, -1, 0);
+    add_menu_items(builder, menu, menu_style(menu), -1, 0);
     TRACE("menu %p: %d items\n", menu, builder->count);
     snapshot = macdrv_create_menu_snapshot(builder->items, builder->count);
     for (i = 0; i < builder->count; i++)
@@ -195,6 +209,12 @@ BOOL query_menu_init(HWND hwnd, macdrv_query *query)
 void macdrv_window_menu_command(HWND hwnd, const macdrv_event *event)
 {
     if (!hwnd || (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_DISABLED)) return;
-    TRACE("hwnd %p command %u\n", hwnd, event->window_menu_command.id);
-    NtUserPostMessage(hwnd, WM_COMMAND, MAKEWPARAM(event->window_menu_command.id, 0), 0);
+    TRACE("hwnd %p command %u menu %s position %u by position %d\n", hwnd, event->window_menu_command.id,
+          wine_dbgstr_longlong(event->window_menu_command.menu), event->window_menu_command.position,
+          event->window_menu_command.by_position);
+    if (event->window_menu_command.by_position)
+        NtUserPostMessage(hwnd, WM_MENUCOMMAND, event->window_menu_command.position,
+                          (LPARAM)(UINT_PTR)event->window_menu_command.menu);
+    else
+        NtUserPostMessage(hwnd, WM_COMMAND, event->window_menu_command.id, 0);
 }

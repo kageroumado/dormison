@@ -475,6 +475,9 @@ typedef struct macdrv_event {
         }                                           client_surface_presented;
         struct {
             unsigned int    id;
+            uint64_t        menu;           /* the HMENU holding the item */
+            unsigned int    position;       /* the item's position in it */
+            bool            by_position;    /* posted as WM_MENUCOMMAND, MNS_NOTIFYBYPOS */
         }                                           window_menu_command;
     };
 } macdrv_event;
@@ -677,6 +680,8 @@ enum
     MACDRV_MENU_ITEM_DISABLED  = 0x02,
     MACDRV_MENU_ITEM_CHECKED   = 0x04,
     MACDRV_MENU_ITEM_RADIO     = 0x08,
+    /* Chosen, it is posted as WM_MENUCOMMAND: its menu or the bar has MNS_NOTIFYBYPOS. */
+    MACDRV_MENU_ITEM_BY_POSITION = 0x10,
 };
 
 /* One item of a window's menu, in a flat list where every submenu's items follow the item
@@ -686,6 +691,8 @@ struct macdrv_menu_item
     int             parent;     /* index of the item whose submenu this is in, -1 in the bar */
     unsigned int    id;         /* the command's id, for WM_COMMAND */
     unsigned int    flags;      /* MACDRV_MENU_ITEM_* */
+    uint64_t        menu;       /* the HMENU holding the item */
+    unsigned int    position;   /* the item's position in that menu, for WM_MENUCOMMAND */
     uint64_t        popup;      /* the HMENU this item opens, 0 for a command */
     CFStringRef     title;      /* without the mnemonic's ampersand */
     CFStringRef     shortcut;   /* the accelerator text after a tab, or NULL */
