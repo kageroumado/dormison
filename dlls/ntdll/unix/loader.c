@@ -126,6 +126,8 @@ const char *build_dir = NULL;
 const char *config_dir = NULL;
 const char *wineloader = NULL;
 const char **dll_paths = NULL;
+/* How many of dll_paths, from the first, came from WINEDLLPATH_PREPEND. */
+unsigned int dll_path_prepend_count = 0;
 const char **system_dll_paths = NULL;
 const char *user_name = NULL;
 SECTION_IMAGE_INFORMATION main_image_info = { NULL };
@@ -316,6 +318,7 @@ static void set_dll_path(void)
         prepend = strdup(prepend);
         for (p = strtok( prepend, ":" ); p; p = strtok( NULL, ":" )) dll_paths[count++] = strdup( p );
         free( prepend );
+        dll_path_prepend_count = count;
     }
 
     if (!build_dir) dll_paths[count++] = dll_dir;
@@ -1187,6 +1190,37 @@ static NTSTATUS open_builtin_pe_file( const char *name, OBJECT_ATTRIBUTES *attr,
 
 
 /***********************************************************************
+ *           set_unixlib_name
+ *
+ * Names the unix library of a builtin found at `path`. A builtin found in a
+ * WINEDLLPATH_PREPEND directory may have none beside it: a renderer payload ships its PE
+ * files alone, and its unix half (DXMT's winemetal.so, D3DMetal's d3d11.so) is in the
+ * engine's own tree. The first directory of the dll path that has one provides it then.
+ */
+static void set_unixlib_name( void *module, const char *path, const char *name, const char *so_dir )
+{
+    unsigned int i;
+    char *other;
+
+    if (dll_path_prepend_count && access( path, F_OK ))
+    {
+        for (i = 0; dll_paths[i]; i++)
+        {
+            if (asprintf( &other, "%s%s%s", dll_paths[i], so_dir, name ) < 0) break;
+            if (!access( other, F_OK ))
+            {
+                set_builtin_unixlib_name( module, other );
+                free( other );
+                return;
+            }
+            free( other );
+        }
+    }
+    set_builtin_unixlib_name( module, path );
+}
+
+
+/***********************************************************************
  *           find_builtin_dll
  */
 static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name, void **module,
@@ -1306,7 +1340,7 @@ done:
     if (NT_SUCCESS(status) && ext)
     {
         strcpy( ext, ".so" );
-        set_builtin_unixlib_name( *module, ptr );
+        set_unixlib_name( *module, ptr, file + pos, so_dir );
     }
     free( file );
     return status;

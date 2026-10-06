@@ -3248,10 +3248,41 @@ static NTSTATUS get_env_var( const WCHAR *name, SIZE_T extra, UNICODE_STRING *re
 
 
 /***********************************************************************
+ *	find_prepended_builtin
+ *
+ * Find a builtin dll with no file in the prefix in the directories WINEDLLPATH_PREPEND
+ * names, which select a renderer for this process. A renderer can carry dlls Wine has no
+ * counterpart of, and so no file in the prefix: DXMT's dxgi.dll imports winemetal.dll.
+ */
+static NTSTATUS find_prepended_builtin( const WCHAR *name, UNICODE_STRING *new_name,
+                                        WINE_MODREF **pwm, HANDLE *mapping,
+                                        SECTION_IMAGE_INFORMATION *image_info, struct file_id *id )
+{
+    WCHAR dllpath[32];
+    NTSTATUS status = STATUS_DLL_NOT_FOUND;
+    DWORD i;
+
+    for (i = 0; ; i++)
+    {
+        swprintf( dllpath, ARRAY_SIZE(dllpath), L"WINEDLLPREPEND%u", i );
+        if (get_env_var( dllpath, wcslen(pe_dir) + wcslen(name) + 1, new_name )) break;
+        RtlAppendUnicodeToString( new_name, pe_dir );
+        RtlAppendUnicodeToString( new_name, L"\\" );
+        RtlAppendUnicodeToString( new_name, name );
+        status = open_dll_file( new_name, pwm, mapping, image_info, id );
+        RtlFreeUnicodeString( new_name );
+        if (status != STATUS_DLL_NOT_FOUND) break;
+    }
+    if (!status) build_sysdir_nt_name( name, new_name );
+    return status;
+}
+
+
+/***********************************************************************
  *	find_builtin_without_file
  *
  * Find a builtin dll when the corresponding file cannot be found in the prefix.
- * This is used during prefix bootstrap.
+ * This is used during prefix bootstrap, and for the dlls of a renderer selected per process.
  */
 static NTSTATUS find_builtin_without_file( const WCHAR *name, UNICODE_STRING *new_name,
                                            WINE_MODREF **pwm, HANDLE *mapping,
@@ -3268,7 +3299,8 @@ static NTSTATUS find_builtin_without_file( const WCHAR *name, UNICODE_STRING *ne
     if (!is_prefix_bootstrap)
     {
         /* 16-bit files can't be loaded from the prefix */
-        if (!name[1] || wcscmp( name + wcslen(name) - 2, L"16" )) return status;
+        if (!name[1] || wcscmp( name + wcslen(name) - 2, L"16" ))
+            return find_prepended_builtin( name, new_name, pwm, mapping, image_info, id );
     }
 
     if (!get_env_var( L"WINEBUILDDIR", 20 + 2 * wcslen(name) + wcslen(pe_dir), new_name ))

@@ -209,6 +209,7 @@ extern const char *config_dir;
 extern const char *wineloader;
 extern const char *user_name;
 extern const char **dll_paths;
+extern unsigned int dll_path_prepend_count;
 extern const char **system_dll_paths;
 extern PEB *peb;
 extern DWORD pid;

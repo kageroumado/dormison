@@ -1202,6 +1202,13 @@ static void add_dynamic_environment( WCHAR **env, SIZE_T *pos, SIZE_T *size )
     }
     snprintf( str, sizeof(str), "WINEDLLDIR%u", i );
     append_envW( env, pos, size, str, NULL );
+    for (i = 0; i < dll_path_prepend_count; i++)
+    {
+        snprintf( str, sizeof(str), "WINEDLLPREPEND%u", i );
+        add_path_var( env, pos, size, str, dll_paths[i] );
+    }
+    snprintf( str, sizeof(str), "WINEDLLPREPEND%u", i );
+    append_envW( env, pos, size, str, NULL );
     add_system_dll_path_var( env, pos, size );
     append_envA( env, pos, size, "WINEUSERNAME", user_name );
     if (unix_cp.CodePage != CP_UTF8)
