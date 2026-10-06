@@ -20,6 +20,12 @@ release body.
   check marks and disabled items as it sets them when a menu opens, Ctrl+letter shortcuts
   appear as their Command equivalents, and a modal dialog disables the menus as it disables
   the window. The driver's View menu reads Picture when the program has a View of its own.
+- HEVC video through Media Foundation's decoder transform: a program that finds its H.265
+  decoder through `MFTEnumEx` or creates `CLSID_MSH265DecoderMFT` gets winegstreamer's, which
+  decodes through VideoToolbox in hardware. The source reader already played HEVC files.
+- A game pinned to DXMT while its bottle runs another renderer starts: DXMT's `winemetal.dll`
+  used to fail to initialize, because its unix half was looked for beside the pinned DLLs
+  rather than in the engine.
 
 ## b1
 
