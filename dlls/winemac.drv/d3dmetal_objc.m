@@ -30,6 +30,7 @@
 #import "cocoa_event.h"
 #import "cocoa_window.h"
 #import "d3dmetal_objc.h"
+#include "sevo_limiter.h"
 #include "sevo_presenter.h"
 #include "sevo_provenance.h"
 #include "sevo_stats.h"
@@ -49,6 +50,7 @@ extern id objc_storeWeak(id *location, id obj);
     os_unfair_lock stateLock;
     void* _presenter;
     id _wineView;
+    struct sevo_limiter limiter;
 }
 
     - (void) dealloc
@@ -124,6 +126,10 @@ extern id objc_storeWeak(id *location, id obj);
                 }
             }
         }
+
+        /* Every Metal renderer takes one drawable per frame here, so this is where the
+           frame limiter holds a frame back. */
+        sevo_limiter_wait(&limiter);
 
         os_unfair_lock_lock(&stateLock);
         presenter = _presenter;

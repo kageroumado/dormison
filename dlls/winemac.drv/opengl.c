@@ -42,6 +42,7 @@
 #include <OpenGL/CGLIOSurface.h>
 #include <dlfcn.h>
 
+#include "sevo_limiter.h"
 #include "sevo_presenter.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(wgl);
@@ -109,6 +110,7 @@ struct gl_drawable
     struct opengl_drawable  base;
     CGLPBufferObj           pbuffer;
     struct gl_presented     presented;
+    struct sevo_limiter     limiter;
 };
 
 static struct gl_drawable *impl_from_opengl_drawable(struct opengl_drawable *base)
@@ -3124,6 +3126,7 @@ static BOOL macdrv_surface_swap(struct opengl_drawable *base)
     TRACE("%s context %p/%p/%p\n", debugstr_opengl_drawable(base), context, (context ? context->context : NULL),
           (context ? context->cglcontext : NULL));
 
+    sevo_limiter_wait(&gl->limiter);
     if (context && gl->presented.presenter)
     {
         presented_present(gl, TRUE, base->interval);

@@ -22,8 +22,10 @@
 #import "cocoa_cursorclipping.h"
 #import "cocoa_event.h"
 #import "cocoa_window.h"
+#include "sevo_limiter.h"
 #include "sevo_presenter.h"
 #include "sevo_stats.h"
+#include "sevo_sysstats.h"
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
@@ -125,7 +127,9 @@ static BOOL sevoReadoutShown;
    It reads the process's own present counter twice a second. With the graph
    on it becomes a card: the number, the 1 % low and the slowest frame of the
    last ten seconds, and every frame of the last five seconds drawn at its
-   frame time, read from the stats page's ring ten times a second. */
+   frame time, read from the stats page's ring ten times a second. At the
+   system level the card adds a row for the process's CPU, the GPU's load, the
+   Mac's power and its temperature, read off the main thread twice a second. */
 @interface WineFrameTimeGraph : NSView
 {
     /* Frame times in ms and when each frame ended, in seconds before now. */
@@ -142,17 +146,20 @@ static BOOL sevoReadoutShown;
     NSPanel* panel;
     NSTextField* label;
     NSTextField* detail;
+    NSTextField* system;
     WineFrameTimeGraph* graph;
     NSTimer* timer;
     NSWindow* host;
     unsigned long long lastFrames;
     CFAbsoluteTime lastTime;
-    BOOL graphShown;
+    int level;
     unsigned int ticks;
+    dispatch_queue_t sampler;
+    BOOL sampling;
 }
     - (void) show;
     - (void) hide;
-    - (void) setGraphShown:(BOOL)shown;
+    - (void) setLevel:(int)newLevel;
 @end
 
 static const CGFloat kFrameRateInset = 12;
@@ -162,6 +169,8 @@ static const NSTimeInterval kFrameRateInterval = 0.5;
 static const CGFloat kFrameGraphWidth = 220;
 static const CGFloat kFrameGraphPlotHeight = 48;
 static const CGFloat kFrameGraphHeight = 22 + 16 + 48 + 10;
+/* The system level's extra row. */
+static const CGFloat kFrameSystemRowHeight = 14;
 static const NSTimeInterval kFrameGraphInterval = 0.1;
 /* Seconds of frames the plot spans, and the window the 1 % low is taken over. */
 static const float kFrameGraphSpan = 5;
@@ -250,8 +259,10 @@ static int compare_floats(const void* a, const void* b)
         [self hide];
         [label release];
         [detail release];
+        [system release];
         [graph release];
         [panel release];
+        if (sampler) dispatch_release(sampler);
         [super dealloc];
     }
 
@@ -265,7 +276,7 @@ static int compare_floats(const void* a, const void* b)
 
     - (void) startTimer
     {
-        timer = [[NSTimer timerWithTimeInterval:graphShown ? kFrameGraphInterval : kFrameRateInterval
+        timer = [[NSTimer timerWithTimeInterval:level >= OVERLAY_LEVEL_FRAME_TIME ? kFrameGraphInterval : kFrameRateInterval
                                          target:self selector:@selector(tick:)
                                        userInfo:nil repeats:YES] retain];
         [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
@@ -279,10 +290,11 @@ static int compare_floats(const void* a, const void* b)
         [self detach];
     }
 
-    - (void) setGraphShown:(BOOL)shown
+    - (void) setLevel:(int)newLevel
     {
-        if (graphShown == shown) return;
-        graphShown = shown;
+        if (level == newLevel) return;
+        level = newLevel;
+        if (level >= OVERLAY_LEVEL_SYSTEM) [self sampleSystem];
         if (panel) [self layoutPanel];
         if (timer)
         {
@@ -337,9 +349,11 @@ static int compare_floats(const void* a, const void* b)
 
         label = [self makeLabelOfSize:12 weight:NSFontWeightSemibold];
         detail = [self makeLabelOfSize:10 weight:NSFontWeightRegular];
+        system = [self makeLabelOfSize:10 weight:NSFontWeightRegular];
         graph = [[WineFrameTimeGraph alloc] initWithFrame:NSZeroRect];
         [backing addSubview:label];
         [backing addSubview:detail];
+        [backing addSubview:system];
         [backing addSubview:graph];
         [self layoutPanel];
     }
@@ -351,16 +365,21 @@ static int compare_floats(const void* a, const void* b)
         NSView* backing = [panel contentView];
         NSRect frame = [panel frame];
         CGFloat inset = 10;
+        BOOL graphShown = level >= OVERLAY_LEVEL_FRAME_TIME, systemShown = level >= OVERLAY_LEVEL_SYSTEM;
 
         [label sizeToFit];
         if (graphShown)
         {
-            frame.size = NSMakeSize(kFrameGraphWidth, kFrameGraphHeight);
+            CGFloat height = kFrameGraphHeight + (systemShown ? kFrameSystemRowHeight : 0);
+
+            frame.size = NSMakeSize(kFrameGraphWidth, height);
             [[backing layer] setCornerRadius:12];
             [label setAlignment:NSTextAlignmentLeft];
-            [label setFrame:NSMakeRect(inset, kFrameGraphHeight - 6 - 16, kFrameGraphWidth - 2 * inset, 16)];
+            [label setFrame:NSMakeRect(inset, height - 6 - 16, kFrameGraphWidth - 2 * inset, 16)];
             [detail sizeToFit];
-            [detail setFrame:NSMakeRect(inset, kFrameGraphHeight - 6 - 16 - 14, kFrameGraphWidth - 2 * inset, 14)];
+            [detail setFrame:NSMakeRect(inset, height - 6 - 16 - 14, kFrameGraphWidth - 2 * inset, 14)];
+            [system setFrame:NSMakeRect(inset, height - 6 - 16 - 14 - kFrameSystemRowHeight,
+                                        kFrameGraphWidth - 2 * inset, kFrameSystemRowHeight)];
             [graph setFrame:NSMakeRect(inset, 6, kFrameGraphWidth - 2 * inset, kFrameGraphPlotHeight)];
         }
         else
@@ -372,6 +391,7 @@ static int compare_floats(const void* a, const void* b)
                                        frame.size.width, NSHeight([label frame]))];
         }
         [detail setHidden:!graphShown];
+        [system setHidden:!systemShown];
         [graph setHidden:!graphShown];
         [panel setFrame:frame display:NO];
         [self place];
@@ -438,7 +458,11 @@ static int compare_floats(const void* a, const void* b)
         double elapsed = now - lastTime;
         NSString* text = nil;
 
-        if (elapsed > 0 && frames >= lastFrames)
+        int limit = frame_rate_limit;
+
+        if (elapsed > 0 && frames >= lastFrames && limit > 0)
+            text = [NSString stringWithFormat:@"%.0f fps · limit %d", (frames - lastFrames) / elapsed, limit];
+        else if (elapsed > 0 && frames >= lastFrames)
             text = [NSString stringWithFormat:@"%.0f fps", (frames - lastFrames) / elapsed];
         lastFrames = frames;
         lastTime = now;
@@ -495,16 +519,53 @@ static int compare_floats(const void* a, const void* b)
         [detail setStringValue:text];
     }
 
+    /* The system row, as text; a value the Mac does not offer is left out. */
+    - (void) showSystemStats:(struct sevo_system_stats)stats
+    {
+        NSMutableArray* parts = [NSMutableArray array];
+
+        if (stats.cpu_percent >= 0) [parts addObject:[NSString stringWithFormat:@"CPU %.0f%%", stats.cpu_percent]];
+        if (stats.gpu_percent >= 0) [parts addObject:[NSString stringWithFormat:@"GPU %.0f%%", stats.gpu_percent]];
+        if (stats.power_watts >= 0) [parts addObject:[NSString stringWithFormat:@"%.1f W", stats.power_watts]];
+        if (stats.cpu_celsius >= 0) [parts addObject:[NSString stringWithFormat:@"%.0f °C", stats.cpu_celsius]];
+        [system setStringValue:[parts componentsJoinedByString:@" · "]];
+    }
+
+    /* A reading costs about 2 ms of IOKit and SMC calls, so it is taken on a queue of its
+       own and handed back to the main thread; a reading still running skips the next one. */
+    - (void) sampleSystem
+    {
+        if (sampling) return;
+        if (!sampler) sampler = dispatch_queue_create("sevo.overlay.system", DISPATCH_QUEUE_SERIAL);
+        sampling = YES;
+        [self retain];
+        dispatch_async(sampler, ^{
+            struct sevo_system_stats stats;
+
+            sevo_system_stats_sample(&stats);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                sampling = NO;
+                if (level >= OVERLAY_LEVEL_SYSTEM) [self showSystemStats:stats];
+                [self release];
+            });
+        });
+    }
+
     - (void) tick:(NSTimer*)unused
     {
         NSString* text = nil;
         CGFloat before;
+        BOOL graphShown = level >= OVERLAY_LEVEL_FRAME_TIME;
 
         [self attachTo:[self presentedWindow]];
         if (!host) return;
 
-        /* The number keeps its half-second cadence when the graph runs faster. */
-        if (!graphShown || ++ticks % 5 == 0) text = [self rateText];
+        /* The number and the system row keep a half-second cadence when the graph runs faster. */
+        if (!graphShown || ++ticks % 5 == 0)
+        {
+            text = [self rateText];
+            if (level >= OVERLAY_LEVEL_SYSTEM) [self sampleSystem];
+        }
         if (graphShown) [self updateGraph];
         if (!text || [text isEqualToString:[label stringValue]]) return;
 
@@ -1071,6 +1132,8 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         NSMenu* view = [[[NSMenu alloc] initWithTitle:@"View"] autorelease];
         NSMenu* upscalers = [[[NSMenu alloc] initWithTitle:@"Upscaler"] autorelease];
         NSMenu* filters = [[[NSMenu alloc] initWithTitle:@"Final Filter"] autorelease];
+        NSMenu* limits = [[[NSMenu alloc] initWithTitle:@"Frame Rate Limit"] autorelease];
+        NSMenu* details = [[[NSMenu alloc] initWithTitle:@"Overlay Detail"] autorelease];
         NSMenuItem* item;
         char* packages = sevo_presenter_package_names();
 
@@ -1111,9 +1174,29 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         item = [view addItemWithTitle:@"Show Frame Rate" action:@selector(sevoToggleFrameRate:) keyEquivalent:@"f"];
         [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
         [item setTarget:self];
-        item = [view addItemWithTitle:@"Show Frame Time Graph" action:@selector(sevoToggleFrameGraph:) keyEquivalent:@"g"];
-        [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
-        [item setTarget:self];
+        for (NSArray* pair in @[@[@"Frame Rate", @(OVERLAY_LEVEL_FRAME_RATE)],
+                                @[@"Frame Rate and Frame Time", @(OVERLAY_LEVEL_FRAME_TIME)],
+                                @[@"Frame Time, CPU, GPU, Power and Temperature", @(OVERLAY_LEVEL_SYSTEM)]])
+        {
+            BOOL graph = [pair[1] intValue] == OVERLAY_LEVEL_FRAME_TIME;
+            item = [details addItemWithTitle:pair[0] action:@selector(sevoChooseOverlayLevel:)
+                               keyEquivalent:graph ? @"g" : @""];
+            if (graph) [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
+            [item setTarget:self];
+            [item setRepresentedObject:pair[1]];
+        }
+        item = [view addItemWithTitle:@"Overlay Detail" action:NULL keyEquivalent:@""];
+        [item setSubmenu:details];
+        for (NSNumber* fps in @[@0, @30, @40, @45, @60, @90, @120])
+        {
+            item = [limits addItemWithTitle:[fps intValue] ? [NSString stringWithFormat:@"%d fps", [fps intValue]] : @"Off"
+                                     action:@selector(sevoChooseFrameRateLimit:) keyEquivalent:@""];
+            [item setTarget:self];
+            [item setRepresentedObject:fps];
+            if (![fps intValue]) [limits addItem:[NSMenuItem separatorItem]];
+        }
+        item = [view addItemWithTitle:@"Frame Rate Limit" action:NULL keyEquivalent:@""];
+        [item setSubmenu:limits];
         item = [view addItemWithTitle:@"Show Picture Details" action:@selector(sevoToggleReadout:) keyEquivalent:@"i"];
         [item setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagOption];
         [item setTarget:self];
@@ -1141,8 +1224,10 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
             [menuItem setState:!strcasecmp(final_filter_option, [[menuItem representedObject] UTF8String]) ? NSControlStateValueOn : NSControlStateValueOff];
         else if (action == @selector(sevoToggleFrameRate:))
             [menuItem setState:frame_rate_on ? NSControlStateValueOn : NSControlStateValueOff];
-        else if (action == @selector(sevoToggleFrameGraph:))
-            [menuItem setState:frame_rate_on && frame_graph_on ? NSControlStateValueOn : NSControlStateValueOff];
+        else if (action == @selector(sevoChooseOverlayLevel:))
+            [menuItem setState:[[menuItem representedObject] intValue] == overlay_level ? NSControlStateValueOn : NSControlStateValueOff];
+        else if (action == @selector(sevoChooseFrameRateLimit:))
+            [menuItem setState:[[menuItem representedObject] intValue] == frame_rate_limit ? NSControlStateValueOn : NSControlStateValueOff];
         else if (action == @selector(sevoToggleResizableWindows:))
         {
             NSWindow* key = [NSApp keyWindow];
@@ -1222,7 +1307,7 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
     {
         frame_rate_on = shown;
         if (shown && !sevoFrameRateCounter) sevoFrameRateCounter = [[WineFrameRateCounter alloc] init];
-        [sevoFrameRateCounter setGraphShown:frame_graph_on];
+        [sevoFrameRateCounter setLevel:overlay_level];
         if (shown) [sevoFrameRateCounter show];
         else [sevoFrameRateCounter hide];
     }
@@ -1233,21 +1318,29 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         [self sevoStoreSetting:@"fps" value:frame_rate_on ? @"on" : @"off"];
     }
 
-    /* The graph comes with the counter: turning it on shows both, turning it off leaves the
-       number. */
-    - (void) sevoToggleFrameGraph:(NSMenuItem*)sender
+    /* Choosing a level shows the counter at it. `fps-graph` carries levels 1 and 2 for an app
+       that knows no `overlay` setting. */
+    - (void) sevoChooseOverlayLevel:(NSMenuItem*)sender
     {
-        BOOL on = !(frame_rate_on && frame_graph_on);
-
-        frame_graph_on = on;
-        if (on && !frame_rate_on)
+        overlay_level = [[sender representedObject] intValue];
+        if (!frame_rate_on)
         {
             [self sevoSetFrameRateShown:YES];
             [self sevoStoreSetting:@"fps" value:@"on"];
         }
         else
-            [sevoFrameRateCounter setGraphShown:on];
-        [self sevoStoreSetting:@"fps-graph" value:on ? @"on" : @"off"];
+            [sevoFrameRateCounter setLevel:overlay_level];
+        [self sevoStoreSetting:@"fps-graph" value:overlay_level >= OVERLAY_LEVEL_FRAME_TIME ? @"on" : @"off"];
+        [self sevoStoreSetting:@"overlay" value:[NSString stringWithFormat:@"%d", overlay_level]];
+    }
+
+    /* Takes effect at the next frame on every present path. */
+    - (void) sevoChooseFrameRateLimit:(NSMenuItem*)sender
+    {
+        int fps = [[sender representedObject] intValue];
+
+        sevo_limiter_set(fps);
+        [self sevoStoreSetting:@"fps-limit" value:fps ? [NSString stringWithFormat:@"%d", fps] : @"off"];
     }
 
     /* Off, or back to the level the game started with; a game that started with it off

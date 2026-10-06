@@ -34,6 +34,7 @@
 #include "ntstatus.h"
 #include "macdrv.h"
 #include "shellapi.h"
+#include "sevo_limiter.h"
 #include "sevo_provenance.h"
 #include "wine/server.h"
 
@@ -65,7 +66,7 @@ int presenter_on = 0;
 int gl_presenter_on = 1;
 int presenter_log_on = 0;
 int frame_rate_on = 0;
-int frame_graph_on = 0;
+int overlay_level = OVERLAY_LEVEL_FRAME_RATE;
 char upscaler_option[64] = "off";
 char final_filter_option[16] = "lanczos";
 static char presenter_debug_option[16] = "";
@@ -303,6 +304,18 @@ static void copy_option_string(char *dest, size_t size, const WCHAR *value)
     dest[i] = 0;
 }
 
+static int overlay_level_from_option(int level)
+{
+    return max(OVERLAY_LEVEL_FRAME_RATE, min(OVERLAY_LEVEL_SYSTEM, level));
+}
+
+/* Frames per second, 0 (off) for anything that is not a plausible rate. */
+static int frame_rate_limit_from_option(const char *value)
+{
+    int fps = atoi(value);
+    return fps > 0 && fps <= 1000 ? fps : 0;
+}
+
 /* "all" for every titled window, "window" for the locked ones plus
    fullscreen-style windows put in a window, "fixed" or any true value for
    the windows the program locked, anything else off. */
@@ -461,7 +474,17 @@ static void setup_options(void)
     }
     {
         const char *env = getenv("SEVO_FPS_GRAPH");
-        if (env && *env) frame_graph_on = IS_OPTION_TRUE(*env);
+        if (env && *env)
+            overlay_level = IS_OPTION_TRUE(*env) ? OVERLAY_LEVEL_FRAME_TIME : OVERLAY_LEVEL_FRAME_RATE;
+        if (env && IS_OPTION_TRUE(*env)) frame_rate_on = 1;
+    }
+    {
+        const char *env = getenv("SEVO_OVERLAY_LEVEL");
+        if (env && *env) overlay_level = overlay_level_from_option(atoi(env));
+    }
+    {
+        const char *env = getenv("SEVO_FPS_LIMIT");
+        if (env && *env) frame_rate_limit = frame_rate_limit_from_option(env);
     }
     {
         const char *env = getenv("SEVO_GL_PRESENTER");
@@ -508,8 +531,22 @@ static void setup_options(void)
     if (!get_config_key(hkey, appkey, "FrameRate", buffer, sizeof(buffer)))
         frame_rate_on = IS_OPTION_TRUE(buffer[0]);
     if (!get_config_key(hkey, appkey, "FrameRateGraph", buffer, sizeof(buffer)))
-        frame_graph_on = IS_OPTION_TRUE(buffer[0]);
-    if (frame_graph_on) frame_rate_on = 1;
+    {
+        overlay_level = IS_OPTION_TRUE(buffer[0]) ? OVERLAY_LEVEL_FRAME_TIME : OVERLAY_LEVEL_FRAME_RATE;
+        if (IS_OPTION_TRUE(buffer[0])) frame_rate_on = 1;
+    }
+    if (!get_config_key(hkey, appkey, "OverlayLevel", buffer, sizeof(buffer)))
+    {
+        char value[16];
+        copy_option_string(value, sizeof(value), buffer);
+        overlay_level = overlay_level_from_option(atoi(value));
+    }
+    if (!get_config_key(hkey, appkey, "FrameRateLimit", buffer, sizeof(buffer)))
+    {
+        char value[16];
+        copy_option_string(value, sizeof(value), buffer);
+        frame_rate_limit = frame_rate_limit_from_option(value);
+    }
     if (!get_config_key(hkey, appkey, "OpenGLPresenter", buffer, sizeof(buffer)))
         gl_presenter_on = IS_OPTION_TRUE(buffer[0]);
     if (!get_config_key(hkey, appkey, "PresenterLog", buffer, sizeof(buffer)))

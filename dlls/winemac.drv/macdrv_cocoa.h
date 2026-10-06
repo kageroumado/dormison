@@ -153,10 +153,18 @@ extern char final_filter_option[16];
    frame: `Mac Driver\FrameRate=Y` or SEVO_FPS=1. View > Show Frame Rate
    switches it while the game runs. */
 extern int frame_rate_on;
-/* The counter grows a frame-time graph of the last few seconds and the 1 % low under the
-   number: `Mac Driver\FrameRateGraph=Y` or SEVO_FPS_GRAPH=1, and View > Show Frame Time
-   Graph. On, it implies the counter. */
-extern int frame_graph_on;
+/* How much the counter shows: the number alone; a card with the frame-time graph of the
+   last few seconds and the 1 % low; or that card with the process's CPU, the GPU's
+   utilization, the Mac's power draw and its CPU temperature. `Mac Driver\OverlayLevel=<1-3>`
+   or SEVO_OVERLAY_LEVEL=<1-3>, and View > Overlay Detail. `FrameRateGraph=Y` or
+   SEVO_FPS_GRAPH=1 is level 2 and also shows the counter. */
+enum
+{
+    OVERLAY_LEVEL_FRAME_RATE = 1,
+    OVERLAY_LEVEL_FRAME_TIME = 2,
+    OVERLAY_LEVEL_SYSTEM     = 3,
+};
+extern int overlay_level;
 /* The app became active or resigned: the display hold follows it. Main thread. */
 extern void macdrv_note_app_active(int active);
 /* Traces the presenter's frames and the Metal view lifecycle to stderr:
