@@ -121,6 +121,7 @@ extern UINT draw_nc_menu_bar( HDC hdc, RECT *rect, HWND hwnd );
 extern void end_menu( HWND hwnd );
 extern HMENU get_menu( HWND hwnd );
 extern UINT get_menu_bar_height( HWND hwnd, UINT width, INT org_x, INT org_y );
+extern UINT get_menu_bar_cached_height( HWND hwnd );
 extern BOOL get_menu_info( HMENU handle, MENUINFO *info );
 extern INT get_menu_item_count( HMENU handle );
 extern UINT get_menu_state( HMENU handle, UINT item_id, UINT flags );

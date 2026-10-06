@@ -2128,6 +2128,16 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
     visible_rect.right  -= rect.right;
     visible_rect.top    -= rect.top;
     visible_rect.bottom -= rect.bottom;
+
+    /* A driver that shows the window's menu bar natively leaves the strip out of what it
+       shows. The window and client rectangles keep it, so the program's geometry is the one
+       it would have on Windows. */
+    if (!(style & WS_CHILD) && get_menu( hwnd ) && user_driver->pHasNativeMenuBar( hwnd ))
+    {
+        UINT height = get_menu_bar_cached_height( hwnd );
+        if (height && visible_rect.top + (int)height <= rects->client.top) visible_rect.top += height;
+    }
+
     if (visible_rect.top >= visible_rect.bottom) visible_rect.bottom = visible_rect.top + 1;
     if (visible_rect.left >= visible_rect.right) visible_rect.right = visible_rect.left + 1;
 

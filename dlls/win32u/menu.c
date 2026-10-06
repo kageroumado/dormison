@@ -2239,6 +2239,18 @@ UINT get_menu_bar_height( HWND hwnd, UINT width, INT org_x, INT org_y )
     return menu->Height;
 }
 
+/* The height of the window's menu bar as last laid out, by WM_NCCALCSIZE; 0 before that. */
+UINT get_menu_bar_cached_height( HWND hwnd )
+{
+    struct menu *menu;
+    UINT height;
+
+    if (!(menu = grab_menu_ptr( get_menu( hwnd )))) return 0;
+    height = menu->Height;
+    release_menu_ptr( menu );
+    return height;
+}
+
 static void draw_popup_arrow( HDC hdc, RECT rect, UINT arrow_width, UINT arrow_height )
 {
     HDC mem_hdc = NtGdiCreateCompatibleDC( hdc );
