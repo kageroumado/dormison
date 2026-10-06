@@ -26,6 +26,10 @@ release body.
 - A game pinned to DXMT while its bottle runs another renderer starts: DXMT's `winemetal.dll`
   used to fail to initialize, because its unix half was looked for beside the pinned DLLs
   rather than in the engine.
+- Controllers reach games with winebus's SDL bus off (`Enable SDL`=0) or failed to start: the
+  IOHID bus keeps an Xbox or 8BitDo pad it used to drop as a duplicate of SDL's. The Xbox One
+  S, Elite 2 and Adaptive controllers over Bluetooth LE (0b20, 0b22, 0b21) and the Adaptive
+  wired and over Bluetooth (0b0a, 0b0c) count as Xbox pads, ids as SDL lists them.
 
 ## b1
 
