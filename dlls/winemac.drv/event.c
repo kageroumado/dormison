@@ -76,6 +76,7 @@ static const char *dbgstr_event(int type)
         "WINDOW_RESIZE_ENDED",
         "WINDOW_RESTORE_REQUESTED",
         "CLIENT_SURFACE_PRESENTED",
+        "WINDOW_MENU_COMMAND",
     };
     C_ASSERT(ARRAYSIZE(event_names) == NUM_EVENT_TYPES);
 
@@ -129,6 +130,7 @@ static macdrv_event_mask get_event_mask(DWORD mask)
         event_mask |= event_mask_for_type(WINDOW_FRAME_CHANGED);
         event_mask |= event_mask_for_type(WINDOW_GOT_FOCUS);
         event_mask |= event_mask_for_type(WINDOW_LOST_FOCUS);
+        event_mask |= event_mask_for_type(WINDOW_MENU_COMMAND);
     }
 
     if (mask & QS_SENDMESSAGE)
@@ -357,6 +359,10 @@ static void macdrv_query_event(HWND hwnd, const macdrv_event *event)
             TRACE("QUERY_MIN_MAX_INFO\n");
             success = query_min_max_info(hwnd);
             break;
+        case QUERY_MENU_INIT:
+            TRACE("QUERY_MENU_INIT\n");
+            success = query_menu_init(hwnd, query);
+            break;
         default:
             FIXME("unrecognized query type %d\n", query->type);
             break;
@@ -465,6 +471,9 @@ void macdrv_handle_event(const macdrv_event *event)
         break;
     case WINDOW_LOST_FOCUS:
         macdrv_window_lost_focus(hwnd, event);
+        break;
+    case WINDOW_MENU_COMMAND:
+        macdrv_window_menu_command(hwnd, event);
         break;
     case WINDOW_MAXIMIZE_REQUESTED:
         macdrv_window_maximize_requested(hwnd);

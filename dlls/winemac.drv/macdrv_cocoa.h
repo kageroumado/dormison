@@ -175,6 +175,10 @@ extern int presenter_log_on;
    default. The pointer-acceleration curve shapes what the cursor does, which
    is right for a cursor and wrong for a camera. */
 extern int linear_mouse;
+/* A top-level window's Win32 menu bar is shown in the macOS menu bar, between the app menu
+   and View, and the strip in the window is cropped away: `Mac Driver\NativeMenuBar=Y` or
+   SEVO_MENU_BAR=1. */
+extern int native_menu_bar;
 /* Confine the cursor at the window server rather than through an event tap or
    a window's confinement rect: `Mac Driver\CursorConfine=Y`, or
    SEVO_CURSOR_CONFINE=1 in the environment. The private call reaches the
@@ -363,6 +367,7 @@ enum {
     WINDOW_RESIZE_ENDED,
     WINDOW_RESTORE_REQUESTED,
     CLIENT_SURFACE_PRESENTED,
+    WINDOW_MENU_COMMAND,
     NUM_EVENT_TYPES
 };
 
@@ -468,6 +473,9 @@ typedef struct macdrv_event {
         struct {
             void   *client_surface;
         }                                           client_surface_presented;
+        struct {
+            unsigned int    id;
+        }                                           window_menu_command;
     };
 } macdrv_event;
 
@@ -480,6 +488,7 @@ enum {
     QUERY_RESIZE_SIZE,
     QUERY_RESIZE_START,
     QUERY_MIN_MAX_INFO,
+    QUERY_MENU_INIT,
     NUM_QUERY_TYPES
 };
 
@@ -507,6 +516,13 @@ typedef struct macdrv_query {
         struct {
             unsigned int    scaled : 1;
         }                                           resize_start;
+        struct {
+            uint64_t        popup;      /* the HMENU about to open */
+            int             position;   /* its position in the menu that holds it */
+            bool            begin;      /* it opens from the bar: WM_INITMENU comes first */
+            bool            abandoned;  /* the menu opened without the answer; skip asking */
+            CFTypeRef       snapshot;   /* out: the menu after the program's WM_INITMENUPOPUP */
+        }                                           menu_init;
     };
 } macdrv_query;
 
@@ -653,6 +669,32 @@ extern void macdrv_make_context_current_offscreen(macdrv_opengl_context c);
 extern void macdrv_update_opengl_context(macdrv_opengl_context c);
 extern void macdrv_flush_opengl_context(macdrv_opengl_context c);
 
+
+/* Win32 menu bar */
+enum
+{
+    MACDRV_MENU_ITEM_SEPARATOR = 0x01,
+    MACDRV_MENU_ITEM_DISABLED  = 0x02,
+    MACDRV_MENU_ITEM_CHECKED   = 0x04,
+    MACDRV_MENU_ITEM_RADIO     = 0x08,
+};
+
+/* One item of a window's menu, in a flat list where every submenu's items follow the item
+   that opens it. */
+struct macdrv_menu_item
+{
+    int             parent;     /* index of the item whose submenu this is in, -1 in the bar */
+    unsigned int    id;         /* the command's id, for WM_COMMAND */
+    unsigned int    flags;      /* MACDRV_MENU_ITEM_* */
+    uint64_t        popup;      /* the HMENU this item opens, 0 for a command */
+    CFStringRef     title;      /* without the mnemonic's ampersand */
+    CFStringRef     shortcut;   /* the accelerator text after a tab, or NULL */
+};
+
+/* A snapshot of a menu, which the Cocoa side keeps; NULL for an empty one. */
+extern CFTypeRef macdrv_create_menu_snapshot(const struct macdrv_menu_item *items, int count);
+/* Gives the window its menu: the snapshot (retained) or NULL for none. */
+extern void macdrv_set_cocoa_window_menu(macdrv_window w, CFTypeRef snapshot);
 
 /* systray / status item */
 extern macdrv_status_item macdrv_create_status_item(macdrv_event_queue q);

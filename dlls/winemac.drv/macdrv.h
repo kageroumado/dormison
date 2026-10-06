@@ -161,6 +161,7 @@ extern void macdrv_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags);
 extern LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 extern BOOL macdrv_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects);
 extern BOOL macdrv_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask);
+extern BOOL macdrv_HasNativeMenuBar(HWND hwnd);
 extern struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format);
 extern BOOL macdrv_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface);
 extern void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
@@ -248,6 +249,9 @@ extern void macdrv_reassert_window_position(HWND hwnd);
 extern BOOL query_resize_size(HWND hwnd, macdrv_query *query);
 extern BOOL query_resize_start(HWND hwnd, BOOL scaled);
 extern BOOL query_min_max_info(HWND hwnd);
+extern BOOL query_menu_init(HWND hwnd, macdrv_query *query);
+extern void macdrv_update_window_menu(HWND hwnd);
+extern void macdrv_window_menu_command(HWND hwnd, const macdrv_event *event);
 
 extern void macdrv_mouse_button(HWND hwnd, const macdrv_event *event);
 extern void macdrv_mouse_moved(HWND hwnd, const macdrv_event *event);

@@ -21,6 +21,7 @@
 #import "cocoa_app.h"
 #import "cocoa_cursorclipping.h"
 #import "cocoa_event.h"
+#import "cocoa_menubar.h"
 #import "cocoa_window.h"
 #include "sevo_limiter.h"
 #include "sevo_presenter.h"
@@ -780,6 +781,7 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
 
             [NSApp setMainMenu:mainMenu];
             [NSApp setWindowsMenu:submenu];
+            if (native_menu_bar) [[WineMenuBarMirror sharedMirror] attachToMainMenu:mainMenu];
 
             /* The bundle's own icon stands where there is one. */
             if (becomesRegular) [NSApp setApplicationIconImage:self.applicationIcon];

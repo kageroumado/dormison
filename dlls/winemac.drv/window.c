@@ -1667,6 +1667,18 @@ BOOL macdrv_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *styl
 
 
 /***********************************************************************
+ *              HasNativeMenuBar   (MACDRV.@)
+ *
+ * A top-level window's menu bar is shown in the macOS menu bar (menubar.c), so win32u leaves
+ * the strip out of the window's visible rectangle.
+ */
+BOOL macdrv_HasNativeMenuBar(HWND hwnd)
+{
+    return native_menu_bar;
+}
+
+
+/***********************************************************************
  *              frame_change_overridden
  *
  * Whether the program answered a Cocoa frame change with a rectangle of its own: its visible
@@ -1754,6 +1766,10 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
 
 done:
     release_win_data(data);
+
+    /* SetMenu and DrawMenuBar both end here with SWP_FRAMECHANGED. */
+    if (native_menu_bar && (swp_flags & (SWP_FRAMECHANGED | SWP_SHOWWINDOW)) && !(new_style & WS_CHILD))
+        macdrv_update_window_menu(hwnd);
 }
 
 

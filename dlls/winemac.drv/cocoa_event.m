@@ -767,6 +767,10 @@ void macdrv_release_query(macdrv_query *query)
                 if (query->pasteboard_data.type)
                     CFRelease(query->pasteboard_data.type);
                 break;
+            case QUERY_MENU_INIT:
+                if (query->menu_init.snapshot)
+                    CFRelease(query->menu_init.snapshot);
+                break;
         }
         [(WineWindow*)query->window release];
         free(query);

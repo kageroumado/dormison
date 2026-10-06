@@ -71,6 +71,7 @@ char upscaler_option[64] = "off";
 char final_filter_option[16] = "lanczos";
 static char presenter_debug_option[16] = "";
 int linear_mouse = 0;
+int native_menu_bar = 0;
 int cursor_confine = 0;
 bool use_precise_scrolling = true;
 int gl_surface_mode = GL_SURFACE_IN_FRONT_OPAQUE;
@@ -518,6 +519,10 @@ static void setup_options(void)
         const char *env = getenv("SEVO_CURSOR_CONFINE");
         if (env && *env) cursor_confine = IS_OPTION_TRUE(*env);
     }
+    {
+        const char *env = getenv("SEVO_MENU_BAR");
+        if (env && *env) native_menu_bar = IS_OPTION_TRUE(*env);
+    }
     if (!get_config_key(hkey, appkey, "ResizableWindows", buffer, sizeof(buffer)))
         resizable_windows = resizable_windows_from_option((char)buffer[0]);
     if (!get_config_key(hkey, appkey, "PresentationLog", buffer, sizeof(buffer)))
@@ -560,6 +565,8 @@ static void setup_options(void)
         linear_mouse = IS_OPTION_TRUE(buffer[0]);
     if (!get_config_key(hkey, appkey, "CursorConfine", buffer, sizeof(buffer)))
         cursor_confine = IS_OPTION_TRUE(buffer[0]);
+    if (!get_config_key(hkey, appkey, "NativeMenuBar", buffer, sizeof(buffer)))
+        native_menu_bar = IS_OPTION_TRUE(buffer[0]);
 
     if (appkey) NtClose(appkey);
     if (hkey) NtClose(hkey);
