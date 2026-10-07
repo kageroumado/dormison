@@ -18,10 +18,10 @@ Like the app, it is named after an anesthetic.
 |---|---|
 | Graphics | DXMT for Direct3D 10/11, DXVK over MoltenVK, D3DMetal from Apple's Game Porting Toolkit, or Wine's wined3d. Choose a renderer per bottle or game in Sevoflurane. |
 | Window scaling | Resize supported game windows while the game keeps drawing at its original resolution. Scale the picture with Lanczos, MetalFX Spatial, Anime4K or CuNNy. |
-| Frame rate | Show a frame-rate counter or a frame-time graph from the game's View menu. |
-| Input | Use raw mouse movement when a game holds the cursor for mouse-look. |
+| Frame rate | Show a frame-rate counter, a frame-time card, or a card with the game's CPU, the GPU's load, power and temperature from the game's View menu. Cap the frame rate per game or while it runs. |
+| Input | Use raw mouse movement when a game holds the cursor for mouse-look. Play with an Xbox controller over Bluetooth through XInput or DirectInput, rumble included. |
 | Game settings | Change per-game settings for the next launch while Steam stays open. |
-| Mac integration | Show a game's title and icon in the Dock, and run supported NW.js games with native macOS NW.js. |
+| Mac integration | Show a game's title and icon in the Dock, show a program's own menus in the macOS menu bar, and run supported NW.js games with native macOS NW.js. |
 
 Compatibility depends on the game, Mac and graphics translator.
 
@@ -60,6 +60,8 @@ Everything below is absent from Wine 11.16 and wine-staging 11.16.
   load, power and temperature.
 - A frame limiter on every Metal and OpenGL present path, set per game or
   from the View menu while the game runs.
+- A renderer pinned to one game through `WINEDLLPATH_PREPEND` loads whole,
+  so a game can run DXMT while its bottle runs another renderer.
 - `SEVO_GPU_*` adapter identity, plus RTX 50 and RX 7000/9000 device IDs in
   wined3d.
 - Vulkan portability enumeration on, so Windows programs see MoltenVK.
@@ -79,9 +81,13 @@ Everything below is absent from Wine 11.16 and wine-staging 11.16.
 - A "not responding" sheet for a game that ignores quit, and crash reports
   for faults on threads Wine did not create.
 - A program's own Win32 menu bar can live in the macOS menu bar, with the
-  strip in its window cropped away.
-- Tray icons can stay out of the menu bar. A background program no longer
-  keeps the display awake.
+  strip in its window cropped away, Ctrl shortcuts shown as their Command
+  equivalents, and choices sent back by id or by position as the program asks.
+- Gamepads reach games with winebus's SDL bus off or failed, through the
+  IOHID bus. Xbox One S, Elite 2 and Adaptive controllers over Bluetooth LE
+  count as Xbox pads.
+- Tray icons can stay out of the menu bar. A background program lets the
+  display sleep.
 
 **Processes, sync and memory**
 - msync+: Mach-based in-process synchronization (`WINEMSYNC=1`), Dormison's
@@ -97,6 +103,8 @@ Everything below is absent from Wine 11.16 and wine-staging 11.16.
 **Audio, media and text**
 - Bundled GStreamer (LGPL build) for Media Foundation and DirectShow movies,
   MPEG program streams included.
+- An HEVC decoder transform for Media Foundation. It and the H.264 decoder
+  decode through VideoToolbox in hardware.
 - CoreAudio applies each stream's volume, channel by channel, to its own
   samples, so other programs' playback and the Mac's volume stay intact and a
   muted capture records silence.
@@ -194,9 +202,24 @@ CuNNy. A final filter resamples the output. Configure it with `Upscaler`,
 
 A running program has a View menu: Upscaler, Final Filter, Show Frame Rate
 (`FrameRate=Y` or `SEVO_FPS=1` shows it from the first frame), Show Frame
-Time Graph (`FrameRateGraph=Y` or `SEVO_FPS_GRAPH=1`) and Show Picture
-Details. The counter and graph read the same per-process stats page as
-Sevoflurane.
+Time Graph (`FrameRateGraph=Y` or `SEVO_FPS_GRAPH=1`), Show Picture
+Details, Overlay Detail and Frame Rate Limit. Overlay Detail picks the frame
+rate alone, the frame-time card, or the card with a row for the game's CPU,
+the GPU's load, the Mac's power draw and its CPU temperature
+(`OverlayLevel=1|2|3` or `SEVO_OVERLAY_LEVEL`). Frame Rate Limit offers Off,
+30, 40, 45, 60, 90 and 120 (`FrameRateLimit=<n>` or `SEVO_FPS_LIMIT=<n>` sets
+it from the start); frames leave on fixed deadlines on every Metal and
+OpenGL path, with or without the upscaler. The counter and graph read the
+same per-process stats page as Sevoflurane.
+
+`NativeMenuBar=Y` or `SEVO_MENU_BAR=1` moves a program's Win32 menu bar into
+the macOS menu bar, between the app menu and View, and crops the strip from
+its window while the window's geometry stays as on Windows. Menus carry the
+check marks and disabled items the program sets as a menu opens, and a
+modal dialog disables them. A choice arrives as `WM_COMMAND` with the item's
+id, or as `WM_MENUCOMMAND` with its position and menu when the menu has
+`MNS_NOTIFYBYPOS`. The driver's View menu reads Picture when the program has
+a View menu of its own.
 
 `ResizableWindows` preserves the game's rendering size and aspect ratio
 while allowing the presentation window to resize. `LinearMouse` supplies
@@ -214,7 +237,10 @@ MXCSR state.
 At process start, Wine reads `<prefix>/.sevo/bottle.env`, then
 `<prefix>/.sevo/apps/<exe>.env`, where `<exe>` is the executable's
 lowercase basename. Game settings therefore apply at the next launch.
-`WINEDLLPATH_PREPEND` adds a directory ahead of the built-in DLLs.
+`WINEDLLPATH_PREPEND` adds a directory ahead of the built-in DLLs. A renderer
+placed there loads whole: its DLLs that Wine has no counterpart of load
+without a file in the prefix, and a DLL whose unix half is missing from that
+directory takes the engine's own.
 
 `SEVO_GPU_*` variables set the adapter identity, memory and driver
 metadata reported to Windows programs. Without a driver override, an

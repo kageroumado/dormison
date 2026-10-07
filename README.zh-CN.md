@@ -17,10 +17,10 @@ Sevoflurane 会下载引擎并管理它的设置。想直接用它玩游戏，�
 |---|---|
 | 图形 | 可选用于 Direct3D 10/11 的 DXMT、通过 MoltenVK 运行的 DXVK、Apple 游戏移植工具包（Game Porting Toolkit）中的 D3DMetal，或 Wine 自带的 wined3d。在 Sevoflurane 中可以为整个容器或单款游戏选择渲染器。 |
 | 窗口缩放 | 让支持的游戏自由调整窗口大小，同时保留游戏原本的渲染分辨率。可以用 Lanczos、MetalFX Spatial、Anime4K 或 CuNNy 放大画面。 |
-| 帧率 | 在游戏的 View（显示）菜单中显示帧率计数器或帧时间图。 |
-| 输入 | 游戏锁定光标、用鼠标控制视角时，可以使用原始鼠标位移。 |
+| 帧率 | 在游戏的 View（显示）菜单中显示帧率计数器、帧时间卡片，或带有游戏 CPU、GPU 负载、功耗和温度的卡片。可以为单款游戏或在游戏运行时限制帧率。 |
+| 输入 | 游戏锁定光标、用鼠标控制视角时，可以使用原始鼠标位移。可以通过蓝牙连接 Xbox 手柄，以 XInput 或 DirectInput 游玩，支持震动。 |
 | 游戏设置 | Steam 保持运行时也能修改单款游戏的设置，下次启动游戏时生效。 |
-| Mac 集成 | 在程序坞显示游戏自己的名称和图标，并用 macOS 原生 NW.js 运行支持的 NW.js 游戏。 |
+| Mac 集成 | 在程序坞显示游戏自己的名称和图标，把程序自己的菜单放进 macOS 菜单栏，并用 macOS 原生 NW.js 运行支持的 NW.js 游戏。 |
 
 兼容性取决于游戏、Mac 和所用的图形转译组件。
 
@@ -53,6 +53,11 @@ Sevoflurane 通过带签名的发布清单查找引擎版本。
 - wined3d 将游戏原始分辨率的帧交给画面缩放器。
 - 调整游戏窗口大小时，保留游戏的渲染分辨率和宽高比。
 - FPS 计数器和帧时间图，从每个进程的统计页读取数据；Sevoflurane 也读取同一份数据。
+  更详细的显示级别还会加入游戏的 CPU 占用、GPU 负载、功耗和温度。
+- 帧率限制器，覆盖所有 Metal 和 OpenGL 画面呈现路径，可以为单款游戏设置，
+  也可以在游戏运行时从 View（显示）菜单切换。
+- 通过 `WINEDLLPATH_PREPEND` 为单款游戏指定的渲染器能完整加载，
+  因此容器使用其他渲染器时，单款游戏也能使用 DXMT。
 - 通过 `SEVO_GPU_*` 配置显卡标识，并在 wined3d 中加入 RTX 50 和 RX 7000/9000 的设备 ID。
 - 启用 Vulkan 可移植性枚举，让 Windows 程序能发现 MoltenVK。
 - 在支持 Metal 4 的 GPU（M3 及更新芯片）上，关闭显示同步时，present 调用立即返回；
@@ -67,6 +72,10 @@ Sevoflurane 通过带签名的发布清单查找引擎版本。
   可加载 32 位和 64 位 Steamworks。
 - 通过窗口服务器限制光标范围，并为鼠标视角控制提供原始位移。
 - 游戏不响应退出操作时，显示“未响应”对话框；Wine 以外创建的线程发生异常时，也能生成崩溃报告。
+- 程序自己的 Win32 菜单栏可以放进 macOS 菜单栏，窗口中的菜单条会被裁掉；
+  Ctrl 快捷键显示为对应的 Command 快捷键，菜单选择按程序要求以 ID 或位置发回。
+- winebus 的 SDL 总线关闭或启动失败时，手柄通过 IOHID 总线接入游戏。
+  通过蓝牙 LE 连接的 Xbox One S、Elite 2 和 Adaptive 手柄会被识别为 Xbox 手柄。
 - 可以隐藏菜单栏中的托盘图标。后台程序允许显示器正常休眠。
 
 **进程、同步与内存**
@@ -83,6 +92,8 @@ Sevoflurane 通过带签名的发布清单查找引擎版本。
 
 - 附带 GStreamer（LGPL 构建），用于播放 Media Foundation 和 DirectShow 视频，
   包括 MPEG 程序流。
+- 为 Media Foundation 提供 HEVC 解码器转换（transform）。它和 H.264 解码器都通过
+  VideoToolbox 进行硬件解码。
 - CoreAudio 将每个音频流各声道的音量应用到它自己的采样数据上，
   保留其他程序和 Mac 的音量；将采集流静音时，录到的也是静音。
 - Discord Rich Presence 桥接。
@@ -166,9 +177,21 @@ D3DMetal 支持包括 `__wine_unix_call` 导出、工具包回调的 Microsoft A
 
 程序运行时会有一个 View（显示）菜单，包含 Upscaler（画面缩放器）、Final Filter（最终滤镜）、
 Show Frame Rate（显示帧率，设置 `FrameRate=Y` 或 `SEVO_FPS=1` 可从第一帧开始显示）、
-Show Frame Time Graph（显示帧时间图，`FrameRateGraph=Y` 或 `SEVO_FPS_GRAPH=1`）
-和 Show Picture Details（显示画面详情）。计数器、图表和 Sevoflurane
-读取的是同一份进程统计页。
+Show Frame Time Graph（显示帧时间图，`FrameRateGraph=Y` 或 `SEVO_FPS_GRAPH=1`）、
+Show Picture Details（显示画面详情）、Overlay Detail（叠加层详细程度）和
+Frame Rate Limit（帧率限制）。Overlay Detail 可以只显示帧率、显示帧时间卡片，
+或在卡片中再加一行游戏的 CPU 占用、GPU 负载、Mac 的功耗和 CPU 温度
+（`OverlayLevel=1|2|3` 或 `SEVO_OVERLAY_LEVEL`）。Frame Rate Limit 提供关闭、
+30、40、45、60、90 和 120 几档（`FrameRateLimit=<n>` 或 `SEVO_FPS_LIMIT=<n>`
+可从启动时生效）；无论是否使用画面缩放器，每条 Metal 和 OpenGL 路径都按固定的截止时间送出帧。
+计数器、图表和 Sevoflurane 读取的是同一份进程统计页。
+
+设置 `NativeMenuBar=Y` 或 `SEVO_MENU_BAR=1` 后，程序的 Win32 菜单栏会出现在
+macOS 菜单栏中，位于应用菜单和 View（显示）之间；窗口中的菜单条会被裁掉，
+窗口的几何尺寸仍与 Windows 上一致。菜单会显示程序在打开菜单时设置的勾选标记和禁用项，
+弹出模态对话框时菜单也会被禁用。菜单选择以带项目 ID 的 `WM_COMMAND` 发给程序；
+菜单设置了 `MNS_NOTIFYBYPOS` 时，则以带项目位置和菜单句柄的 `WM_MENUCOMMAND` 发送。
+程序自己有 View 菜单时，驱动的 View 菜单改名为 Picture（画面）。
 
 `ResizableWindows` 允许调整显示窗口的大小，同时保留游戏的渲染尺寸和宽高比。
 `LinearMouse` 在程序锁定光标、用鼠标控制视角时提供原始位移。
@@ -184,7 +207,9 @@ Dormison 包含 msync+，即它对 CrossOver msync 实现的分支，通过共�
 进程启动时，Wine 先读取 `<prefix>/.sevo/bottle.env`，
 再读取 `<prefix>/.sevo/apps/<exe>.env`，其中 `<exe>` 是可执行文件的文件名，统一为小写。
 所以游戏设置会在下次启动时生效。
-`WINEDLLPATH_PREPEND` 可以在内建 DLL 目录之前插入一个搜索目录。
+`WINEDLLPATH_PREPEND` 可以在内建 DLL 目录之前插入一个搜索目录。放在其中的渲染器会完整加载：
+Wine 没有对应版本的 DLL 无需在容器中放置文件即可加载；
+DLL 的 unix 部分不在该目录中时，使用引擎自带的那一份。
 
 `SEVO_GPU_*` 变量设置 Windows 程序看到的显卡标识、显存和驱动信息。
 没有指定驱动信息时，未知厂商会使用 NVIDIA 的驱动信息。
