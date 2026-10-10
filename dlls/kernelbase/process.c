@@ -465,8 +465,8 @@ static BOOL is_native_executable( const WCHAR *path )
  * (`Game.app\Contents\MacOS\Game`). That file is a Mach-O or a script, so the
  * launch is handed to explorer.exe with that exact path, the way Steam
  * shell-opens an `.app`, and the dock shim runs it natively. Any other file
- * answers STATUS_INVALID_IMAGE_NOT_MZ, as the image did, so batch files and the
- * rest keep their own handling.
+ * keeps the STATUS_INVALID_IMAGE_NOT_MZ its image produced, so batch files and
+ * the rest go on to their own handling.
  */
 static NTSTATUS create_macos_build_process( HANDLE token, HANDLE debug, SECURITY_ATTRIBUTES *psa,
                                             SECURITY_ATTRIBUTES *tsa, DWORD flags,

@@ -208,7 +208,7 @@ direction, so every pointer argument becomes a sized buffer on the wire.
   sees half of one. A connection the helper closes before answering the hello is tried
   again within the 30 s. The first wait that runs out, a refused or unanswered hello, or a
   port file reading `failed` (the helper's word that it cannot serve) turns the bridge off
-  for the process: every later call fails at once instead of waiting again. `libsevosteamipc.dylib` holds one idle keepalive
+  for the process: every later call fails at once. `libsevosteamipc.dylib` holds one idle keepalive
   connection from the game's start (hello kind 2: token only, serves nothing), since a
   game's threads come and go between calls, a game may initialize Steam late, and the
   helper quits when its last greeted connection closes. The helper binds a

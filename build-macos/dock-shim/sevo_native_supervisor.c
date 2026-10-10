@@ -10,8 +10,8 @@
 //   - ends the whole group when the waiter dies (Steam's Stop, the wineserver going down with
 //     an app quit or an engine switch) or when it is sent SIGTERM (the app's stop);
 //   - publishes the session in <prefix>/.sevo/native-sessions/<own pid>.json for the app.
-// None of this depends on the game loading anything, so a hardened game that strips
-// DYLD_INSERT_LIBRARIES is supervised the same way.
+// All of it works from outside the game, so a hardened game that strips
+// DYLD_INSERT_LIBRARIES is supervised like any other.
 //
 // sevo-native-supervisor --status-fd N --waiter PID --prefix DIR --appid ID --bundle PATH
 //                        --cwd DIR -- EXECUTABLE [ARGUMENT...]
@@ -211,8 +211,8 @@ int main(int argc, char **argv) {
     const char *executable = argv[at];
     char *const *arguments = argv + at;
 
-    // The pipe stays open in this process alone: the game and everything it starts never
-    // hold the waiter.
+    // The pipe stays open in this process alone, so the waiter lives exactly as long as
+    // the session.
     if (status_fd > 2) fcntl(status_fd, F_SETFD, FD_CLOEXEC);
 
     int queue = kqueue();
