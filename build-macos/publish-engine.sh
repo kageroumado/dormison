@@ -271,5 +271,15 @@ UPLOADED="$(gh api "repos/$ENGINE_REPO/releases/tags/$VERSION" -q ".assets[] | s
 echo "==> manifest on $ENGINE_REPO, release manifest"
 gh release view manifest --repo "$ENGINE_REPO" >/dev/null 2>&1 || gh release create manifest --repo "$ENGINE_REPO" --prerelease \
     --title "Engine manifest" --notes "The signed manifest Sevoflurane reads: engine.json and engine.json.sig." --target main
-gh release upload manifest "$MANIFEST" "$MANIFEST.sig" --repo "$ENGINE_REPO" --clobber
+# --clobber deletes each old asset before its upload, so a failed upload leaves the release
+# without a manifest and every engine install failing: retry until the live copy matches.
+EXPECTED="$(shasum -a 256 "$MANIFEST" | cut -d' ' -f1)"
+for attempt in 1 2 3 4 5; do
+    gh release upload manifest "$MANIFEST" "$MANIFEST.sig" --repo "$ENGINE_REPO" --clobber || true
+    LIVE="$(curl -fsSL "https://github.com/$ENGINE_REPO/releases/download/manifest/$(basename "$MANIFEST")" | shasum -a 256 | cut -d' ' -f1)"
+    [ "$LIVE" = "$EXPECTED" ] && break
+    echo "    manifest upload attempt $attempt did not land; retrying"
+    sleep $((attempt * 10))
+done
+[ "$LIVE" = "$EXPECTED" ] || { echo "the manifest on $ENGINE_REPO does not match $MANIFEST — upload it by hand now"; exit 1; }
 echo "==> published $VERSION as $CHANNEL"
