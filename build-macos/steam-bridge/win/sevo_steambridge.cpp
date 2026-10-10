@@ -235,9 +235,21 @@ namespace {
 std::string g_token;
 volatile LONG g_clients;          // greeted connections
 volatile LONG g_ever_connected;   // a connection has been greeted
+volatile LONG g_ungreeted;        // accepted connections that have not said hello yet
 
-// Seconds an unauthenticated connection may take to say hello.
-constexpr DWORD kHelloTimeoutMs = 10000;
+// From accept to the end of a valid hello, whatever arrives in between.
+constexpr ULONGLONG kHelloTimeoutMs = 10000;
+// Connections that have not said hello yet; one past this is closed as it is accepted.
+// A game's threads greet in microseconds, and a thread whose connection is closed before
+// its hello connects again.
+constexpr LONG kMaxUngreeted = 8;
+// How long the last greeted connection may be gone before the helper exits: a connection
+// being replaced comes back within it.
+constexpr ULONGLONG kLastClientGraceMs = 2000;
+// The longest the accept loop sleeps before it looks at its exit conditions again.
+constexpr long kLoopTickMs = 250;
+// Waits with no deadline.
+constexpr ULONGLONG kNoDeadline = 0;
 
 // Token comparison in time independent of where the first difference is.
 bool token_matches(const char *token) {
@@ -247,10 +259,6 @@ bool token_matches(const char *token) {
     for (size_t i = 0; i < g_token.size(); i++)
         diff |= (unsigned char)(g_token[i] ^ (i < n ? token[i] : 0));
     return diff == 0;
-}
-
-void set_receive_timeout(SOCKET s, DWORD ms) {
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ms, sizeof ms);
 }
 
 bool send_all(SOCKET s, const void *data, size_t n) {
@@ -264,9 +272,27 @@ bool send_all(SOCKET s, const void *data, size_t n) {
     return true;
 }
 
-bool recv_all(SOCKET s, void *data, size_t n) {
+/* Waits until `s` has data, or answers false once `deadline` (GetTickCount64) passes. */
+bool readable_before(SOCKET s, ULONGLONG deadline) {
+    for (;;) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) return false;
+        ULONGLONG left = deadline - now;
+        fd_set set;
+        FD_ZERO(&set);
+        FD_SET(s, &set);
+        timeval tv = {(long)(left / 1000), (long)(left % 1000) * 1000};
+        int ready = select(0, &set, NULL, NULL, &tv);
+        if (ready > 0) return true;
+        if (ready < 0) return false;
+    }
+}
+
+/* Reads exactly `n` bytes; with a deadline, every byte of them arrives before it. */
+bool recv_all(SOCKET s, void *data, size_t n, ULONGLONG deadline) {
     char *p = static_cast<char *>(data);
     while (n) {
+        if (deadline != kNoDeadline && !readable_before(s, deadline)) return false;
         int r = recv(s, p, (int)n, 0);
         if (r <= 0) return false;
         p += r;
@@ -311,7 +337,7 @@ bool serve_frame(SOCKET s, std::vector<uint8_t> &frame, Greeting &greeting) {
         greeting = kind == bridge::kHelloKeepalive ? kKeepalive : kClient;
         InterlockedIncrement(&g_clients);
         InterlockedExchange(&g_ever_connected, 1);
-        set_receive_timeout(s, 0);
+        InterlockedDecrement(&g_ungreeted);
         return true;
     }
     if (greeting == kKeepalive) return false;
@@ -340,21 +366,24 @@ DWORD WINAPI serve_client(LPVOID arg) {
     SOCKET s = (SOCKET)(uintptr_t)arg;
     int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
-    set_receive_timeout(s, kHelloTimeoutMs);
+    ULONGLONG hello_deadline = GetTickCount64() + kHelloTimeoutMs;
     Greeting greeting = kUngreeted;
     std::vector<uint8_t> frame;
     for (;;) {
+        ULONGLONG deadline = greeting == kUngreeted ? hello_deadline : kNoDeadline;
         uint32_t length;
-        if (!recv_all(s, &length, 4)) break;
+        if (!recv_all(s, &length, 4, deadline)) break;
         uint32_t most = greeting == kUngreeted ? bridge::kMaxHelloFrame : bridge::kMaxBlob + 1024;
         if (length < 12 || length > most) break;
         frame.resize(length);
-        if (!recv_all(s, frame.data(), length)) break;
+        if (!recv_all(s, frame.data(), length, deadline)) break;
         if (!serve_frame(s, frame, greeting)) break;
     }
     if (greeting == kClient && g_steam.ReleaseThreadLocalMemory) g_steam.ReleaseThreadLocalMemory(1);
     closesocket(s);
-    if (greeting != kUngreeted) {
+    if (greeting == kUngreeted) {
+        InterlockedDecrement(&g_ungreeted);
+    } else {
         LONG left = InterlockedDecrement(&g_clients);
         logf_("%s gone, %ld left", greeting == kKeepalive ? "keepalive" : "client", left);
     }
@@ -376,6 +405,43 @@ void publish_failure(const std::string &stem) {
     fprintf(f, "%s\n", bridge::kPortFileFailed);
     fclose(f);
     MoveFileExA(tmp.c_str(), (stem + ".port").c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
+/* Hands an accepted connection a thread of its own, unless kMaxUngreeted connections
+   are already waiting to say hello. The listener is non-blocking, so a connection that
+   went away between select and accept costs nothing; the accepted socket inherits that
+   mode and is set back to blocking for its thread. */
+void accept_one(SOCKET listener) {
+    SOCKET client = accept(listener, NULL, NULL);
+    if (client == INVALID_SOCKET) return;
+    u_long blocking = 0;
+    ioctlsocket(client, FIONBIO, &blocking);
+    if (InterlockedIncrement(&g_ungreeted) > kMaxUngreeted) {
+        InterlockedDecrement(&g_ungreeted);
+        closesocket(client);
+        if (g_tracing) logf_("%ld connections already waiting to say hello: closed a new one", kMaxUngreeted);
+        return;
+    }
+    HANDLE thread = CreateThread(NULL, 0, serve_client, (LPVOID)(uintptr_t)client, 0, NULL);
+    if (thread) {
+        CloseHandle(thread);
+    } else {
+        InterlockedDecrement(&g_ungreeted);
+        closesocket(client);
+    }
+}
+
+/* Every exit ends here. TerminateProcess, never a return or ExitProcess: process exit
+   runs steamclient64.dll's detach, which waits forever on its own threads, and Steam
+   keeps showing the game as running while this process lives. */
+[[noreturn]] void exit_helper(UINT code) {
+    logf_("exited");
+    /* Worker threads may still be logging: the file closes under their lock. */
+    EnterCriticalSection(&g_log_lock);
+    if (g_log) fclose(g_log);
+    g_log = NULL;
+    TerminateProcess(GetCurrentProcess(), code);
+    for (;;) Sleep(INFINITE);
 }
 
 }  // namespace
@@ -401,19 +467,19 @@ int main() {
     if (g_token.empty()) {
         logf_("SEVO_STEAM_BRIDGE_TOKEN is not set: nothing could tell the game's connections from anyone else's, so not listening");
         publish_failure(stem);
-        return 1;
+        exit_helper(1);
     }
 
     if (!load_steamclient()) {
         publish_failure(stem);
-        return 1;
+        exit_helper(1);
     }
 
     WSADATA data;
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
         logf_("WSAStartup failed");
         publish_failure(stem);
-        return 1;
+        exit_helper(1);
     }
     SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sockaddr_in addr;
@@ -421,10 +487,12 @@ int main() {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons((u_short)(port_text ? atoi(port_text) : 0));
-    if (bind(listener, (sockaddr *)&addr, sizeof addr) != 0 || listen(listener, 16) != 0) {
+    u_long nonblocking = 1;
+    if (bind(listener, (sockaddr *)&addr, sizeof addr) != 0 || listen(listener, 16) != 0 ||
+        ioctlsocket(listener, FIONBIO, &nonblocking) != 0) {
         logf_("bind/listen on port %s failed: %d", port_text ? port_text : "0", WSAGetLastError());
         publish_failure(stem);
-        return 1;
+        exit_helper(1);
     }
     int len = sizeof addr;
     getsockname(listener, (sockaddr *)&addr, &len);
@@ -441,30 +509,28 @@ int main() {
     }
     logf_("listening on 127.0.0.1:%d", port);
 
+    /* The exit conditions run on elapsed time every tick, whatever connections arrive. */
+    ULONGLONG idle_deadline = GetTickCount64() + (ULONGLONG)(idle_seconds > 0 ? idle_seconds : 0) * 1000;
+    bool clients_gone = false;
+    ULONGLONG clients_gone_since = 0;
     for (;;) {
         fd_set set;
         FD_ZERO(&set);
         FD_SET(listener, &set);
-        timeval tv = {1, 0};
-        int ready = select(0, &set, NULL, NULL, &tv);
-        if (ready > 0) {
-            SOCKET client = accept(listener, NULL, NULL);
-            if (client == INVALID_SOCKET) continue;
-            HANDLE thread = CreateThread(NULL, 0, serve_client, (LPVOID)(uintptr_t)client, 0, NULL);
-            if (thread) CloseHandle(thread);
-            else closesocket(client);
-            continue;
-        }
+        timeval tv = {0, kLoopTickMs * 1000};
+        if (select(0, &set, NULL, NULL, &tv) > 0) accept_one(listener);
+        ULONGLONG now = GetTickCount64();
         if (g_ever_connected) {
-            if (g_clients == 0) {
-                /* A brief grace for a connection being replaced. */
-                Sleep(2000);
-                if (g_clients == 0) {
-                    logf_("last client gone: exiting");
-                    break;
-                }
+            if (g_clients > 0) {
+                clients_gone = false;
+            } else if (!clients_gone) {
+                clients_gone = true;
+                clients_gone_since = now;
+            } else if (now - clients_gone_since >= kLastClientGraceMs) {
+                logf_("last client gone: exiting");
+                break;
             }
-        } else if (--idle_seconds <= 0) {
+        } else if (now >= idle_deadline) {
             logf_("no game said hello within the idle wait: exiting");
             break;
         }
@@ -472,11 +538,5 @@ int main() {
     DeleteFileA((stem + ".port").c_str());
     closesocket(listener);
     WSACleanup();
-    logf_("exited");
-    if (g_log) fclose(g_log);
-    /* Never return: process exit runs steamclient64.dll's detach, which waits
-       forever on its own threads, and Steam keeps showing the game as running
-       while this process lives. */
-    TerminateProcess(GetCurrentProcess(), 0);
-    return 0;
+    exit_helper(0);
 }

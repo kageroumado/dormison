@@ -191,12 +191,24 @@ direction, so every pointer argument becomes a sized buffer on the wire.
   table (319 layouts, one per distinct id and size pair across SDKs).
 - **Strings** a method returns are copied into a per-thread ring of 256; Steam's own
   contract is "valid until the next call".
-- **Transport:** loopback TCP, `TCP_NODELAY`, close-on-exec, one connection per game
-  thread opened at the thread's first call (retrying for 30 s while the helper starts; the
-  first connection waits for wine), dropped by `Steam_ReleaseThreadLocalMemory(true)`. The
-  first wait that runs out, a refused hello, or a port file reading `failed` (the helper's
-  word that it cannot serve) turns the bridge off for the process: every later call fails
-  at once instead of waiting again. `libsevosteamipc.dylib` holds one idle keepalive
+- **Transport:** loopback TCP, one connection per game thread opened at the thread's first
+  call (retrying for 30 s while the helper starts; the first connection waits for wine),
+  dropped by `Steam_ReleaseThreadLocalMemory(true)`, after which a pooled thread that comes
+  back connects afresh. Both dylibs open their sockets through `mac/transport.c`:
+  non-blocking, close-on-exec, `TCP_NODELAY` and `SO_NOSIGPIPE` (sends also pass
+  `MSG_NOSIGNAL`), so a helper that vanishes makes a call fail with `EPIPE` and never
+  raises `SIGPIPE` in a game that left it at its default. Every wait runs against an
+  absolute deadline on the monotonic clock, which a partial read or write never extends:
+  2 s per connect, 10 s for the hello and its reply, 30 s per call's request and reply
+  (most Steam calls answer in microseconds; a few block on the client, such as
+  `ConnectToGlobalUser` while it signs in or a synchronous Remote Storage write). A call
+  that fails or runs past its deadline retires that thread's connection, and the call
+  and every later one on the thread return the answer for an unreachable Steam (zero,
+  false, `""`); the helper only dispatches a request it has read whole, so Steam never
+  sees half of one. A connection the helper closes before answering the hello is tried
+  again within the 30 s. The first wait that runs out, a refused or unanswered hello, or a
+  port file reading `failed` (the helper's word that it cannot serve) turns the bridge off
+  for the process: every later call fails at once instead of waiting again. `libsevosteamipc.dylib` holds one idle keepalive
   connection from the game's start (hello kind 2: token only, serves nothing), since a
   game's threads come and go between calls, a game may initialize Steam late, and the
   helper quits when its last greeted connection closes. The helper binds a
@@ -205,9 +217,11 @@ direction, so every pointer argument becomes a sized buffer on the wire.
   (by hand), so no process can take the port between a choice and the bind. The first frame is a
   hello carrying `SEVO_STEAM_BRIDGE_TOKEN` and the protocol hash (a SHA-256 of every method
   name, its wire signature and the callback table); the helper refuses anything else and
-  refuses to listen at all without a token. Before the hello a connection gets 10 s and one
-  frame of at most 4 KB; the token compares in constant time; only greeted connections
-  count toward the helper's exit. A refused hello disables the dylib for the
+  refuses to listen at all without a token. Before the hello a connection gets 10 s from
+  accept to a complete hello, however its bytes arrive, and one frame of at most 4 KB; at
+  most 8 connections wait to say hello at once, and one past that is closed as it is
+  accepted; the token compares in constant time; only greeted connections count toward
+  the helper's exit. A refused hello disables the dylib for the
   process, so `SteamAPI_Init` fails fast instead of hanging.
 - **The helper** loads `steamclient64.dll` from
   `HKCU\Software\Valve\Steam\ActiveProcess\SteamClientDll64`, serves one thread per
@@ -216,12 +230,17 @@ direction, so every pointer argument becomes a sized buffer on the wire.
   `failed`). It exits when the last greeted connection closes (2 s grace), which with the
   keepalive is when the game ends, or after `SEVO_STEAM_BRIDGE_IDLE` seconds (120) when no
   game ever said hello (a failed launch, or a hardened runtime that stripped the bridge).
+  Its accept loop wakes every 250 ms and checks both on elapsed time whatever connections
+  arrive. Every exit, a failure after `steamclient64.dll` is loaded included, ends in
+  `TerminateProcess`: a return would run the dll's detach, which waits forever on its own
+  threads while Steam keeps showing the game as running.
 
 ## Build
 
 ```
 make -C build-macos/steam-bridge sdk venv generate   # SDK headers, libclang venv, generator
 make -C build-macos/steam-bridge -j12 mac win ipc native
+make -C build-macos/steam-bridge test-transport      # transport against fake helpers
 ```
 
 `make venv` installs libclang 18.1.1 exactly. Everything lands under
@@ -237,6 +256,13 @@ for the hardened-runtime check.
 
 ## Testing
 
+- **`tests/transport_test.c`** (`make test-transport`) runs `mac/transport.c` against
+  helpers it forks on loopback, with `SIGPIPE` at its default: a peer that accepts and
+  never greets (the wait ends at its deadline), one that resets the connection mid-write
+  (the write fails, the process lives), one that sends its reply a byte at a time (it
+  arrives whole), one that trickles a byte every 100 ms (the deadline holds across partial
+  reads), and a port with nothing listening (refused at once). It needs no Steam or wine.
+  The helper's accept loop has no harness: it is a mingw PE.
 - **`tests/probe.c`** drives a game's libsteam_api through the flat API the way
   Steamworks.NET does, with the bridge environment the shim gives a game. By hand, with the
   helper started like the steam stub (`../steam-stub/README.md`, plus `SteamAppId`,
