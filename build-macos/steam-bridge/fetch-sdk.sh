@@ -26,7 +26,9 @@ else
         git clone --filter=blob:none --no-checkout --sparse https://github.com/ValveSoftware/Proton.git "$CLONE"
         git -C "$CLONE" sparse-checkout set lsteamclient
     fi
-    if [ "$(git -C "$CLONE" rev-parse HEAD 2>/dev/null)" != "$PROTON_COMMIT" ]; then
+    # A fresh --no-checkout clone can already sit at the pinned commit with no files.
+    if [ "$(git -C "$CLONE" rev-parse HEAD 2>/dev/null)" != "$PROTON_COMMIT" ] ||
+       [ ! -d "$CLONE/lsteamclient/steamworks_sdk_165" ]; then
         git -C "$CLONE" fetch --depth 1 origin "$PROTON_COMMIT"
         git -C "$CLONE" checkout --quiet "$PROTON_COMMIT"
     fi
