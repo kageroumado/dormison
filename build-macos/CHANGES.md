@@ -6,6 +6,10 @@ itself after the top heading.
 
 ## r5
 
+- Engines are regular releases again, named r<N>; the manifest names each one for every app.
+- A macOS game whose Steam launch names the executable inside its bundle (Fluffy Store, among
+  others) starts natively like one Steam shell-opens as an `.app`, instead of failing silently.
+
 ## b4
 
 - A native macOS game launched from Steam leaves nothing behind: the process Steam created runs
