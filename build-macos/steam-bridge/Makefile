@@ -5,6 +5,7 @@
 #   make sdk                 assemble the SDK headers (fetch-sdk.sh)
 #   make generate            run the generator (ONLY=SteamUser021,... narrows it)
 #   make -j12 mac win ipc native   build the four artifacts into $(OUT)
+#   make test-transport      run the macOS transport against fake helpers (no Steam)
 #
 # The generator needs libclang's Python binding; `make venv` makes a venv with it under
 # $(BUILD) and PYTHON defaults to that venv's interpreter.
@@ -27,7 +28,7 @@ MINGW_INCLUDE ?= $(if $(wildcard $(MINGW_SYSROOT)/x86_64-w64-mingw32/include/win
 ONLY ?=
 HERE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-.PHONY: all sdk venv generate mac win ipc native clean
+.PHONY: all sdk venv generate mac win ipc native test-transport clean
 
 all: mac win ipc native
 
@@ -47,10 +48,10 @@ generate: $(if $(filter $(VENV)/bin/python,$(PYTHON)),$(VENV)/bin/python)
 
 # --- macOS: the generated proxies plus the runtime, one universal dylib ---
 MAC_GEN := $(addprefix $(GEN)/mac/,$(shell cat $(GEN)/mac/sources.txt 2>/dev/null))
-MAC_OBJS := $(patsubst $(GEN)/mac/%.cpp,$(OBJ)/mac/%.o,$(MAC_GEN)) $(OBJ)/mac/bridge.o
+MAC_OBJS := $(patsubst $(GEN)/mac/%.cpp,$(OBJ)/mac/%.o,$(MAC_GEN)) $(OBJ)/mac/bridge.o $(OBJ)/mac/transport.o
 MAC_ARCH := -arch arm64 -arch x86_64
 MACFLAGS := -std=c++17 -O2 $(MAC_ARCH) -fvisibility=hidden -I$(HERE)mac -I$(HERE)shared -I$(BUILD)
-MAC_DEPS := $(HERE)mac/proxy_prelude.h $(HERE)shared/wire.h
+MAC_DEPS := $(HERE)mac/proxy_prelude.h $(HERE)shared/wire.h $(HERE)mac/transport.h
 
 $(OBJ)/mac/%.o: $(GEN)/mac/%.cpp $(MAC_DEPS)
 	@mkdir -p $(dir $@)
@@ -59,6 +60,10 @@ $(OBJ)/mac/%.o: $(GEN)/mac/%.cpp $(MAC_DEPS)
 $(OBJ)/mac/bridge.o: $(HERE)mac/bridge.cpp $(MAC_DEPS)
 	@mkdir -p $(dir $@)
 	clang++ $(MACFLAGS) -Wall -Wextra -c $< -o $@
+
+$(OBJ)/mac/transport.o: $(HERE)mac/transport.c $(HERE)mac/transport.h
+	@mkdir -p $(dir $@)
+	clang -O2 $(MAC_ARCH) -fvisibility=hidden -Wall -Wextra -c $< -o $@
 
 $(OUT)/steamclient.dylib: $(MAC_OBJS)
 	@mkdir -p $(dir $@)
@@ -95,12 +100,20 @@ $(OUT)/sevo-native.exe: $(HERE)win/sevo_native.c
 native: $(OUT)/sevo-native.exe
 
 # --- the ipcserver stand-in a game's libsteam_api asks for Steam's path ---
-$(OUT)/libsevosteamipc.dylib: $(HERE)mac/sevo_steam_ipc.c
+$(OUT)/libsevosteamipc.dylib: $(HERE)mac/sevo_steam_ipc.c $(HERE)mac/transport.c $(HERE)mac/transport.h
 	@mkdir -p $(dir $@)
-	clang $(MAC_ARCH) -O2 -Wall -dynamiclib -o $@ $<
+	clang $(MAC_ARCH) -O2 -Wall -dynamiclib -o $@ $(HERE)mac/sevo_steam_ipc.c $(HERE)mac/transport.c
 	codesign -s - -f $@
 
 ipc: $(OUT)/libsevosteamipc.dylib
+
+# --- the transport against fake helpers that stall, vanish and fragment ---
+$(OBJ)/tests/transport_test: $(HERE)tests/transport_test.c $(HERE)mac/transport.c $(HERE)mac/transport.h
+	@mkdir -p $(dir $@)
+	clang -O2 -Wall -Wextra -I$(HERE)mac -o $@ $(HERE)tests/transport_test.c $(HERE)mac/transport.c
+
+test-transport: $(OBJ)/tests/transport_test
+	$<
 
 clean:
 	trash $(OBJ) $(OUT) 2>/dev/null || true

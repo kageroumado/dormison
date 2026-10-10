@@ -16,22 +16,20 @@
 //   SEVO_STEAM_BRIDGE_PREFIX  the bottle (WINEPREFIX), for drive-letter paths
 //   SEVO_STEAM_BRIDGE_LOG     1 traces every call on stderr
 
-#include <arpa/inet.h>
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
-#include <fcntl.h>
 #include <map>
 #include <mutex>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <set>
-#include <sys/socket.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #include "proxy_prelude.h"
+#include "transport.h"
 
 #define BRIDGE_EXPORT extern "C" __attribute__((visibility("default")))
 
@@ -75,8 +73,10 @@ static const char *method_name(uint32_t method) {
 
 // One connection per game thread, opened at the thread's first call. The helper may
 // still be starting when the game first asks, so the first connect retries for a while;
-// once one wait has run out, or the helper has refused a hello or published that it
-// cannot serve, the bridge is off for the process and every call fails at once.
+// once one wait has run out, or the helper has refused or stalled a hello or published
+// that it cannot serve, the bridge is off for the process and every call fails at once.
+// A connection whose round trip fails or runs past its deadline is retired, and that
+// thread's later calls fail at once.
 struct Connection {
     int fd = -1;
     bool tried = false;
@@ -88,47 +88,37 @@ struct Connection {
 static thread_local Connection connection;
 static std::atomic<bool> disabled{false};   // no connection will ever work
 
+// How long the helper gets to come up and publish a port: wine's own start is most of it.
+constexpr uint64_t kStartupWaitMs = 30000;
+// One loopback connect; the helper's listen queue answers at once when it is there.
+constexpr uint64_t kConnectTimeoutMs = 2000;
+// The hello and its reply: the helper answers it before touching Steam.
+constexpr uint64_t kGreetingTimeoutMs = 10000;
+// One call's request and reply. Steam answers most calls in microseconds; a few block on
+// the client (ConnectToGlobalUser while it signs in, synchronous Remote Storage writes),
+// so the deadline is generous, and a call past it means the client is wedged.
+constexpr uint64_t kCallTimeoutMs = 30000;
+// The pause between attempts while the helper starts.
+constexpr useconds_t kRetryPauseUs = 100 * 1000;
+
 static void disable(const char *why) {
     if (!disabled.exchange(true)) log("Steam is out of reach for this process: %s", why);
 }
 
-static bool write_all(int fd, const void *data, size_t n) {
-    const uint8_t *p = static_cast<const uint8_t *>(data);
-    while (n) {
-        ssize_t w = ::write(fd, p, n);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        p += w;
-        n -= (size_t)w;
-    }
-    return true;
-}
+enum class Trip { ok, closed, timed_out };
 
-static bool read_all(int fd, void *data, size_t n) {
-    uint8_t *p = static_cast<uint8_t *>(data);
-    while (n) {
-        ssize_t r = ::read(fd, p, n);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (r == 0) return false;
-        p += r;
-        n -= (size_t)r;
-    }
-    return true;
-}
-
-// Sends one frame and reads the reply into `reply` (status and payload, length stripped).
-static bool round_trip(int fd, const std::vector<uint8_t> &frame, std::vector<uint8_t> &reply) {
-    if (!write_all(fd, frame.data(), frame.size())) return false;
+// Sends one frame and reads the reply into `reply` (status and payload, length stripped),
+// all within `timeout_ms`.
+static Trip round_trip(int fd, const std::vector<uint8_t> &frame, std::vector<uint8_t> &reply, uint64_t timeout_ms) {
+    uint64_t deadline = sevo_transport_now_ms() + timeout_ms;
+    auto failure = [] { return errno == ETIMEDOUT ? Trip::timed_out : Trip::closed; };
+    if (!sevo_transport_send_all(fd, frame.data(), frame.size(), deadline)) return failure();
     uint32_t length;
-    if (!read_all(fd, &length, 4)) return false;
-    if (length < 4 || length > kMaxBlob + 1024) return false;
+    if (!sevo_transport_recv_all(fd, &length, 4, deadline)) return failure();
+    if (length < 4 || length > kMaxBlob + 1024) return Trip::closed;
     reply.resize(length);
-    return read_all(fd, reply.data(), length);
+    if (!sevo_transport_recv_all(fd, reply.data(), length, deadline)) return failure();
+    return Trip::ok;
 }
 
 // The port the helper published, 0 while the file is not there yet, or -1 when the
@@ -144,27 +134,9 @@ static int port_from_file(const char *path) {
     return port > 0 && port < 65536 ? port : 0;
 }
 
-static bool hello(int fd);
+enum class Hello { accepted, refused, closed, timed_out };
 
-static int connect_once(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    fcntl(fd, F_SETFD, FD_CLOEXEC);
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    sockaddr_in addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(fd, (sockaddr *)&addr, sizeof addr) != 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
-
-static bool hello(int fd) {
+static Hello hello(int fd) {
     const char *token = getenv("SEVO_STEAM_BRIDGE_TOKEN");
     Writer w;
     w.u32(0);
@@ -175,14 +147,13 @@ static bool hello(int fd) {
     w.u32(kHelloClient);
     w.close(0);
     std::vector<uint8_t> reply;
-    if (!round_trip(fd, w.buf, reply)) return false;
-    Reader r(reply.data(), reply.size());
-    uint32_t status = r.u32();
-    if (status != kStatusOK) {
-        disable("the helper refused the hello (token or protocol mismatch)");
-        return false;
+    switch (round_trip(fd, w.buf, reply, kGreetingTimeoutMs)) {
+    case Trip::ok: break;
+    case Trip::closed: return Hello::closed;
+    case Trip::timed_out: return Hello::timed_out;
     }
-    return true;
+    Reader r(reply.data(), reply.size());
+    return r.u32() == kStatusOK ? Hello::accepted : Hello::refused;
 }
 
 static int current_fd() {
@@ -199,30 +170,38 @@ static int current_fd() {
         std::call_once(once, [] { log("neither SEVO_STEAM_BRIDGE_PORT nor SEVO_STEAM_BRIDGE_PORT_FILE is set: Steam stays out of reach"); });
         return -1;
     }
-    // Up to 30 s for the helper to come up: wine's own start is most of it.
-    for (int attempt = 0; attempt < 300 && !disabled; attempt++) {
+    // A connection the helper closes before answering the hello (its cap on connections
+    // that have not said hello yet, or a helper still starting) is tried again.
+    uint64_t startup_deadline = sevo_transport_now_ms() + kStartupWaitMs;
+    for (; !disabled && sevo_transport_now_ms() < startup_deadline; usleep(kRetryPauseUs)) {
         if (port <= 0) {
             port = port_from_file(port_file);
             if (port < 0) {
                 disable("the helper could not start (its log is steambridge-<appid>.log in the bottle)");
                 return -1;
             }
-            if (port == 0) {
-                usleep(100 * 1000);
-                continue;
-            }
+            if (port == 0) continue;
         }
-        int fd = connect_once(port);
-        if (fd >= 0) {
-            if (!hello(fd)) {
-                close(fd);
-                return -1;
-            }
+        uint64_t now = sevo_transport_now_ms();
+        int fd = sevo_transport_connect(port, std::min(now + kConnectTimeoutMs, startup_deadline));
+        if (fd < 0) continue;
+        switch (hello(fd)) {
+        case Hello::accepted:
             c.fd = fd;
             if (tracing()) log("connected to port %d on thread %p", port, (void *)pthread_self());
             return fd;
+        case Hello::closed:
+            close(fd);
+            continue;
+        case Hello::refused:
+            close(fd);
+            disable("the helper refused the hello (token or protocol mismatch)");
+            return -1;
+        case Hello::timed_out:
+            close(fd);
+            disable("the helper did not answer the hello within 10 s");
+            return -1;
         }
-        usleep(100 * 1000);
     }
     if (!disabled) disable(port > 0 ? "no helper answered within 30 s" : "the helper published no port within 30 s");
     return -1;
@@ -246,8 +225,15 @@ bool Call::send() {
     int fd = current_fd();
     if (fd < 0) return false;
     w.close(0);
-    if (!round_trip(fd, w.buf, reply)) {
+    switch (round_trip(fd, w.buf, reply, kCallTimeoutMs)) {
+    case Trip::ok: break;
+    case Trip::closed:
         log("%s: the helper went away", method_name(method));
+        drop_connection();
+        return false;
+    case Trip::timed_out:
+        log("%s: no answer within %llu s: this thread's connection is retired", method_name(method),
+            (unsigned long long)(kCallTimeoutMs / 1000));
         drop_connection();
         return false;
     }
@@ -586,7 +572,11 @@ BRIDGE_EXPORT void Steam_ReleaseThreadLocalMemory(bool thread_exit) {
     Call c(0, kMethodReleaseThreadLocalMemory);
     c.w.u8(thread_exit ? 1 : 0);
     c.send();
-    if (thread_exit) drop_connection();
+    if (thread_exit) {
+        // A pooled thread may come back with new work: it gets a connection of its own again.
+        drop_connection();
+        connection.tried = false;
+    }
 }
 
 BRIDGE_EXPORT bool Steam_IsKnownInterface(const char *version) {

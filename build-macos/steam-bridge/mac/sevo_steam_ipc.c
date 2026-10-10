@@ -38,6 +38,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "transport.h"
+
 #define IPCTOOL_SERVICE "com.valvesoftware.steam.ipctool"
 #define IPC_PROTOCOL_VERSION 0x68
 #define IPC_COMMAND_GET_STEAM_PATH 14
@@ -163,6 +165,10 @@ kern_return_t sevo_bootstrap_look_up(mach_port_t bp, const name_t name, mach_por
 // The hello matches shared/wire.h: u32 length, u32 method 1, u64 object 0, the token as
 // a blob with its NUL, u64 protocol hash (0, unchecked for this kind), u32 kind 2.
 #define KEEPALIVE_WAIT_SECONDS 120
+#define KEEPALIVE_RETRY_PAUSE_US (250 * 1000)
+// One loopback connect, and the hello with its reply; bridge.cpp uses the same bounds.
+#define KEEPALIVE_CONNECT_TIMEOUT_MS 2000
+#define KEEPALIVE_GREETING_TIMEOUT_MS 10000
 #define HELLO_METHOD 1
 #define HELLO_KIND_KEEPALIVE 2
 #define PORT_FILE_FAILED "failed"
@@ -179,10 +185,12 @@ static int published_port(const char *path) {
     return port > 0 && port < 65536 ? port : 0;
 }
 
-static int send_keepalive_hello(int fd, const char *token) {
+typedef enum { KEEPALIVE_ACCEPTED, KEEPALIVE_REFUSED, KEEPALIVE_CLOSED, KEEPALIVE_TIMED_OUT } keepalive_hello;
+
+static keepalive_hello send_keepalive_hello(int fd, const char *token) {
     uint32_t token_size = (uint32_t)strlen(token) + 1;
     uint8_t frame[4 + 4 + 8 + 4 + 256 + 8 + 4];
-    if (token_size > 256) return 0;
+    if (token_size > 256) return KEEPALIVE_REFUSED;
     uint32_t length = 4 + 8 + 4 + token_size + 8 + 4, method = HELLO_METHOD, kind = HELLO_KIND_KEEPALIVE;
     uint64_t zero = 0;
     size_t at = 0;
@@ -193,18 +201,13 @@ static int send_keepalive_hello(int fd, const char *token) {
     memcpy(frame + at, token, token_size); at += token_size;
     memcpy(frame + at, &zero, 8); at += 8;
     memcpy(frame + at, &kind, 4); at += 4;
-    if (write(fd, frame, at) != (ssize_t)at) return 0;
+    uint64_t deadline = sevo_transport_now_ms() + KEEPALIVE_GREETING_TIMEOUT_MS;
     uint8_t reply[8];
-    size_t got = 0;
-    while (got < sizeof reply) {
-        ssize_t n = read(fd, reply + got, sizeof reply - got);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) return 0;
-        got += (size_t)n;
-    }
+    if (!sevo_transport_send_all(fd, frame, at, deadline) || !sevo_transport_recv_all(fd, reply, sizeof reply, deadline))
+        return errno == ETIMEDOUT ? KEEPALIVE_TIMED_OUT : KEEPALIVE_CLOSED;
     uint32_t status;
     memcpy(&status, reply + 4, 4);
-    return status == 0;
+    return status == 0 ? KEEPALIVE_ACCEPTED : KEEPALIVE_REFUSED;
 }
 
 static void *hold_keepalive(void *unused) {
@@ -214,25 +217,22 @@ static void *hold_keepalive(void *unused) {
     const char *port_file = getenv("SEVO_STEAM_BRIDGE_PORT_FILE");
     const char *token = getenv("SEVO_STEAM_BRIDGE_TOKEN");
     int fixed_port = port_text ? atoi(port_text) : 0;
-    for (int attempt = 0; attempt < KEEPALIVE_WAIT_SECONDS * 4; attempt++, usleep(250 * 1000)) {
+    uint64_t give_up = sevo_transport_now_ms() + KEEPALIVE_WAIT_SECONDS * 1000ull;
+    for (; sevo_transport_now_ms() < give_up; usleep(KEEPALIVE_RETRY_PAUSE_US)) {
         int port = fixed_port > 0 ? fixed_port : port_file ? published_port(port_file) : 0;
         if (port < 0) return NULL;
         if (port == 0) continue;
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) return NULL;
-        fcntl(fd, F_SETFD, FD_CLOEXEC);
-        struct sockaddr_in address;
-        memset(&address, 0, sizeof address);
-        address.sin_family = AF_INET;
-        address.sin_port = htons((uint16_t)port);
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (connect(fd, (struct sockaddr *)&address, sizeof address) != 0) {
+        int fd = sevo_transport_connect(port, sevo_transport_now_ms() + KEEPALIVE_CONNECT_TIMEOUT_MS);
+        if (fd < 0) continue;
+        keepalive_hello answer = send_keepalive_hello(fd, token);
+        if (answer == KEEPALIVE_CLOSED) {
             close(fd);
             continue;
         }
-        if (!send_keepalive_hello(fd, token)) {
+        if (answer != KEEPALIVE_ACCEPTED) {
             close(fd);
-            fprintf(stderr, "sevo-steam-ipc: the helper refused the keepalive\n");
+            fprintf(stderr, "sevo-steam-ipc: the helper %s the keepalive\n",
+                    answer == KEEPALIVE_REFUSED ? "refused" : "did not answer");
             return NULL;
         }
         if (tracing()) fprintf(stderr, "sevo-steam-ipc: keepalive held on port %d\n", port);
