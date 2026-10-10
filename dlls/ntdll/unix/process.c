@@ -555,6 +555,21 @@ NTSTATUS wow64_wine_spawnvp( void *args )
 #endif
 
 /***********************************************************************
+ *           is_steam_macos_build
+ *
+ * A Mach-O inside a Steam library bundle (`Game.app/Contents/MacOS/Game`).
+ * It is left to kernelbase, which opens the bundle through explorer.exe so
+ * the dock shim starts it with its waiter and Steam bridge. Executing it here
+ * would run the game with none of those once the file has its exec bit.
+ */
+static BOOL is_steam_macos_build( const char *unix_name )
+{
+    const char *library = strstr( unix_name, "/steamapps/common/" );
+    return library && strstr( library, ".app/Contents/MacOS/" );
+}
+
+
+/***********************************************************************
  *           fork_and_exec
  *
  * Fork and exec a new Unix binary, checking for errors.
@@ -759,7 +774,8 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     InitializeObjectAttributes( &attr, &path, OBJ_CASE_INSENSITIVE, 0, 0 );
     if ((status = get_pe_file_info( &attr, &nt_name, &unix_name, &file_handle, &pe_info )))
     {
-        if (status == STATUS_INVALID_IMAGE_NOT_MZ && !fork_and_exec( &attr, unix_name, unixdir, params ))
+        if (status == STATUS_INVALID_IMAGE_NOT_MZ && !is_steam_macos_build( unix_name ) &&
+            !fork_and_exec( &attr, unix_name, unixdir, params ))
         {
             *process_handle_ptr = *thread_handle_ptr = 0;
             memset( info, 0, sizeof(*info) );
