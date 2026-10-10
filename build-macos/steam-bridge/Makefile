@@ -19,6 +19,11 @@ OUT := $(BUILD)/out
 SDK := $(BUILD)/sdk
 VENV := $(BUILD)/venv
 PYTHON ?= $(VENV)/bin/python
+LIBCLANG_VERSION := 18.1.1
+# mingw-w64's Windows headers, for the generator's Windows parse: under the cross gcc's
+# sysroot, else Homebrew's location.
+MINGW_SYSROOT := $(shell x86_64-w64-mingw32-gcc -print-sysroot 2>/dev/null)
+MINGW_INCLUDE ?= $(if $(wildcard $(MINGW_SYSROOT)/x86_64-w64-mingw32/include/windows.h),$(MINGW_SYSROOT)/x86_64-w64-mingw32/include,/opt/homebrew/opt/mingw-w64/toolchain-x86_64/x86_64-w64-mingw32/include)
 ONLY ?=
 HERE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -33,11 +38,11 @@ venv: $(VENV)/bin/python
 
 $(VENV)/bin/python:
 	python3 -m venv $(VENV)
-	$(VENV)/bin/pip install --quiet libclang
+	$(VENV)/bin/pip install --quiet libclang==$(LIBCLANG_VERSION)
 
 generate: $(if $(filter $(VENV)/bin/python,$(PYTHON)),$(VENV)/bin/python)
 	@mkdir -p $(GEN)
-	$(PYTHON) $(HERE)gen/gen_bridge.py --sdk-root $(SDK) --out $(GEN) --cache $(BUILD)/parsed.json \
+	MINGW_INCLUDE=$(MINGW_INCLUDE) $(PYTHON) $(HERE)gen/gen_bridge.py --sdk-root $(SDK) --out $(GEN) --cache $(BUILD)/parsed.json \
 	    --sdk-include sdk $(if $(ONLY),--only $(ONLY))
 
 # --- macOS: the generated proxies plus the runtime, one universal dylib ---
