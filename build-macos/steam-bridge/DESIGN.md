@@ -154,29 +154,42 @@ direction, so every pointer argument becomes a sized buffer on the wire.
   object, payload` / `u32 length, u32 status, payload`. Structs travel in the Windows
   layout; the macOS side converts with run tables (`{win offset, mac offset, length}`) the
   generator computes by pairing both layouts' scalar leaves. Unions and bitfield structs
-  are one opaque leaf.
+  are one opaque leaf for layout; their members still count for the pointer check below.
+  The object field is an opaque handle (see *The helper*), never an address.
 - **Argument rules** (the generator; overrides in `PARAM_OVERRIDES`): scalars and enums by
   value; records by value with conversion; `const char *` as a string; a pointer sized by
   the count parameter right after it (`cch*`/`cub*`/`cb*`/`c<Upper>`/`*Size*`/`*Count*`…;
   bytes when the name says `cub`/`cb`/`cch`/`Size`/`Bytes`, elements otherwise), by an
-  integer count *pointer* right after it (`punCount`), or by a count after a run of
-  array-named pointers (`prg*`, `pArray*`, `pvec*`…); any other typed pointer or reference
-  is a single element; `void *`/`char *`/`uint8 *` with no size is unsupported. The SDK's
+  integer count *pointer* right after it (`punCount`), by a count after a run of
+  array-named pointers (`prg*`, `pArray*`, `pvec*`…), or by the one integer parameter on
+  either side that names the same thing (`nOptions` for `pOptions`, `cItems` for
+  `prgItems`); a reference is a single element; `void *`/`char *`/`uint8 *` with no size
+  is unsupported. A typed pointer no rule sized is a single element only while no integer
+  parameter named like a count (`n<Plural>`, `c*`, `*Count`, `*Size`…) is left unclaimed
+  in the signature; beside one it makes the method unsupported until an override decides.
+  Connection setup's `int nOptions, const SteamNetworkingConfigValue_t *pOptions` and
+  `ConfigureConnectionLanes` are `count:` overrides. The SDK's
   `STEAM_OUT_ARRAY_COUNT(<constant>)` arrays (Input and Controller handles, origins, layers)
-  are `fixed:<n>` overrides; the generator refuses to run while any writable pointer it
-  guessed to be one element is named like several (`*Out`, `*List`, `*Array`, `prg*`, a
-  plural), so each new one gets a decision. Every non-const pointer travels both ways
-  (present flag, Windows capacity, contents) so in, out and in/out buffers are one case.
-  The helper allocates a fixed array at its full Windows size, and clamps every count and
-  size it passes to the callee (`*punCount` included) to the buffer it allocated, so a
-  sizing rule that is wrong costs a short answer, never a write past a buffer. `char **` is an out string. Interface returns resolve through the `pchVersion`
+  are `fixed:<n>` overrides; the generator refuses to run while any pointer, read-only or
+  writable, it guessed to be one element is named like several (`*Out`, `*List`, `*Array`,
+  `prg*`, a plural), so each new one gets a decision. Every non-const pointer travels both
+  ways (present flag, Windows capacity, contents) so in, out and in/out buffers are one
+  case. The helper takes a buffer only in whole elements (exactly its full Windows size
+  for a fixed array), and clamps every count and size it passes to the callee (`nOptions`
+  and `*punCount` included) to the buffer it received, so a sizing rule that is wrong
+  costs a short answer, never a read or write past a buffer. `char **` is an out string. Interface returns resolve through the `pchVersion`
   argument (`FIXED_RETURN_VERSIONS` for the rest) into a handle the macOS side wraps in that
   version's proxy, cached per (version, handle). Function-pointer setters are answered
-  locally. A record holding pointers (`SteamParamStringArray_t`,
-  `SteamNetworkingMessage_t`), a game-side listener object (`ISteamMatchmaking*Response`,
-  `ISteamNetworkingConnectionSignaling`) or a pointer-to-pointer array makes the method
-  unsupported: it logs once and answers zero. 266 such methods across the 213 versions,
-  listed in the report; none that Escape Dungeon 2 reaches.
+  locally. A record holding a pointer anywhere, union arms and nested records included
+  (`SteamParamStringArray_t`, `SteamNetworkingMessage_t`), a game-side listener object
+  (`ISteamMatchmaking*Response`, `ISteamNetworkingConnectionSignaling`) or a
+  pointer-to-pointer array makes the method unsupported: it logs once and answers zero.
+  266 such methods across the 213 versions, listed in the report; none that Escape
+  Dungeon 2 reaches. `TAGGED_RECORDS` names the exception: `SteamNetworkingConfigValue_t`
+  travels as bytes when every element's `m_eDataType` is Int32, Int64 or Float; the proxy
+  checks each element before sending and the helper again before calling, and a String or
+  Ptr option fails the call (zero, logged once), since its address belongs to the game.
+  The report also lists the callback structs that hold pointers.
 - **Paths:** `GetAppInstallDir`, `GetUserDataFolder`, `GetItemInstallInfo`, `GetAppInstallDir`
   (AppList) rewrite their out-buffer from Windows to macOS (`Z:\…` → `/…`, other drives →
   `$SEVO_STEAM_BRIDGE_PREFIX/dosdevices/<l>:/…`); a macOS path too long for the game's
@@ -216,7 +229,11 @@ direction, so every pointer argument becomes a sized buffer on the wire.
   dylib reads `SEVO_STEAM_BRIDGE_PORT_FILE` (the shim's way) or `SEVO_STEAM_BRIDGE_PORT`
   (by hand), so no process can take the port between a choice and the bind. The first frame is a
   hello carrying `SEVO_STEAM_BRIDGE_TOKEN` and the protocol hash (a SHA-256 of every method
-  name, its wire signature and the callback table); the helper refuses anything else and
+  name and its wire signature, and the callback table; a signature holds the method's
+  interface version and slot, each parameter's scalar width, both layouts of every record
+  it carries (size, alignment, leaf offsets, conversion runs), its size rule and its
+  path and tag conversions, and the same for the result, so equal hashes mean one wire);
+  the helper refuses anything else and
   refuses to listen at all without a token. Before the hello a connection gets 10 s from
   accept to a complete hello, however its bytes arrive, and one frame of at most 4 KB; at
   most 8 connections wait to say hello at once, and one past that is closed as it is
@@ -225,7 +242,14 @@ direction, so every pointer argument becomes a sized buffer on the wire.
   process, so `SteamAPI_Init` fails fast instead of hanging.
 - **The helper** loads `steamclient64.dll` from
   `HKCU\Software\Valve\Steam\ActiveProcess\SteamClientDll64`, serves one thread per
-  connection, logs to `%LOCALAPPDATA%\Sevoflurane\steambridge-<appid>.log` (every call with
+  connection, and hands the game opaque handles: every interface object `CreateInterface`
+  or an interface-returning method yields is registered with the interface version it was
+  asked for (aliases resolve to the version serving them) and named by its registry
+  index. A request is decoded in full before Steam sees it: its handle must name an object
+  issued for the called method's own interface version, every string must end in its NUL
+  within its blob, every buffer must hold whole elements, and nothing may be left over or
+  missing; anything else answers `kStatusBadRequest` with nothing called. The bridge's own
+  methods carry handle 0 and follow the same decode-first rule. The helper logs to `%LOCALAPPDATA%\Sevoflurane\steambridge-<appid>.log` (every call with
   `SEVO_STEAM_BRIDGE_LOG=1`) and writes its port to `steambridge-<appid>.port` (or
   `failed`). It exits when the last greeted connection closes (2 s grace), which with the
   keepalive is when the game ends, or after `SEVO_STEAM_BRIDGE_IDLE` seconds (120) when no
@@ -256,6 +280,13 @@ for the hardened-runtime check.
 
 ## Testing
 
+- **`make test-gen`** runs `tests/gen/test_gen.py`: the generator on a fake SDK
+  (`tests/gen/sdk`) covering a count before its array (override and name rule), a
+  read-only pointer with no size rule, a union arm holding a pointer, tagged option
+  records, record returns, overloaded virtuals and interface returns; then it builds
+  both generated halves and drives the Windows handlers against a fake object
+  (`tests/gen/handlers_test.cpp`) with valid, clamped, truncated, trailing and
+  wrongly-tagged requests.
 - **`tests/transport_test.c`** (`make test-transport`) runs `mac/transport.c` against
   helpers it forks on loopback, with `SIGPIPE` at its default: a peer that accepts and
   never greets (the wait ends at its deadline), one that resets the connection mid-write

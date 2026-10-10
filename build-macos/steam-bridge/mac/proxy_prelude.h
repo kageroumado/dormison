@@ -46,6 +46,8 @@ void *proxy_for(const char *version, uint64_t handle);
 
 void note_local(const char *method);
 void note_unsupported(const char *method);
+// A call whose tagged record (gen_bridge.py TAGGED_RECORDS) names a refused arm.
+void note_refused(const char *method, const char *param);
 
 // Path conversion between the bottle's Windows view and macOS.
 std::string path_to_win(const char *mac_path);

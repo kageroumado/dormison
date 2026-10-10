@@ -135,6 +135,37 @@ bool load_steamclient() {
     return true;
 }
 
+/* ------------------------------------------------------------ the handles */
+
+/* Every interface object handed to the game is an entry here, named by its index + 1:
+   the game's side never sees an address, and a request reaches only an object issued
+   for the interface version whose method it calls. Entries live as long as the
+   process, as Steam's interface objects do. */
+struct HandleEntry {
+    void *object;
+    uint16_t iface;
+};
+
+SRWLOCK g_handles_lock = SRWLOCK_INIT;
+std::vector<HandleEntry> g_handles;
+
+int interface_index(const char *version) {
+    if (!version) return -1;
+    for (size_t i = 0; i < bridge_interface_name_count; i++)
+        if (strcmp(bridge_interface_names[i].version, version) == 0) return bridge_interface_names[i].index;
+    return -1;
+}
+
+/* The object a handle names when it was issued for interface `iface`, else null. */
+void *resolve_handle(uint64_t handle, uint16_t iface) {
+    void *object = NULL;
+    AcquireSRWLockShared(&g_handles_lock);
+    if (handle >= 1 && handle <= g_handles.size() && g_handles[handle - 1].iface == iface)
+        object = g_handles[handle - 1].object;
+    ReleaseSRWLockShared(&g_handles_lock);
+    return object;
+}
+
 /* ------------------------------------------------------------ the methods */
 
 const char *method_name(uint32_t method) {
@@ -143,20 +174,26 @@ const char *method_name(uint32_t method) {
     return "?";
 }
 
-/* Bridge-own methods; answers whether the method was one of them. */
-bool serve_special(bridge::Req &q, bridge::Rep &p) {
+/* The bridge's own methods carry object 0 and are decoded in full before Steam is
+   called. Answers kStatusOK, kStatusBadRequest, or kStatusUnknownMethod for an id that
+   is none of them. */
+uint32_t serve_special(bridge::Req &q, bridge::Rep &p) {
+    if (q.obj != 0) return bridge::kStatusBadRequest;
     switch (q.method) {
     case bridge::kMethodCreateInterface: {
         const char *name = q.r.str();
+        if (!q.done() || !name) return bridge::kStatusBadRequest;
         int code = 0;
         void *iface = g_steam.CreateInterface(name, &code);
-        logf_("CreateInterface(%s) -> %p (code %d)", name ? name : "(null)", iface, code);
-        p.w.u64((uint64_t)(uintptr_t)iface);
+        uint64_t handle = bridge::issue_handle(iface, name);
+        logf_("CreateInterface(%s) -> %p, handle %llu (code %d)", name, iface, (unsigned long long)handle, code);
+        p.w.u64(handle);
         p.w.i32(code);
-        return true;
+        return bridge::kStatusOK;
     }
     case bridge::kMethodBGetCallback: {
         int32_t pipe = q.r.i32();
+        if (!q.done()) return bridge::kStatusBadRequest;
         WinCallbackMsg msg;
         memset(&msg, 0, sizeof msg);
         int32_t ignored = 0;
@@ -168,64 +205,105 @@ bool serve_special(bridge::Req &q, bridge::Rep &p) {
             p.w.blob(msg.param, msg.param ? (uint32_t)msg.param_size : 0);
             if (g_tracing) logf_("callback %d, %d bytes", msg.callback, msg.param_size);
         }
-        return true;
+        return bridge::kStatusOK;
     }
     case bridge::kMethodFreeLastCallback: {
         int32_t pipe = q.r.i32();
+        if (!q.done()) return bridge::kStatusBadRequest;
         p.w.u8(g_steam.FreeLastCallback(pipe) ? 1 : 0);
-        return true;
+        return bridge::kStatusOK;
     }
     case bridge::kMethodGetAPICallResult: {
         int32_t pipe = q.r.i32();
         uint64_t call = q.r.u64();
         uint32_t size = q.r.u32();
         int32_t expected = q.r.i32();
-        if (size > bridge::kMaxBlob) { q.r.failed = true; return true; }
-        std::vector<uint8_t> buffer(size, 0);
+        if (!q.done() || size > bridge::kMaxBlob) return bridge::kStatusBadRequest;
+        std::vector<uint8_t> buffer(size ? size : 1, 0);
         uint8_t failed = 0;
         uint8_t ret = g_steam.GetAPICallResult(pipe, call, buffer.data(), (int32_t)size, expected, &failed);
         p.w.u8(ret ? 1 : 0);
         p.w.u8(failed ? 1 : 0);
         p.w.blob(buffer.data(), size);
         if (g_tracing) logf_("GetAPICallResult(%llu, %d, %u) -> %d failed %d", (unsigned long long)call, expected, size, ret, failed);
-        return true;
+        return bridge::kStatusOK;
     }
     case bridge::kMethodReleaseThreadLocalMemory: {
         int32_t exiting = q.r.u8();
+        if (!q.done()) return bridge::kStatusBadRequest;
         if (g_steam.ReleaseThreadLocalMemory) g_steam.ReleaseThreadLocalMemory(exiting);
-        return true;
+        return bridge::kStatusOK;
     }
     case bridge::kMethodIsKnownInterface: {
         const char *name = q.r.str();
+        if (!q.done()) return bridge::kStatusBadRequest;
         p.w.u8(g_steam.IsKnownInterface && name ? g_steam.IsKnownInterface(name) : 0);
-        return true;
+        return bridge::kStatusOK;
     }
     case bridge::kMethodNotifyMissingInterface: {
         int32_t pipe = q.r.i32();
         const char *name = q.r.str();
+        if (!q.done()) return bridge::kStatusBadRequest;
         if (g_steam.NotifyMissingInterface && name) g_steam.NotifyMissingInterface(pipe, name);
-        return true;
+        return bridge::kStatusOK;
     }
     }
-    return false;
+    return bridge::kStatusUnknownMethod;
+}
+
+/* A generated method: its handle must name an object issued for the method's own
+   interface version before the handler decodes and calls. */
+uint32_t serve_generated(bridge::Req &q, bridge::Rep &p) {
+    uint32_t index = q.method - bridge::kFirstGeneratedMethod;
+    if (index >= bridge_handler_count || !bridge_handlers[index]) {
+        logf_("no handler for method %u (%s)", q.method, method_name(q.method));
+        return bridge::kStatusUnknownMethod;
+    }
+    q.target = resolve_handle(q.obj, bridge_method_interfaces[index]);
+    if (!q.target) {
+        logf_("%s: handle %llu names no object of its interface", method_name(q.method), (unsigned long long)q.obj);
+        return bridge::kStatusBadRequest;
+    }
+    if (g_tracing) logf_("%s handle %llu", method_name(q.method), (unsigned long long)q.obj);
+    return bridge_handlers[index](q, p) ? bridge::kStatusOK : bridge::kStatusBadRequest;
 }
 
 }  // namespace
 
-void bridge::api_call_result(bridge::Req &q, bridge::Rep &p, unsigned slot) {
-    void *obj = q.object();
+uint64_t bridge::issue_handle(void *object, const char *version) {
+    if (!object) return 0;
+    int iface = interface_index(version);
+    if (iface < 0) {
+        logf_("%s is no interface this bridge serves: its object stays here", version ? version : "(null)");
+        return 0;
+    }
+    AcquireSRWLockExclusive(&g_handles_lock);
+    uint64_t handle = 0;
+    for (size_t i = 0; i < g_handles.size() && !handle; i++)
+        if (g_handles[i].object == object && g_handles[i].iface == iface) handle = i + 1;
+    if (!handle) {
+        g_handles.push_back({object, (uint16_t)iface});
+        handle = g_handles.size();
+    }
+    ReleaseSRWLockExclusive(&g_handles_lock);
+    return handle;
+}
+
+bool bridge::api_call_result(bridge::Req &q, bridge::Rep &p, unsigned slot) {
+    void *obj = q.target;
     uint64_t call = q.r.u64();
     uint32_t size = q.r.u32();
     int32_t expected = q.r.i32();
     uint8_t has_failed = q.r.u8();
-    if (size > bridge::kMaxBlob) { q.r.failed = true; return; }
-    std::vector<uint8_t> buffer(size, 0);
+    if (!q.done() || size > bridge::kMaxBlob) return false;
+    std::vector<uint8_t> buffer(size ? size : 1, 0);
     uint8_t failed = 0;
     typedef uint8_t (*Fn)(void *, uint64_t, void *, int32_t, int32_t, uint8_t *);
     uint8_t ret = ((Fn)bridge::slot(obj, slot))(obj, call, buffer.data(), (int32_t)size, expected, has_failed ? &failed : NULL);
     p.w.u8(ret ? 1 : 0);
     p.w.u8(failed ? 1 : 0);
     p.w.blob(buffer.data(), size);
+    return true;
 }
 
 namespace {
@@ -342,22 +420,10 @@ bool serve_frame(SOCKET s, std::vector<uint8_t> &frame, Greeting &greeting) {
     }
     if (greeting == kKeepalive) return false;
 
-    uint32_t status = bridge::kStatusOK;
-    if (q.method < bridge::kFirstGeneratedMethod) {
-        if (!serve_special(q, p)) status = bridge::kStatusUnknownMethod;
-    } else {
-        uint32_t index = q.method - bridge::kFirstGeneratedMethod;
-        if (index >= bridge_handler_count || !bridge_handlers[index]) {
-            logf_("no handler for method %u (%s)", q.method, method_name(q.method));
-            status = bridge::kStatusUnknownMethod;
-        } else {
-            if (g_tracing) logf_("%s obj %p", method_name(q.method), q.object());
-            bridge_handlers[index](q, p);
-        }
-    }
-    if (q.r.failed) {
-        logf_("%s: short request", method_name(q.method));
-        status = bridge::kStatusBadRequest;
+    uint32_t status = q.method < bridge::kFirstGeneratedMethod ? serve_special(q, p) : serve_generated(q, p);
+    if (status == bridge::kStatusBadRequest) {
+        logf_("%s: malformed request, refused", method_name(q.method));
+        p.w.buf.clear();
     }
     return reply(s, p, status);
 }

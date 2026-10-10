@@ -287,7 +287,7 @@ void Call::put_in(const void *p, uint32_t count, uint32_t msize, uint32_t wsize,
     }
     std::vector<uint8_t> tmp;
     elements_to_win(tmp, p, count, msize, wsize, runs, n);
-    w.blob(tmp.data(), (uint32_t)tmp.size());
+    w.blob(tmp.empty() ? "" : (const void *)tmp.data(), (uint32_t)tmp.size());
 }
 
 void Call::put_inout(const void *p, uint32_t count, uint32_t msize, uint32_t wsize, const Run *runs, size_t n) {
@@ -296,7 +296,7 @@ void Call::put_inout(const void *p, uint32_t count, uint32_t msize, uint32_t wsi
     std::vector<uint8_t> tmp;
     elements_to_win(tmp, p, count, msize, wsize, runs, n);
     w.u32((uint32_t)tmp.size());
-    w.blob(tmp.data(), (uint32_t)tmp.size());
+    w.blob(tmp.empty() ? "" : (const void *)tmp.data(), (uint32_t)tmp.size());
 }
 
 void Call::get_inout(void *p, uint32_t count, uint32_t msize, uint32_t wsize, const Run *runs, size_t n) {
@@ -366,6 +366,12 @@ void note_local(const char *method) {
 void note_unsupported(const char *method) {
     std::lock_guard<std::mutex> guard(notes_lock);
     if (noted.insert(method).second) log("%s is not bridged yet: answering zero", method);
+}
+
+void note_refused(const char *method, const char *param) {
+    std::lock_guard<std::mutex> guard(notes_lock);
+    if (noted.insert(std::string(method) + "/" + param).second)
+        log("%s: %s holds a string or pointer option, which the bridge cannot carry: the call fails", method, param);
 }
 
 // MARK: - Paths

@@ -142,9 +142,19 @@ _INPUT_ARRAYS = {
     "GetAnalogActionOrigins": {"originsOut": "fixed:8"},
     "GetActiveActionSetLayers": {"handlesOut": "fixed:16"},  # STEAM_{INPUT,CONTROLLER}_MAX_ACTIVE_LAYERS
 }
+# Connection setup takes its options as `int nOptions, const SteamNetworkingConfigValue_t
+# *pOptions`, the count first.
+_OPTION_ARRAYS = ("CreateListenSocketIP", "ConnectByIPAddress", "CreateListenSocketP2P", "ConnectP2P",
+                  "ConnectToHostedDedicatedServer", "CreateHostedDedicatedServerListenSocket",
+                  "CreateListenSocketP2PFakeIP", "ConnectP2PCustomSignaling")
 PARAM_OVERRIDES = {
     **{f"{klass}_{method}": decisions for klass in ("ISteamInput", "ISteamController")
        for method, decisions in _INPUT_ARRAYS.items()},
+    **{f"ISteamNetworkingSockets_{method}": {"pOptions": "count:nOptions"} for method in _OPTION_ARRAYS},
+    "ISteamNetworkingSockets_ConfigureConnectionLanes": {"pLanePriorities": "count:nNumLanes",
+                                                         "pLaneWeights": "count:nNumLanes"},
+    "ISteamUserStats_GetDownloadedLeaderboardEntry": {"pLeaderboardEntry": "single"},
+    "ISteamNetworkingSockets_SendMessages": {"pOutMessageNumberOrResult": "count:nMessages"},
     "ISteamInventory_GetResultItems": {"pOutItemsArray": "count:punOutItemsArraySize"},
     "ISteamInventory_GetItemDefinitionIDs": {"pItemDefIDs": "count:punItemDefIDsArraySize"},
     "ISteamInventory_GetEligiblePromoItemDefinitionIDs": {"pItemDefIDs": "count:punItemDefIDsArraySize"},
@@ -167,9 +177,23 @@ PARAM_OVERRIDES = {
     "ISteamInventory_GetAllItems": {"pResultHandle": "single"},
 }
 
+# Records holding a pointer in a union arm that still travel as bytes when a tag field
+# says which arm is live: "record": (tag field, {allowed tag values}). Every element is
+# checked on both sides before a call; any other tag fails the call (the method's zero
+# answer), since a pointer from one process means nothing in the other.
+# ESteamNetworkingConfigDataType: Int32 = 1, Int64 = 2, Float = 3 (String = 4 and Ptr = 5
+# carry addresses).
+TAGGED_RECORDS = {
+    "SteamNetworkingConfigValue_t": ("m_eDataType", {"Int32": 1, "Int64": 2, "Float": 3}),
+}
+
 DEFINE_INTERFACE_VERSION = re.compile(r'^#define\s*(?P<name>STEAM(?:\w*)_VERSION(?:\w*))\s*"(?P<version>.*)"')
 
 # --- parsing ---------------------------------------------------------------------------
+
+# The shape of the parsed-SDK data `parse_sdk` produces; a cache of another shape is
+# parsed again.
+PARSE_SCHEMA = 2
 
 MINGW_TRIPLE = "x86_64-w64-mingw32"
 MINGW_INCLUDE_FALLBACK = f"/opt/homebrew/opt/mingw-w64/toolchain-x86_64/{MINGW_TRIPLE}/include"
@@ -299,9 +323,9 @@ def parse_sdk(sdk_root, sdkver, target):
                 for e in ch.get_children():
                     if e.displayname == "k_iCallback":
                         rec["callback_id"] = int(e.enum_value)
-        if rec["union"]:
-            return rec
 
+        # A union's arms are recorded like a struct's fields (all at offset 0), so the
+        # pointer check sees every arm; its layout stays one opaque leaf (`leaves`).
         def add_fields(cursor):
             for f in cursor.type.get_fields():
                 if f.is_bitfield():
@@ -453,8 +477,8 @@ def has_pointers(t):
 
 
 def record_has_pointers(rec):
-    if rec["union"] or rec["bitfields"]:
-        return False
+    """Whether a pointer sits anywhere in a record: fields, nested records, union arms
+    and the fields of a record with bitfields alike."""
     return any(has_pointers(f["type"]) for f in rec["fields"])
 
 
@@ -514,6 +538,7 @@ class Param:
         self.elem = None          # element type (array kinds) / record type
         self.path_in = False      # a macOS path the client must see as Windows
         self.path_out = None      # the count parameter of an out-buffer carrying a Windows path
+        self.tag = None           # (tag field, {name: value}) of a TAGGED_RECORDS element
 
 
 class MethodModel:
@@ -609,6 +634,10 @@ def classify_method(mm):
             q, via_ptr = count
             p.count, p.count_ptr, p.count_bytes = q.name, via_ptr, counts_bytes(q.name)
             continue
+        q = stem_count(params, i)
+        if q is not None:
+            p.count, p.count_ptr, p.count_bytes = q.name, q.type["k"] == "ptr", counts_bytes(q.name)
+            continue
         if is_bytes_type:
             p.kind, p.reason = "unsupported", f"{p.name}: {t['spell']} with no size"
             continue
@@ -622,11 +651,21 @@ def classify_method(mm):
             if p.elem.get("size", 0) == 0:
                 p.kind, p.reason = "unsupported", f"{p.name}: incomplete {p.elem['name']}"
         if p.kind in ("record", "array") and p.elem["k"] == "record" and has_pointers_named(p.elem):
-            p.kind, p.reason = "unsupported", f"{p.name}: {p.elem['name']} holds pointers"
+            if p.elem["name"] in TAGGED_RECORDS:
+                p.tag = TAGGED_RECORDS[p.elem["name"]]
+            else:
+                p.kind, p.reason = "unsupported", f"{p.name}: {p.elem['name']} holds pointers"
         if p.kind == "array" and p.elem["k"] in ("class", "ptr", "ref", "funcptr", "other", "void") and p.elem["k"] != "void":
             p.kind, p.reason = "unsupported", f"{p.name}: array of {p.elem['spell']}"
         if p.kind == "array" and p.elem["k"] == "void":
             p.elem = {"k": "uint", "size": 1, "spell": "uint8_t"}
+    # A pointer no rule sized is one element only while nothing in the signature could
+    # count it; otherwise it needs a PARAM_OVERRIDES decision.
+    candidates = count_candidates(params)
+    for p in params:
+        if p.kind == "array" and p.guessed_single and p.type["k"] == "ptr" and candidates:
+            p.kind = "unsupported"
+            p.reason = f"{p.name}: no size rule while {', '.join(candidates)} could count it"
     if any(p.kind == "funcptr" for p in params):
         mm.local = True
 
@@ -691,6 +730,44 @@ def find_count(params, i):
     return None
 
 
+POINTER_STEM = re.compile(r"^(?:prg|pvec|pArray|pv|p)(?=[A-Z])")
+COUNT_STEM_PREFIX = re.compile(r"^(?:cub|cch|cb|num|un|n|c)(?=[A-Z])")
+COUNT_STEM_SUFFIX = re.compile(r"(?:Count|Size|Max|Len)$")
+
+
+def stem_count(params, i):
+    """The integer parameter, on either side of pointer params[i], that names the same
+    thing: `nOptions` for `pOptions`, `cItems` for `prgItems`, `cubBlobSize` for
+    `pBlob`. None when no parameter names it, or when several do."""
+    m = POINTER_STEM.match(params[i].name)
+    if not m:
+        return None
+    stem = params[i].name[m.end():]
+    found = []
+    for q in params:
+        if q is params[i] or not is_int(q.type):
+            continue
+        cm = COUNT_STEM_PREFIX.match(q.name)
+        if cm and COUNT_STEM_SUFFIX.sub("", q.name[cm.end():]) == stem:
+            found.append(q)
+    return found[0] if len(found) == 1 else None
+
+
+def count_candidates(params):
+    """Integer parameters named like counts that size no pointer: `cDetailsMax`,
+    `nOptions`, `unEntries`. A pointer taken for one element beside one of these may
+    really be the array it counts."""
+    claimed = {p.count for p in params if p.count}
+    out = []
+    for q in params:
+        if q.kind != "scalar" or not is_int(q.type) or q.name in claimed:
+            continue
+        plural_n = re.match(r"^n[A-Z]", q.name) and q.name.endswith("s") and not SINGULAR_S.search(q.name)
+        if is_count_name(q.name) or plural_n:
+            out.append(q.name)
+    return out
+
+
 ARRAY_LOOKING = re.compile(r"(Out|List|list|Array|array|Arr|Vec)$|^(prg|pvec|pArray)")
 SINGULAR_S = re.compile(r"(ss|us|is|Details|Stats|Status|Flags|Bytes|Progress)$")
 
@@ -698,7 +775,8 @@ SINGULAR_S = re.compile(r"(ss|us|is|Details|Stats|Status|Flags|Bytes|Progress)$"
 def looks_like_array(name):
     """Whether a pointer the rules took for one element is named like several: *Out,
     *List, *Array, prg*/pvec*, or a plural. Such a guess sized wrong overflows the
-    helper's buffer, so each one needs a PARAM_OVERRIDES decision."""
+    helper's buffer (writable) or hands the callee a count past the copy (read-only),
+    so each one needs a PARAM_OVERRIDES decision."""
     if is_count_name(name):
         return False
     if ARRAY_LOOKING.search(name):
@@ -707,14 +785,15 @@ def looks_like_array(name):
 
 
 def guessed_arrays(interfaces):
-    """Every writable pointer guessed to be a single element whose name says otherwise."""
+    """Every pointer, writable or read-only, guessed to be a single element whose name
+    says otherwise."""
     found = set()
     for iface in interfaces:
         for mm in iface["methods"]:
             if mm.m["dtor"] or mm.unsupported or mm.local:
                 continue
             for p in mm.params:
-                if p.kind == "array" and p.guessed_single and p.inout and looks_like_array(p.name):
+                if p.kind == "array" and p.guessed_single and looks_like_array(p.name):
                     found.add(f"{mm.key} {p.name} ({p.type['spell']})")
     return sorted(found)
 
@@ -768,6 +847,29 @@ class Emitter:
         if runs is None:
             return None
         return win["size"], mac["size"], runs
+
+    def tag_info(self, sdkver, name, target):
+        """(tag field offset, mask of allowed tag values) of a TAGGED_RECORDS record on
+        one target. Refuses a record whose pointers sit outside its union arms, or whose
+        tag is no 4-byte integer."""
+        rec = self.parsed[sdkver][target]["records"].get(name)
+        if rec is None:
+            raise GenError(f"no {target} layout for tagged record {name}")
+        field, allowed = TAGGED_RECORDS[name]
+        for f in rec["fields"]:
+            inner = f["type"]
+            in_union = inner["k"] == "record" and "record" in inner and inner["record"]["union"]
+            if not in_union and has_pointers(inner):
+                raise GenError(f"{name}.{f['name']} holds a pointer outside a tagged union")
+        tag = next((f for f in rec["fields"] if f["name"] == field), None)
+        if tag is None or tag["type"]["k"] not in ("int", "uint", "enum") or tag["type"].get("size") != 4:
+            raise GenError(f"{name}.{field} is no 4-byte tag")
+        mask = 0
+        for value in allowed.values():
+            if not 0 <= value < 32:
+                raise GenError(f"{name}: tag value {value} is outside the 32-bit mask")
+            mask |= 1 << value
+        return tag["off"], mask
 
     def runs_decl(self, name, runs, sdkver):
         if not runs:
@@ -858,6 +960,24 @@ def emit_mac_method(em, mm, sdkver, method_id):
     if mm.special == "apicallresult":
         return emit_mac_apicallresult(mm, method_id)
 
+    for p in mm.params:
+        if not p.tag:
+            continue
+        name = p.elem["name"]
+        info = em.record_info(sdkver, name)
+        if info is None:
+            raise GenError(f"{mm.full}: no layout for {name}")
+        msize = info[1]
+        off, mask = em.tag_info(sdkver, name, "mac")
+        if p.kind == "record":
+            ptr, count = f"&{p.name}", "1"
+        else:
+            ptr = f"&{p.name}" if p.type["k"] == "ref" else p.name
+            count = array_count_expr(p, msize)
+        out.append(f"        if (!bridge::tags_allowed({ptr}, {count}, {msize}, {off}, {mask:#x}u)) {{")
+        out.append(f'            bridge::note_refused("{mm.full}", "{p.name}");')
+        out.append("            " + mac_zero_return(mm).strip())
+        out.append("        }")
     out.append(f"        bridge::Call c(handle_, {method_id});")
     post = []
     for p in mm.params:
@@ -994,20 +1114,24 @@ def emit_win_class(em, iface, sdkver):
     lines.append("}  // namespace")
     lines.append("")
     for mm in handlers:
-        lines.append(f"void bridge_h_{mm.full}(bridge::Req &q, bridge::Rep &p) {{ h_{mm.name}(q, p); }}")
+        lines.append(f"bool bridge_h_{mm.full}(bridge::Req &q, bridge::Rep &p) {{ return h_{mm.name}(q, p); }}")
     write_if_changed(os.path.join(em.out, "win", f"{full}.cpp"), "\n".join(lines) + "\n")
 
 
 def emit_win_method(em, mm, sdkver):
+    """One handler: decode the whole request, refuse it (false, nothing called) when it
+    is short, long, malformed or carries a refused tag, then call the slot and write the
+    results."""
     if mm.special == "apicallresult":
         return "\n".join([
-            f"void h_{mm.name}(bridge::Req &q, bridge::Rep &p) {{",
-            f"    bridge::api_call_result(q, p, {mm.slot});",
+            f"bool h_{mm.name}(bridge::Req &q, bridge::Rep &p) {{",
+            f"    return bridge::api_call_result(q, p, {mm.slot});",
             "}",
         ])
-    out = [f"void h_{mm.name}(bridge::Req &q, bridge::Rep &p) {{", "    void *obj = q.object();"]
+    out = [f"bool h_{mm.name}(bridge::Req &q, bridge::Rep &p) {{", "    void *obj = q.target;"]
     fn_params = ["void *"]
     args = ["obj"]
+    checks = []
     post = []
     for p in mm.params:
         t = p.type
@@ -1025,6 +1149,9 @@ def emit_win_method(em, mm, sdkver):
             info = em.record_info(sdkver, t["name"])
             wsize = info[0]
             out.append(f"    bridge::Blob {v} = q.get_struct({wsize});")
+            if p.tag:
+                off, mask = em.tag_info(sdkver, t["name"], "win")
+                checks.append(f"    if (!bridge::tags_allowed({v}.data, 1, {wsize}, {off}, {mask:#x}u)) return false;")
             if wsize in (1, 2, 4, 8):
                 ct = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}[wsize]
                 fn_params.append(ct)
@@ -1033,18 +1160,23 @@ def emit_win_method(em, mm, sdkver):
                 fn_params.append("const void *")
                 args.append(f"{v}.data")
         elif p.kind == "array":
-            # A fixed-size array is allocated at its full Windows size whatever the
-            # game sent, since the callee fills all of it.
-            least = f"{p.fixed * win_elem_size(em, sdkver, p)}" if p.fixed is not None else ""
+            # Elements arrive whole; a fixed-size array arrives at exactly its Windows size.
+            unit = win_elem_size(em, sdkver, p)
+            exact = f", {p.fixed * unit}" if p.fixed is not None else ""
             if p.inout:
-                out.append(f"    bridge::InOut {v} = q.get_inout({least});")
+                out.append(f"    bridge::InOut {v} = q.get_inout({unit}{exact});")
                 post.append(f"    p.put_inout({v});")
                 fn_params.append("void *")
                 args.append(f"{v}.ptr()")
+                data, size = f"{v}.ptr()", f"{v}.capacity"
             else:
-                out.append(f"    bridge::Blob {v} = q.get_in({least});")
+                out.append(f"    bridge::Blob {v} = q.get_in({unit}{exact});")
                 fn_params.append("const void *")
                 args.append(f"{v}.data")
+                data, size = f"{v}.data", f"{v}.size"
+            if p.tag:
+                off, mask = em.tag_info(sdkver, p.elem["name"], "win")
+                checks.append(f"    if (!bridge::tags_allowed({data}, {size} / {unit}, {unit}, {off}, {mask:#x}u)) return false;")
         elif p.kind == "outstr":
             out.append(f"    uint8_t has_{p.name} = q.r.u8(); const char *s_{p.name} = nullptr;")
             fn_params.append("const char **")
@@ -1052,6 +1184,8 @@ def emit_win_method(em, mm, sdkver):
             post.append(f"    if (has_{p.name}) p.w.str(s_{p.name});")
         else:
             raise GenError(f"{mm.full}: {p.name} unclassified")
+    out.append("    if (!q.done()) return false;")
+    out.extend(checks)
     out.extend(win_count_limits(em, mm, sdkver))
     r = mm.m["result"]
     if mm.ret == "record":
@@ -1085,9 +1219,12 @@ def emit_win_method(em, mm, sdkver):
         out.append(f"    const char *ret = {call};")
         out.append("    p.w.str(ret);")
     elif mm.ret == "iface":
+        version = "a_pchVersion" if any(p.name == "pchVersion" for p in mm.params) \
+            else f'"{FIXED_RETURN_VERSIONS[mm.m["spelling"]]}"'
         out.append(f"    void *ret = {call};")
-        out.append("    p.w.u64((uint64_t)(uintptr_t)ret);")
+        out.append(f"    p.w.u64(bridge::issue_handle(ret, {version}));")
     out.extend(post)
+    out.append("    return true;")
     out.append("}")
     return "\n".join(out)
 
@@ -1236,11 +1373,70 @@ def protocol_hash(method_names, signatures, callbacks):
     return int.from_bytes(h.digest()[:8], "little")
 
 
-def wire_signature(mm):
+def record_signature(em, sdkver, name):
+    """A record's wire identity: both layouts (size, alignment, every scalar leaf's offset
+    and size) and the conversion runs between them."""
+    out = [name]
+    for target in ("win", "mac"):
+        rec = em.parsed[sdkver][target]["records"].get(name)
+        if rec is None:
+            out.append(f"{target}:none")
+            continue
+        found = []
+        leaves(rec, 0, found)
+        out.append(f"{target}:{rec['size']}/{rec['align']}:{found}")
+    info = em.record_info(sdkver, name)
+    out.append(f"runs:{info[2] if info else None}")
+    if name in TAGGED_RECORDS:
+        out.append(f"tag:{em.tag_info(sdkver, name, 'win')}:{em.tag_info(sdkver, name, 'mac')}")
+    return "{" + ";".join(out) + "}"
+
+
+def type_signature(em, sdkver, t):
+    """A value's wire identity: the scalar it travels as, or the record's layouts."""
+    k = t["k"]
+    if k in ("bool", "int", "uint", "float", "double", "enum"):
+        return wire_fn(t)
+    if k == "record":
+        return record_signature(em, sdkver, t["name"])
+    return f"{k}:{type_size(t)}"
+
+
+def wire_signature(em, mm):
+    """Everything both halves must agree on for one method: its interface, slot and
+    special handling, each parameter's kind with its scalar widths, record layouts, size
+    rule and conversion rules (paths, tags), and the same for the result."""
+    sdkver = mm.sdkver
     parts = []
     for p in mm.params:
-        parts.append(f"{p.kind}:{p.count or ''}:{int(bool(p.count_ptr))}:{int(bool(p.count_bytes))}:{p.fixed}:{int(p.inout)}")
-    return f"{mm.ret}|" + ",".join(parts) + f"|{mm.slot}|{mm.special or ''}"
+        part = [p.kind]
+        if p.kind == "scalar":
+            part.append(type_signature(em, sdkver, p.type))
+        elif p.kind == "record":
+            part.append(type_signature(em, sdkver, p.type))
+        elif p.kind == "array":
+            part.append(type_signature(em, sdkver, p.elem))
+            part.append(f"count={p.count or ''}:{int(bool(p.count_ptr))}:{int(bool(p.count_bytes))}:{p.fixed}")
+            part.append(f"inout={int(p.inout)}:ref={int(p.always)}")
+        elif p.kind == "string":
+            part.append(f"path_in={int(p.path_in)}")
+        if p.path_out:
+            part.append(f"path_out={p.path_out}")
+        if p.tag:
+            part.append(f"tag={p.tag[0]}:{sorted(p.tag[1].values())}")
+        parts.append(":".join(part))
+    r = mm.m["result"]
+    ret = mm.ret
+    if mm.ret in ("scalar", "record"):
+        ret += ":" + type_signature(em, sdkver, r)
+    elif mm.ret == "string":
+        ret += f":path={int(mm.key in PATH_CONV_RETURN)}"
+    elif mm.ret == "iface":
+        ret += ":" + ("pchVersion" if any(p.name == "pchVersion" for p in mm.params)
+                      else FIXED_RETURN_VERSIONS[mm.m["spelling"]])
+    state = "local" if mm.local else "unsupported" if mm.unsupported else "bridged"
+    return (f"{mm.klass['version']}|{state}|{ret}|" + ",".join(parts) +
+            f"|{mm.slot}|{mm.special or ''}")
 
 
 def main():
@@ -1263,14 +1459,14 @@ def main():
     parsed = None
     if args.cache and not args.reparse and os.path.exists(args.cache):
         with open(args.cache) as f:
-            parsed = json.load(f)
-        if sorted(parsed) != sorted(present):
-            parsed = None
+            cached = json.load(f)
+        if cached.get("schema") == PARSE_SCHEMA and sorted(cached.get("sdks", {})) == sorted(present):
+            parsed = cached["sdks"]
     if parsed is None:
         parsed = parse_all(sdk_root, present, args.jobs)
         if args.cache:
             with open(args.cache, "w") as f:
-                json.dump(parsed, f)
+                json.dump({"schema": PARSE_SCHEMA, "sdks": parsed}, f)
 
     # The x86_64 macOS parse exists to prove the arm64 layouts hold there too.
     for sdkver, sdk in parsed.items():
@@ -1288,8 +1484,6 @@ def main():
     only = [v for v in args.only.split(",") if v] if args.only else None
     chosen, missing = choose_interfaces(parsed, only)
 
-    sdk_rel = args.sdk_include or sdk_root
-    em = Emitter(None, args.out, parsed, sdk_rel)
 
     interfaces = []
     for version in sorted(chosen):
@@ -1307,6 +1501,9 @@ def main():
             methods.append(mm)
         interfaces.append({"klass": klass, "sdkver": sdkver, "methods": methods, "version": version})
 
+    sdk_rel = args.sdk_include or sdk_root
+    em = Emitter(None, args.out, parsed, sdk_rel)
+
     suspects = guessed_arrays(interfaces)
     if suspects:
         sys.exit("pointers sized as one element but named like arrays; give each a PARAM_OVERRIDES "
@@ -1318,7 +1515,7 @@ def main():
     for mm in all_methods:
         method_ids[mm.full] = next_id
         next_id += 1
-    signatures = {mm.full: wire_signature(mm) for mm in all_methods}
+    signatures = {mm.full: wire_signature(em, mm) for mm in all_methods}
     callbacks = build_callbacks(parsed, present)
     phash = protocol_hash([mm.full for mm in all_methods], signatures, callbacks)
 
@@ -1374,7 +1571,23 @@ def emit_tables(em, interfaces, all_methods, method_ids, callbacks, phash, chose
     for mm in all_methods:
         if mm.local or mm.unsupported:
             continue
-        lines.append(f"void bridge_h_{mm.full}(bridge::Req &, bridge::Rep &);")
+        lines.append(f"bool bridge_h_{mm.full}(bridge::Req &, bridge::Rep &);")
+    lines.append("")
+    # Every name an interface object can be issued under (aliases included), with the
+    # index of the interface version whose methods it serves.
+    iface_index = {iface["version"]: i for i, iface in enumerate(interfaces)}
+    lines.append("const bridge::InterfaceName bridge_interface_names[] = {")
+    for iface in interfaces:
+        i = iface_index[iface["version"]]
+        lines.append(f'    {{"{iface["version"]}", {i}}},')
+        for alias in VERSION_ALIASES.get(iface["version"], []):
+            lines.append(f'    {{"{alias}", {i}}},')
+    lines.append("};")
+    lines.append("const size_t bridge_interface_name_count = sizeof(bridge_interface_names) / sizeof(bridge_interface_names[0]);")
+    lines.append("const uint16_t bridge_method_interfaces[] = {")
+    for mm in all_methods:
+        lines.append(f"    {iface_index[mm.klass['version']]},  // {mm.full}")
+    lines.append("};")
     lines.append("")
     lines.append("const bridge::Handler bridge_handlers[] = {")
     for mm in all_methods:
@@ -1441,7 +1654,9 @@ def emit_report(em, interfaces, missing, callbacks, phash):
                     else:
                         how = f"{'bytes' if p.count_bytes else 'elements'} = {'*' if p.count_ptr else ''}{p.count}"
                     io = "in/out" if p.inout else "in"
-                    rows.append(f"- `{mm.name}` `{p.name}` ({p.type['spell']}): {how}, {io}")
+                    rows.append(f"- `{mm.name}` `{p.name}` ({p.type['spell']}): {how}, {io}{tag_note(p)}")
+                elif p.kind == "record" and p.tag:
+                    rows.append(f"- `{mm.name}` `{p.name}` ({p.type['spell']}): by value{tag_note(p)}")
                 elif p.kind == "outstr":
                     rows.append(f"- `{mm.name}` `{p.name}`: out string pointer")
         if rows:
@@ -1449,7 +1664,24 @@ def emit_report(em, interfaces, missing, callbacks, phash):
             lines.append("")
             lines.extend(rows)
             lines.append("")
+    held = [(cid, name, sdkver) for cid, w, m, runs, name, sdkver in callbacks
+            if em.parsed[sdkver]["win"]["records"][name].get("_has_pointers")]
+    if held:
+        lines.append("## Callbacks holding pointers")
+        lines.append("")
+        lines.append("Their pointer fields reach the game as Windows addresses of the helper.")
+        lines.append("")
+        for cid, name, sdkver in held:
+            lines.append(f"- `{name}` ({cid}, SDK {sdkver})")
+        lines.append("")
     write_if_changed(os.path.join(em.out, "REPORT.md"), "\n".join(lines) + "\n")
+
+
+def tag_note(p):
+    if not p.tag:
+        return ""
+    field, allowed = p.tag
+    return f", tag `{field}` ∈ {{{', '.join(allowed)}}}"
 
 
 if __name__ == "__main__":

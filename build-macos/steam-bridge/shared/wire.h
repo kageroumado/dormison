@@ -3,7 +3,7 @@
 // Steamworks or platform headers, so the generated code on either side includes it.
 //
 // Every frame is little-endian. A request is
-//     u32 length (of everything after this field)  u32 method  u64 object  payload
+//     u32 length (of everything after this field)  u32 method  u64 object handle  payload
 // and a reply is
 //     u32 length  u32 status  payload
 // The payload layout of each method is fixed by the generator, identically on both
@@ -138,15 +138,34 @@ struct Reader {
         *n = len;
         return at;
     }
-    // A string blob as a C string: nullptr for null, "" for a malformed one.
+    // A string blob as a C string, nullptr for null. A blob that does not end in its NUL
+    // fails the reader.
     const char *str() {
         uint32_t n;
         const uint8_t *b = blob(&n);
         if (!b) return nullptr;
-        if (n == 0 || b[n - 1] != 0) return "";
+        if (n == 0 || b[n - 1] != 0) {
+            failed = true;
+            return nullptr;
+        }
         return reinterpret_cast<const char *>(b);
     }
+    // Whether everything was read, exactly: nothing short, nothing left over.
+    bool done() const { return !failed && p == end; }
 };
+
+// Whether every one of `count` records of `size` bytes at `p` carries a 4-byte tag at
+// `offset` whose value is a bit set in `mask`. A null `p` passes: there is nothing to read.
+inline bool tags_allowed(const void *p, uint32_t count, uint32_t size, uint32_t offset, uint32_t mask) {
+    if (!p) return true;
+    const uint8_t *b = static_cast<const uint8_t *>(p);
+    for (uint32_t i = 0; i < count; i++) {
+        int32_t tag;
+        std::memcpy(&tag, b + (size_t)i * size + offset, sizeof tag);
+        if (tag < 0 || tag >= 32 || !(mask & (1u << tag))) return false;
+    }
+    return true;
+}
 
 // One copy in a struct conversion: `len` bytes at `win` on the Windows side are the
 // bytes at `mac` on the macOS side. A struct whose layouts match needs no runs.
