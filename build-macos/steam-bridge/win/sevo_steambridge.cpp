@@ -351,6 +351,10 @@ int main() {
     logf_("sevo-steambridge starting, app %s, protocol %016llx", appid ? appid : "(unset)",
           (unsigned long long)bridge_protocol_hash);
     if (!appid) logf_("SteamAppId is not set: steamclient will not know the game");
+    if (g_token.empty()) {
+        logf_("SEVO_STEAM_BRIDGE_TOKEN is not set: nothing could tell the game's connections from anyone else's, so not listening");
+        return 1;
+    }
 
     if (!load_steamclient()) return 1;
 

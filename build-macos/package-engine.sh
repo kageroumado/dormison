@@ -226,10 +226,10 @@ mpegpsdemux applemedia deinterlace libav"
         done
         queue="$next"
     done
-    FEATURES='"env-files", "discord-bridge", "media", "fps-unlock"'
+    FEATURES='"env-files", "discord-bridge", "media", "fps-unlock", "steam-play-macos"'
 else
     echo "warning: no GStreamer at $GST — run build-macos/fetch-gstreamer.sh; video stays silent and black"
-    FEATURES='"env-files", "discord-bridge", "fps-unlock"'
+    FEATURES='"env-files", "discord-bridge", "fps-unlock", "steam-play-macos"'
 fi
 
 # --- pieces DXMT and D3DMetal contribute that a wine build does not produce ---
@@ -285,7 +285,7 @@ fi
 
 # --- the dock shim, from this repository's source: it is the engine's face ---
 echo "==> building the dock shim"
-clang -arch arm64 -arch x86_64 -O2 -Wall -dynamiclib -framework ApplicationServices \
+clang -arch arm64 -arch x86_64 -O2 -Wall -dynamiclib -framework ApplicationServices -framework Security \
     -o "$OUT/libsevodockshim.dylib" "$HERE/dock-shim/sevo_dock_shim.c"
 codesign -s - -f "$OUT/libsevodockshim.dylib"
 record source "$OUT/libsevodockshim.dylib"
@@ -294,6 +294,19 @@ record source "$OUT/libsevodockshim.dylib"
 make -s -C "$HERE/steam-stub"
 cp "$HERE/steam-stub/sevo-steamstub.exe" "$HERE/steam-stub/sevo-steamstub32.exe" "$OUT/"
 record source "$OUT/sevo-steamstub.exe" "$OUT/sevo-steamstub32.exe"
+
+# --- the Steam bridge a native macOS game's Steamworks goes through
+# (steam-bridge/DESIGN.md): generated from the SDK headers fetch-sdk.sh assembles
+# from a pinned Proton commit, built into the bridge's own build directory. ---
+echo "==> building the steam bridge"
+BRIDGE="$ROOT/steam-bridge"
+make -s -C "$HERE/steam-bridge" sdk venv generate | sed 's/^/    /'
+make -s -j8 -C "$HERE/steam-bridge" mac win ipc native | sed 's/^/    /'
+mkdir -p "$OUT/steam-bridge"
+cp "$BRIDGE/out/steamclient.dylib" "$BRIDGE/out/libsevosteamipc.dylib" "$OUT/steam-bridge/"
+cp "$BRIDGE/out/sevo-steambridge.exe" "$BRIDGE/out/sevo-native.exe" "$OUT/"
+cp "$BRIDGE/generated/REPORT.md" "$OUT/steam-bridge/REPORT.md"
+record source "$OUT/steam-bridge" "$OUT/sevo-steambridge.exe" "$OUT/sevo-native.exe"
 
 # --- the Discord relay a game in the bottle reaches the Mac client through ---
 make -s -C "$HERE/discord-bridge"

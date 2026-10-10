@@ -4,7 +4,10 @@
 #
 #   make sdk                 assemble the SDK headers (fetch-sdk.sh)
 #   make generate            run the generator (ONLY=SteamUser021,... narrows it)
-#   make -j12 mac win ipc    build the three artifacts into $(OUT)
+#   make -j12 mac win ipc native   build the four artifacts into $(OUT)
+#
+# The generator needs libclang's Python binding; `make venv` makes a venv with it under
+# $(BUILD) and PYTHON defaults to that venv's interpreter.
 #
 # `generate` must finish before `mac`/`win` are evaluated, since their source lists come
 # from the generator; run it as its own invocation.
@@ -14,18 +17,25 @@ GEN := $(BUILD)/generated
 OBJ := $(BUILD)/obj
 OUT := $(BUILD)/out
 SDK := $(BUILD)/sdk
-PYTHON ?= python3
+VENV := $(BUILD)/venv
+PYTHON ?= $(VENV)/bin/python
 ONLY ?=
 HERE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-.PHONY: all sdk generate mac win ipc clean
+.PHONY: all sdk venv generate mac win ipc native clean
 
-all: mac win ipc
+all: mac win ipc native
 
 sdk:
 	$(HERE)fetch-sdk.sh $(SDK)
 
-generate:
+venv: $(VENV)/bin/python
+
+$(VENV)/bin/python:
+	python3 -m venv $(VENV)
+	$(VENV)/bin/pip install --quiet libclang
+
+generate: $(if $(filter $(VENV)/bin/python,$(PYTHON)),$(VENV)/bin/python)
 	@mkdir -p $(GEN)
 	$(PYTHON) $(HERE)gen/gen_bridge.py --sdk-root $(SDK) --out $(GEN) --cache $(BUILD)/parsed.json \
 	    --sdk-include sdk $(if $(ONLY),--only $(ONLY))
@@ -72,6 +82,12 @@ $(OUT)/sevo-steambridge.exe: $(WIN_OBJS)
 	$(WINCXX) -static -static-libgcc -static-libstdc++ -mwindows -o $@ $^ -lws2_32
 
 win: $(OUT)/sevo-steambridge.exe
+
+$(OUT)/sevo-native.exe: $(HERE)win/sevo_native.c
+	@mkdir -p $(dir $@)
+	x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -municode -o $@ $<
+
+native: $(OUT)/sevo-native.exe
 
 # --- the ipcserver stand-in a game's libsteam_api asks for Steam's path ---
 $(OUT)/libsevosteamipc.dylib: $(HERE)mac/sevo_steam_ipc.c

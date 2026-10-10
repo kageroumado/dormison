@@ -4,6 +4,23 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>` for a release, `b<N>` for a beta) as the GitHub
 release body.
 
+## b3
+
+- Native macOS builds of Steam games run through the bottle's own Steam. With
+  `SEVO_STEAM_PLAY=1` in `steam.exe`'s environment the client's dormant Steam Play system is
+  switched on as `steamclient64.dll` loads, so a game mapped to the app's macOS tool gets its
+  macOS depots on install and update. When Steam launches such a game (shell-opening its
+  `.app`), the dock shim execs the bundle's executable in place, same pid, with the Windows
+  client's files given their executable bits.
+- The Steam bridge: such a game's `libsteam_api.dylib` finds `steamclient.dylib` through
+  `libsevosteamipc.dylib` and reaches the signed-in Windows client through
+  `sevo-steambridge.exe` in the bottle, which loads the real `steamclient64.dll`. Every
+  Steamworks interface version in SDKs 0.99u through 1.65 is served, generated from the SDK
+  headers with struct layouts converted between the two ABIs; achievements, stats, Remote
+  Storage saves, callbacks and async call results work; workshop tags, networking message
+  buffers and game-side listener objects are not bridged yet (`steam-bridge/REPORT.md`).
+  Engines declare it as `steam-play-macos`.
+
 ## b2
 
 - A frame limiter for every game the engine presents: Metal (D3DMetal, DXMT, DXVK over
