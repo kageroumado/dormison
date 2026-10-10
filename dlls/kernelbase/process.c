@@ -416,14 +416,57 @@ static NTSTATUS create_cmd_process( HANDLE token, HANDLE debug, SECURITY_ATTRIBU
 
 
 /***********************************************************************
+ *           match_path_component
+ *
+ * Whether `p` starts with `text`, case-insensitively, a backslash in `text`
+ * matching either separator.
+ */
+static BOOL match_path_component( const WCHAR *p, const WCHAR *text )
+{
+    for (; *text; p++, text++)
+    {
+        if (*text == '\\') { if (*p != '\\' && *p != '/') return FALSE; }
+        else if (RtlDowncaseUnicodeChar( *p ) != RtlDowncaseUnicodeChar( *text )) return FALSE;
+    }
+    return TRUE;
+}
+
+
+/***********************************************************************
+ *           is_native_executable
+ *
+ * A Mach-O image, thin or universal, or a `#!` script.
+ */
+static BOOL is_native_executable( const WCHAR *path )
+{
+    HANDLE file;
+    BYTE head[4];
+    DWORD read = 0, word;
+
+    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                        OPEN_EXISTING, 0, 0 );
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    if (!ReadFile( file, head, sizeof(head), &read, NULL )) read = 0;
+    CloseHandle( file );
+    if (read < 2) return FALSE;
+    if (head[0] == '#' && head[1] == '!') return TRUE;
+    if (read < 4) return FALSE;
+    word = head[0] | (head[1] << 8) | (head[2] << 16) | ((DWORD)head[3] << 24);
+    return word == 0xfeedface || word == 0xfeedfacf || word == 0xcefaedfe || word == 0xcffaedfe ||
+           word == 0xcafebabe || word == 0xbebafeca;
+}
+
+
+/***********************************************************************
  *           create_macos_build_process
  *
  * A game's macOS build, which Steam Play installs into a Steam library, can name
  * the executable inside its bundle as its launch target
- * (`Game.app\Contents\MacOS\Game`). That file is a Mach-O, so the launch is
- * handed to explorer.exe with the bundle, the same as Steam's shell-open of an
- * `.app`, which the dock shim turns into the native game. Anything else answers
- * STATUS_INVALID_IMAGE_NOT_MZ, as the image did.
+ * (`Game.app\Contents\MacOS\Game`). That file is a Mach-O or a script, so the
+ * launch is handed to explorer.exe with that exact path, the way Steam
+ * shell-opens an `.app`, and the dock shim runs it natively. Any other file
+ * answers STATUS_INVALID_IMAGE_NOT_MZ, as the image did, so batch files and the
+ * rest keep their own handling.
  */
 static NTSTATUS create_macos_build_process( HANDLE token, HANDLE debug, SECURITY_ATTRIBUTES *psa,
                                             SECURITY_ATTRIBUTES *tsa, DWORD flags,
@@ -431,25 +474,19 @@ static NTSTATUS create_macos_build_process( HANDLE token, HANDLE debug, SECURITY
                                             RTL_USER_PROCESS_INFORMATION *info, const WCHAR *app_name )
 {
     static const WCHAR explorer[] = L"C:\\windows\\system32\\explorer.exe";
-    static const WCHAR inner[] = L".app\\Contents\\MacOS\\";
-    static const WCHAR library[] = L"\\steamapps\\common\\";
-    const WCHAR *p, *bundle_end = NULL, *args;
+    const WCHAR *p, *args;
     WCHAR *newcmdline;
     NTSTATUS status;
     UINT len;
-    BOOL in_library = FALSE;
+    BOOL in_library = FALSE, in_bundle = FALSE;
 
     if (!app_name) return STATUS_INVALID_IMAGE_NOT_MZ;
-    for (p = app_name; *p; p++)
+    for (p = app_name; *p && !in_bundle; p++)
     {
-        if (!in_library && !wcsnicmp( p, library, ARRAY_SIZE(library) - 1 )) in_library = TRUE;
-        if (in_library && !wcsnicmp( p, inner, ARRAY_SIZE(inner) - 1 ))
-        {
-            bundle_end = p + 4;  /* keep ".app" */
-            break;
-        }
+        if (!in_library && match_path_component( p, L"\\steamapps\\common\\" )) in_library = TRUE;
+        if (in_library && match_path_component( p, L".app\\Contents\\MacOS\\" )) in_bundle = TRUE;
     }
-    if (!bundle_end) return STATUS_INVALID_IMAGE_NOT_MZ;
+    if (!in_bundle || !is_native_executable( app_name )) return STATUS_INVALID_IMAGE_NOT_MZ;
 
     /* The arguments after the program on the original command line. */
     args = params->CommandLine.Buffer;
@@ -460,10 +497,10 @@ static NTSTATUS create_macos_build_process( HANDLE token, HANDLE debug, SECURITY
     }
     else while (*args && *args != ' ' && *args != '\t') args++;
 
-    len = lstrlenW( explorer ) + 3 + (bundle_end - app_name) + lstrlenW( args ) + 1;
+    len = lstrlenW( explorer ) + 3 + lstrlenW( app_name ) + lstrlenW( args ) + 1;
     if (!(newcmdline = RtlAllocateHeap( GetProcessHeap(), 0, len * sizeof(WCHAR) )))
         return STATUS_NO_MEMORY;
-    swprintf( newcmdline, len, L"%s \"%.*s\"%s", explorer, (int)(bundle_end - app_name), app_name, args );
+    swprintf( newcmdline, len, L"%s \"%s\"%s", explorer, app_name, args );
     TRACE( "starting the macOS build %s as %s\n", debugstr_w(app_name), debugstr_w(newcmdline) );
     RtlInitUnicodeString( &params->ImagePathName, explorer );
     RtlInitUnicodeString( &params->CommandLine, newcmdline );

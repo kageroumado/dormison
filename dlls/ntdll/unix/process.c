@@ -555,17 +555,45 @@ NTSTATUS wow64_wine_spawnvp( void *args )
 #endif
 
 /***********************************************************************
+ *           has_path_component
+ *
+ * Whether `path` contains `text` (a '/'-separated fragment), case-insensitively
+ * as the volume and kernelbase match it; returns the position past it or NULL.
+ */
+static const char *has_path_component( const char *path, const char *text )
+{
+    size_t len = strlen( text );
+    for (; *path; path++) if (!strncasecmp( path, text, len )) return path + len;
+    return NULL;
+}
+
+
+/***********************************************************************
  *           is_steam_macos_build
  *
- * A Mach-O inside a Steam library bundle (`Game.app/Contents/MacOS/Game`).
- * It is left to kernelbase, which opens the bundle through explorer.exe so
- * the dock shim starts it with its waiter and Steam bridge. Executing it here
- * would run the game with none of those once the file has its exec bit.
+ * A Mach-O or script inside a Steam library bundle
+ * (`steamapps/common/…/Game.app/Contents/MacOS/Game`). It is left to kernelbase,
+ * which hands it to explorer.exe so the dock shim starts it under its
+ * supervisor with the Steam bridge. Executing it here would run the game with
+ * none of those once the file has its exec bit.
  */
 static BOOL is_steam_macos_build( const char *unix_name )
 {
-    const char *library = strstr( unix_name, "/steamapps/common/" );
-    return library && strstr( library, ".app/Contents/MacOS/" );
+    const char *library = has_path_component( unix_name, "/steamapps/common/" );
+    unsigned char head[4];
+    unsigned int word;
+    ssize_t got;
+    int fd;
+
+    if (!library || !has_path_component( library, ".app/Contents/MacOS/" )) return FALSE;
+    if ((fd = open( unix_name, O_RDONLY | O_CLOEXEC )) == -1) return FALSE;
+    got = pread( fd, head, sizeof(head), 0 );
+    close( fd );
+    if (got >= 2 && head[0] == '#' && head[1] == '!') return TRUE;
+    if (got < 4) return FALSE;
+    word = head[0] | (head[1] << 8) | (head[2] << 16) | ((unsigned int)head[3] << 24);
+    return word == 0xfeedface || word == 0xfeedfacf || word == 0xcefaedfe || word == 0xcffaedfe ||
+           word == 0xcafebabe || word == 0xbebafeca;
 }
 
 
