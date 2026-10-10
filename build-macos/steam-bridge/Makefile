@@ -6,6 +6,7 @@
 #   make generate            run the generator (ONLY=SteamUser021,... narrows it)
 #   make -j12 mac win ipc native   build the four artifacts into $(OUT)
 #   make test-transport      run the macOS transport against fake helpers (no Steam)
+#   make test-gen            run the generator fixtures (tests/gen) into $(BUILD)/test-gen
 #
 # The generator needs libclang's Python binding; `make venv` makes a venv with it under
 # $(BUILD) and PYTHON defaults to that venv's interpreter.
@@ -28,7 +29,7 @@ MINGW_INCLUDE ?= $(if $(wildcard $(MINGW_SYSROOT)/x86_64-w64-mingw32/include/win
 ONLY ?=
 HERE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-.PHONY: all sdk venv generate mac win ipc native test-transport clean
+.PHONY: all sdk venv generate mac win ipc native test-transport test-gen clean
 
 all: mac win ipc native
 
@@ -45,6 +46,9 @@ generate: $(if $(filter $(VENV)/bin/python,$(PYTHON)),$(VENV)/bin/python)
 	@mkdir -p $(GEN)
 	MINGW_INCLUDE=$(MINGW_INCLUDE) $(PYTHON) $(HERE)gen/gen_bridge.py --sdk-root $(SDK) --out $(GEN) --cache $(BUILD)/parsed.json \
 	    --sdk-include sdk $(if $(ONLY),--only $(ONLY))
+
+test-gen: $(if $(filter $(VENV)/bin/python,$(PYTHON)),$(VENV)/bin/python)
+	MINGW_INCLUDE=$(MINGW_INCLUDE) $(PYTHON) $(HERE)tests/gen/test_gen.py --work $(BUILD)/test-gen
 
 # --- macOS: the generated proxies plus the runtime, one universal dylib ---
 MAC_GEN := $(addprefix $(GEN)/mac/,$(shell cat $(GEN)/mac/sources.txt 2>/dev/null))
