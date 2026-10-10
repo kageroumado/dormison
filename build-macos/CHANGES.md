@@ -4,6 +4,14 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>` for a release, `b<N>` for a beta) as the GitHub
 release body.
 
+## b4
+
+- A native macOS game launched from Steam leaves nothing behind: the process Steam created runs
+  `sevo-native.exe` as the game's waiter (swapped in by ntdll for the program the server names),
+  so Steam's shell-open of the `.app` no longer starts an Explorer window that outlives the game.
+- The Steam bridge's helper ends itself once the game's last connection closes, so Steam shows
+  the game stopped within seconds of it quitting.
+
 ## b3
 
 - Native macOS builds of Steam games run through the bottle's own Steam. With

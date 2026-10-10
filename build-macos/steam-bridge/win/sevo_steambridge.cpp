@@ -472,5 +472,11 @@ int main() {
     DeleteFileA((stem + ".port").c_str());
     closesocket(listener);
     WSACleanup();
+    logf_("exited");
+    if (g_log) fclose(g_log);
+    /* Never return: process exit runs steamclient64.dll's detach, which waits
+       forever on its own threads, and Steam keeps showing the game as running
+       while this process lives. */
+    TerminateProcess(GetCurrentProcess(), 0);
     return 0;
 }
