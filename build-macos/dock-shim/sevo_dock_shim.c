@@ -1152,6 +1152,37 @@ static char **native_environment(const char *appid, int bridged, const char *ipc
     return out;
 }
 
+// Whether Steam maps the app to the app's macOS tool: the `name` under the
+// app's entry in `CompatToolMapping`, in the bottle Steam's `config.vdf`. A
+// Windows depot can carry a `.app` beside its `.exe` (Ren'Py builds do), and
+// those stay in wine.
+static int mapped_to_macos_tool(const char *prefix, const char *appid) {
+    static const char *tools[] = { "sevoflurane_macos", "sevo_macos" };
+    char path[1400];
+    snprintf(path, sizeof(path), "%s/drive_c/Program Files (x86)/Steam/config/config.vdf", prefix);
+    char *text = read_file(path, 8 * 1024 * 1024, NULL);
+    if (!text) return 0;
+    int mapped = 0;
+    const char *block = strstr(text, "\"CompatToolMapping\"");
+    char key[48];
+    snprintf(key, sizeof(key), "\"%s\"", appid);
+    const char *entry = block ? strstr(block, key) : NULL;
+    const char *close = block ? strstr(block, "\n\t\t\t\t}") : NULL;
+    if (entry && (!close || entry < close)) {
+        const char *name = strstr(entry, "\"name\"");
+        const char *end = strchr(entry, '}');
+        if (name && (!end || name < end)) {
+            const char *value = strchr(name + 6, '"');
+            for (unsigned i = 0; value && !mapped && i < sizeof(tools) / sizeof(tools[0]); i++) {
+                size_t n = strlen(tools[i]);
+                mapped = strncmp(value + 1, tools[i], n) == 0 && value[1 + n] == '"';
+            }
+        }
+    }
+    free(text);
+    return mapped;
+}
+
 static void sevo_run_native_app(void) {
     char **argv = *_NSGetArgv();
     int argc = *_NSGetArgc();
@@ -1174,6 +1205,10 @@ static void sevo_run_native_app(void) {
     if (!steam_manifest_value(argv[2], "appid", appid, sizeof(appid))) {
         const char *inherited = getenv("SteamAppId");
         snprintf(appid, sizeof(appid), "%s", inherited && *inherited ? inherited : "0");
+    }
+    if (!mapped_to_macos_tool(prefix, appid)) {
+        fprintf(stderr, "sevo-shim: app %s is not set to its macOS version — staying in wine\n", appid);
+        return;
     }
     fix_executable_bits(bundle);
     if (!bundle_executable(bundle, executable, sizeof(executable)) || access(executable, X_OK) != 0) {

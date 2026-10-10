@@ -160,11 +160,14 @@ static void *watch_waiter(void *argument) {
     if (queue < 0) return NULL;
     struct kevent watch;
     EV_SET(&watch, (uintptr_t)waiter, EVFILT_PROC, EV_ADD | EV_ENABLE, NOTE_EXIT, 0, NULL);
-    if (kevent(queue, &watch, 1, NULL, 0, NULL) < 0 && errno != ESRCH) {
+    // ESRCH: the waiter is already gone, so the game ends now.
+    int registered = kevent(queue, &watch, 1, NULL, 0, NULL);
+    int already_gone = registered < 0 && errno == ESRCH;
+    if (registered < 0 && !already_gone) {
         close(queue);
         return NULL;
     }
-    if (errno != ESRCH) {
+    if (!already_gone) {
         struct kevent fired;
         if (kevent(queue, NULL, 0, &fired, 1, NULL) != 1) {
             close(queue);
