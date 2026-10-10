@@ -10,7 +10,8 @@
 // conversion.
 //
 // Environment, set by the dock shim when it execs the game natively:
-//   SEVO_STEAM_BRIDGE_PORT    the helper's loopback port
+//   SEVO_STEAM_BRIDGE_PORT    the helper's loopback port, or
+//   SEVO_STEAM_BRIDGE_PORT_FILE  the file the helper writes its port to
 //   SEVO_STEAM_BRIDGE_TOKEN   the per-launch token the helper expects first
 //   SEVO_STEAM_BRIDGE_PREFIX  the bottle (WINEPREFIX), for drive-letter paths
 //   SEVO_STEAM_BRIDGE_LOG     1 traces every call on stderr
@@ -123,6 +124,19 @@ static bool round_trip(int fd, const std::vector<uint8_t> &frame, std::vector<ui
     return read_all(fd, reply.data(), length);
 }
 
+// The port the helper published, or 0 while the file is not there yet.
+static int port_from_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int port = 0;
+    if (fscanf(f, "%d", &port) != 1) port = 0;
+    fclose(f);
+    return port > 0 && port < 65536 ? port : 0;
+}
+
+static bool hello(int fd);
+static void hold_keepalive();
+
 static int connect_once(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -173,14 +187,22 @@ static int current_fd() {
         if (disabled) return -1;
     }
     const char *port_text = getenv("SEVO_STEAM_BRIDGE_PORT");
+    const char *port_file = getenv("SEVO_STEAM_BRIDGE_PORT_FILE");
     int port = port_text ? atoi(port_text) : 0;
-    if (port <= 0) {
+    if (port <= 0 && !(port_file && *port_file)) {
         static std::once_flag once;
-        std::call_once(once, [] { log("SEVO_STEAM_BRIDGE_PORT is not set: Steam stays out of reach"); });
+        std::call_once(once, [] { log("neither SEVO_STEAM_BRIDGE_PORT nor SEVO_STEAM_BRIDGE_PORT_FILE is set: Steam stays out of reach"); });
         return -1;
     }
     // Up to 30 s for the helper to come up: wine's own start is most of it.
     for (int attempt = 0; attempt < 300; attempt++) {
+        if (port <= 0) {
+            port = port_from_file(port_file);
+            if (port <= 0) {
+                usleep(100 * 1000);
+                continue;
+            }
+        }
         int fd = connect_once(port);
         if (fd >= 0) {
             if (!hello(fd)) {
@@ -189,6 +211,7 @@ static int current_fd() {
             }
             c.fd = fd;
             if (tracing()) log("connected to port %d on thread %p", port, (void *)pthread_self());
+            hold_keepalive();
             return fd;
         }
         {
@@ -199,6 +222,23 @@ static int current_fd() {
     }
     log("no helper on port %d after 30 s", port);
     return -1;
+}
+
+// One connection that is never used and never closed: the helper exits when its last
+// connection closes, and a game's threads come and go between calls, so this one keeps
+// the helper alive for exactly as long as the process that holds it.
+static void hold_keepalive() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const char *port_text = getenv("SEVO_STEAM_BRIDGE_PORT");
+        const char *port_file = getenv("SEVO_STEAM_BRIDGE_PORT_FILE");
+        int port = port_text ? atoi(port_text) : 0;
+        if (port <= 0 && port_file) port = port_from_file(port_file);
+        if (port <= 0) return;
+        int fd = connect_once(port);
+        if (fd < 0) return;
+        if (!hello(fd)) close(fd);
+    });
 }
 
 static void drop_connection() {
@@ -308,7 +348,7 @@ static thread_local std::string string_ring[kStringRing];
 static thread_local size_t string_next = 0;
 
 const char *Call::keep_str(const char *s) {
-    if (!s) return nullptr;
+    if (!s) return "";
     std::string &slot = string_ring[string_next++ % kStringRing];
     slot = s;
     return slot.c_str();

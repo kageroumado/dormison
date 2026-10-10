@@ -20,6 +20,9 @@
 //   command 100000 (stop request): acknowledged and ignored.
 
 #include <dlfcn.h>
+#include <errno.h>
+#include <signal.h>
+#include <sys/event.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <servers/bootstrap.h>
@@ -145,6 +148,42 @@ kern_return_t sevo_bootstrap_look_up(mach_port_t bp, const name_t name, mach_por
         }
     }
     return bootstrap_look_up(bp, name, port);
+}
+
+// The process that stands for this game in Steam (sevo-native.exe --wait, the
+// dock shim's) is what Steam stops when the player stops the game, so the game
+// ends with it.
+static void *watch_waiter(void *argument) {
+    pid_t waiter = (pid_t)(intptr_t)argument;
+    pthread_setname_np("sevo-steam-waiter-watch");
+    int queue = kqueue();
+    if (queue < 0) return NULL;
+    struct kevent watch;
+    EV_SET(&watch, (uintptr_t)waiter, EVFILT_PROC, EV_ADD | EV_ENABLE, NOTE_EXIT, 0, NULL);
+    if (kevent(queue, &watch, 1, NULL, 0, NULL) < 0 && errno != ESRCH) {
+        close(queue);
+        return NULL;
+    }
+    if (errno != ESRCH) {
+        struct kevent fired;
+        if (kevent(queue, NULL, 0, &fired, 1, NULL) != 1) {
+            close(queue);
+            return NULL;
+        }
+    }
+    close(queue);
+    fprintf(stderr, "sevo-steam-ipc: Steam's process for this game (pid %d) is gone — ending\n", (int)waiter);
+    kill(getpid(), SIGTERM);
+    sleep(10);
+    _exit(0);
+}
+
+__attribute__((constructor)) static void sevo_steam_ipc_init(void) {
+    const char *text = getenv("SEVO_STEAM_BRIDGE_WAITER_PID");
+    long pid = text ? strtol(text, NULL, 10) : 0;
+    if (pid <= 0) return;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, watch_waiter, (void *)(intptr_t)pid) == 0) pthread_detach(thread);
 }
 
 __attribute__((used, section("__DATA,__interpose"))) static const struct {

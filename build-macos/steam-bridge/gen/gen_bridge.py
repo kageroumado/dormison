@@ -757,6 +757,9 @@ def mac_zero_return(mm):
     rk = mm.m["result"]["k"]
     if rk == "void":
         return "        return;"
+    if mm.ret == "string":
+        # Steam's own string getters never answer null, and games strlen the result.
+        return '        return "";'
     if rk in ("ptr", "funcptr"):
         return "        return nullptr;"
     if rk == "record":

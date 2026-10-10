@@ -16,8 +16,9 @@
  *   SEVO_STEAM_BRIDGE_TOKEN   what every connection's hello must carry
  *   SEVO_STEAM_BRIDGE_IDLE    seconds to wait for a first client, default 120
  *
- * The port it bound is written to %LOCALAPPDATA%\Sevoflurane\steambridge-<appid>.port
- * and a transcript to steambridge-<appid>.log beside it. The process exits when the
+ * The port it bound is written to %LOCALAPPDATA%\Sevoflurane\steambridge-<appid>.port,
+ * which is how the game's steamclient.dylib finds it, and a transcript to
+ * steambridge-<appid>.log beside it. The process exits when the
  * last client disconnects, or after the idle wait with no client at all.
  */
 
@@ -377,10 +378,13 @@ int main() {
     getsockname(listener, (sockaddr *)&addr, &len);
     int port = ntohs(addr.sin_port);
     {
-        FILE *f = fopen((stem + ".port").c_str(), "w");
+        /* Written whole, then moved into place: a reader never sees a partial file. */
+        std::string tmp = stem + ".port.tmp";
+        FILE *f = fopen(tmp.c_str(), "w");
         if (f) {
             fprintf(f, "%d\n", port);
             fclose(f);
+            MoveFileExA(tmp.c_str(), (stem + ".port").c_str(), MOVEFILE_REPLACE_EXISTING);
         }
     }
     logf_("listening on 127.0.0.1:%d", port);

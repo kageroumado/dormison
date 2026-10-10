@@ -63,6 +63,7 @@
 #include <mach-o/dyld.h>
 #include <Security/Security.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <fts.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -912,11 +913,13 @@ done:
 
 // A game installed as its macOS build through Steam Play is a `.app` in a
 // Steam library, and Steam launches it by shell-opening the bundle, which
-// reaches wine as `explorer.exe "<…>\Game.app"`. That process becomes the
-// game: the bundle's executable is exec'd in its place, same pid, so Steam
-// keeps tracking it. Beside it runs the Steam bridge (steam-bridge/DESIGN.md):
-// sevo-steambridge.exe in the bottle, started here, and the bridge's
-// steamclient.dylib in the game, reached through libsevosteamipc.dylib.
+// reaches wine as `explorer.exe "<…>\Game.app"`. That process forks the
+// bundle's executable as a native child and goes on as wine running
+// `sevo-native.exe --wait`, which lives exactly as long as the game, so
+// Steam's launch completes and its tracking holds. Beside the game runs the
+// Steam bridge (steam-bridge/DESIGN.md): sevo-steambridge.exe in the bottle,
+// started here, and the bridge's steamclient.dylib in the game, reached
+// through libsevosteamipc.dylib.
 
 static int ends_with_ci(const char *s, const char *suffix) {
     size_t n = strlen(s), m = strlen(suffix);
@@ -1013,7 +1016,7 @@ static void warn_if_hardened(const char *bundle) {
     CFRelease(url);
 }
 
-// Replaces this process with `executable`, same pid, running native: a
+// Replaces the calling process with `executable`, running native: a
 // translated process execs a universal binary translated too, and wine is
 // x86_64 under Rosetta, so the game would otherwise take its x86_64 slice.
 // Returns only on failure.
@@ -1034,26 +1037,22 @@ static int exec_native(const char *executable, char *const *arguments, char *con
     return error;
 }
 
-// A loopback port nothing is listening on right now.
-static int free_loopback_port(void) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return 0;
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    socklen_t size = sizeof addr;
-    int port = 0;
-    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) == 0 && getsockname(fd, (struct sockaddr *)&addr, &size) == 0)
-        port = ntohs(addr.sin_port);
-    close(fd);
-    return port;
+// Where the helper publishes the port it bound: %LOCALAPPDATA%\Sevoflurane\
+// steambridge-<appid>.port, seen from macOS. The helper picks the port itself
+// and owns it from the first moment, so nothing can take it in between.
+static int bridge_port_file(const char *prefix, const char *appid, char *out, size_t len) {
+    struct passwd *user = getpwuid(getuid());
+    if (!user || !user->pw_name) return 0;
+    int n = snprintf(out, len, "%s/drive_c/users/%s/AppData/Local/Sevoflurane/steambridge-%s.port",
+                     prefix, user->pw_name, appid);
+    return n > 0 && (size_t)n < len;
 }
 
 // The bridge's helper, started in the bottle this process is still part of.
 // It loads the running client's steamclient64.dll and serves the game's
-// Steamworks calls on `port`; it exits when the game's connections close.
-static int spawn_steam_bridge(const char *appid, int port, const char *token) {
+// Steamworks calls on a port of its own choosing; it exits when the game's
+// connections close.
+static int spawn_steam_bridge(const char *appid, const char *token) {
     char engine[1024], helper[1280], loader[1024];
     if (!engine_directory(engine, sizeof(engine))) return 0;
     snprintf(helper, sizeof(helper), "%s/sevo-steambridge.exe", engine);
@@ -1068,16 +1067,14 @@ static int spawn_steam_bridge(const char *appid, int port, const char *token) {
         "DYLD_INSERT_LIBRARIES=", "SteamAppId=", "SteamGameId=", "SEVO_ENV_FILES=", "SEVO_STEAM_BRIDGE_",
     };
     size_t count = 0;
-    char **environment = bottle_environment(drop, 5, 6, &count);
+    char **environment = bottle_environment(drop, 5, 5, &count);
     if (!environment) return 0;
-    char app_variable[64], game_variable[64], port_variable[64], token_variable[96];
+    char app_variable[64], game_variable[64], token_variable[96];
     snprintf(app_variable, sizeof(app_variable), "SteamAppId=%s", appid);
     snprintf(game_variable, sizeof(game_variable), "SteamGameId=%s", appid);
-    snprintf(port_variable, sizeof(port_variable), "SEVO_STEAM_BRIDGE_PORT=%d", port);
     snprintf(token_variable, sizeof(token_variable), "SEVO_STEAM_BRIDGE_TOKEN=%s", token);
     environment[count++] = app_variable;
     environment[count++] = game_variable;
-    environment[count++] = port_variable;
     environment[count++] = token_variable;
     environment[count++] = (char *)"SEVO_ENV_FILES=0";
     environment[count++] = (char *)"SEVO_QUIET=1";
@@ -1086,10 +1083,73 @@ static int spawn_steam_bridge(const char *appid, int port, const char *token) {
     char *arguments[] = { loader, helper, NULL };
     pid_t child = 0;
     int started = posix_spawn(&child, loader, NULL, NULL, arguments, environment) == 0;
-    if (started) fprintf(stderr, "sevo-shim: steam bridge for app %s on port %d (pid %d)\n", appid, port, child);
+    if (started) fprintf(stderr, "sevo-shim: steam bridge for app %s started (pid %d)\n", appid, child);
     else fprintf(stderr, "sevo-shim: could not start the steam bridge: %s\n", strerror(errno));
     free(environment);
     return started;
+}
+
+// The environment a native game gets: what a Finder launch would give it, the
+// Steam variables the client set for the launch, and the bridge's own. Nothing
+// of wine's or the app's: the client runs with the engine's PATH, the renderer's
+// variables and no HOME, and a native app must not inherit any of that.
+static char **native_environment(const char *appid, int bridged, const char *ipc, const char *bridge,
+                                 const char *port_file, const char *token, const char *prefix, pid_t waiter) {
+    char **inherited = *_NSGetEnviron();
+    size_t inherited_count = 0;
+    while (inherited[inherited_count]) inherited_count++;
+    char **out = calloc(inherited_count + 24, sizeof(char *));
+    if (!out) return NULL;
+    size_t n = 0;
+    struct passwd *user = getpwuid(getuid());
+    char buffer[1400];
+    if (user) {
+        snprintf(buffer, sizeof buffer, "HOME=%s", user->pw_dir);
+        out[n++] = strdup(buffer);
+        snprintf(buffer, sizeof buffer, "USER=%s", user->pw_name);
+        out[n++] = strdup(buffer);
+        snprintf(buffer, sizeof buffer, "LOGNAME=%s", user->pw_name);
+        out[n++] = strdup(buffer);
+        snprintf(buffer, sizeof buffer, "SHELL=%s", user->pw_shell);
+        out[n++] = strdup(buffer);
+    }
+    char tmp[PATH_MAX];
+    if (confstr(_CS_DARWIN_USER_TEMP_DIR, tmp, sizeof tmp) > 0) {
+        snprintf(buffer, sizeof buffer, "TMPDIR=%s", tmp);
+        out[n++] = strdup(buffer);
+    }
+    snprintf(buffer, sizeof buffer, "__CF_USER_TEXT_ENCODING=0x%X:0:0", (unsigned)getuid());
+    out[n++] = strdup(buffer);
+    out[n++] = strdup("PATH=/usr/bin:/bin:/usr/sbin:/sbin");
+    for (size_t i = 0; i < inherited_count; i++) {
+        char *entry = inherited[i];
+        if (strncmp(entry, "SteamAppId=", 11) == 0 || strncmp(entry, "SteamGameId=", 12) == 0) continue;
+        if (strncmp(entry, "Steam", 5) == 0 || strncmp(entry, "STEAM_", 6) == 0 ||
+            strncmp(entry, "ENABLE_VK_LAYER_VALVE", 21) == 0)
+            out[n++] = entry;
+    }
+    snprintf(buffer, sizeof buffer, "SteamAppId=%s", appid);
+    out[n++] = strdup(buffer);
+    snprintf(buffer, sizeof buffer, "SteamGameId=%s", appid);
+    out[n++] = strdup(buffer);
+    if (bridged) {
+        snprintf(buffer, sizeof buffer, "DYLD_INSERT_LIBRARIES=%s", ipc);
+        out[n++] = strdup(buffer);
+        snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_DIR=%s", bridge);
+        out[n++] = strdup(buffer);
+        snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_PORT_FILE=%s", port_file);
+        out[n++] = strdup(buffer);
+        snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_TOKEN=%s", token);
+        out[n++] = strdup(buffer);
+        snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_PREFIX=%s", prefix);
+        out[n++] = strdup(buffer);
+        snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_WAITER_PID=%d", (int)waiter);
+        out[n++] = strdup(buffer);
+        const char *trace = getenv("SEVO_STEAM_BRIDGE_LOG");
+        if (trace && *trace == '1') out[n++] = strdup("SEVO_STEAM_BRIDGE_LOG=1");
+    }
+    out[n] = NULL;
+    return out;
 }
 
 static void sevo_run_native_app(void) {
@@ -1121,76 +1181,78 @@ static void sevo_run_native_app(void) {
         return;
     }
 
-    char engine[1024], bridge[1100], ipc[1200], client[1200];
+    char engine[1024], bridge[1100], ipc[1200], client[1200], port_file[1400], waiter[1300];
     int bridged = 0;
-    int port = 0;
     char token[20] = "";
-    if (engine_directory(engine, sizeof(engine))) {
-        snprintf(bridge, sizeof(bridge), "%s/steam-bridge", engine);
-        snprintf(ipc, sizeof(ipc), "%s/libsevosteamipc.dylib", bridge);
-        snprintf(client, sizeof(client), "%s/steamclient.dylib", bridge);
-        if (access(ipc, R_OK) == 0 && access(client, R_OK) == 0) {
-            uint8_t random[8];
-            arc4random_buf(random, sizeof random);
-            for (unsigned i = 0; i < sizeof random; i++) snprintf(token + 2 * i, 3, "%02x", random[i]);
-            port = free_loopback_port();
-            bridged = port > 0 && spawn_steam_bridge(appid, port, token);
-        } else {
-            fprintf(stderr, "sevo-shim: no steam bridge under %s — the game runs without Steam\n", engine);
-        }
+    if (!engine_directory(engine, sizeof(engine))) return;
+    snprintf(waiter, sizeof(waiter), "%s/sevo-native.exe", engine);
+    if (access(waiter, R_OK) != 0) {
+        fprintf(stderr, "sevo-shim: no %s — staying in wine\n", waiter);
+        return;
+    }
+    snprintf(bridge, sizeof(bridge), "%s/steam-bridge", engine);
+    snprintf(ipc, sizeof(ipc), "%s/libsevosteamipc.dylib", bridge);
+    snprintf(client, sizeof(client), "%s/steamclient.dylib", bridge);
+    if (access(ipc, R_OK) == 0 && access(client, R_OK) == 0) {
+        uint8_t random[8];
+        arc4random_buf(random, sizeof random);
+        for (unsigned i = 0; i < sizeof random; i++) snprintf(token + 2 * i, 3, "%02x", random[i]);
+        bridged = bridge_port_file(prefix, appid, port_file, sizeof(port_file)) &&
+                  (unlink(port_file), spawn_steam_bridge(appid, token));
+    } else {
+        fprintf(stderr, "sevo-shim: no steam bridge under %s — the game runs without Steam\n", engine);
     }
     if (bridged) warn_if_hardened(bundle);
+
+    // The game is a child, so the process Steam created lives on: wine runs
+    // sevo-native.exe --wait in it, holding the read end of a pipe whose write
+    // end the game inherits, and Steam's launch completes and tracks a process
+    // that ends when the game does. The game's end of the bargain is in
+    // libsevosteamipc.dylib: it exits when this process goes.
+    int status_pipe[2];
+    if (pipe(status_pipe) != 0) {
+        fprintf(stderr, "sevo-shim: pipe: %s — staying in wine\n", strerror(errno));
+        return;
+    }
+    char **arguments = calloc((size_t)argc, sizeof(char *));
+    char **environment = native_environment(appid, bridged, ipc, bridge, port_file, token, prefix, getpid());
+    if (!arguments || !environment) return;
+    size_t written = 0;
+    arguments[written++] = executable;
+    for (int i = 3; i < argc; i++) arguments[written++] = argv[i];
+    arguments[written] = NULL;
 
     // The bundle's parent is the game's install directory, where its files are.
     char parent[1400];
     snprintf(parent, sizeof(parent), "%s", bundle);
     char *slash = strrchr(parent, '/');
     if (slash && slash != parent) *slash = '\0';
-    if (chdir(parent) != 0) fprintf(stderr, "sevo-shim: cannot enter %s: %s\n", parent, strerror(errno));
 
-    char **arguments = calloc((size_t)argc, sizeof(char *));
-    if (!arguments) return;
-    size_t written = 0;
-    arguments[written++] = executable;
-    for (int i = 3; i < argc; i++) arguments[written++] = argv[i];
-    arguments[written] = NULL;
-
-    static const char *drop[] = { "DYLD_INSERT_LIBRARIES=", "WINE", "SEVO_", "SteamAppId=", "SteamGameId=" };
-    char **environment = filtered_environment(drop, 5, 8);
-    if (!environment) {
-        free(arguments);
+    fflush(stderr);
+    pid_t child = fork();
+    if (child < 0) {
+        fprintf(stderr, "sevo-shim: fork: %s — staying in wine\n", strerror(errno));
         return;
     }
-    size_t count = 0;
-    while (environment[count]) count++;
-    char dyld[1300], dir[1200], port_variable[64], token_variable[96], prefix_variable[1100];
-    char app_variable[64], game_variable[64];
-    snprintf(app_variable, sizeof(app_variable), "SteamAppId=%s", appid);
-    snprintf(game_variable, sizeof(game_variable), "SteamGameId=%s", appid);
-    environment[count++] = app_variable;
-    environment[count++] = game_variable;
-    if (bridged) {
-        snprintf(dyld, sizeof(dyld), "DYLD_INSERT_LIBRARIES=%s", ipc);
-        snprintf(dir, sizeof(dir), "SEVO_STEAM_BRIDGE_DIR=%s", bridge);
-        snprintf(port_variable, sizeof(port_variable), "SEVO_STEAM_BRIDGE_PORT=%d", port);
-        snprintf(token_variable, sizeof(token_variable), "SEVO_STEAM_BRIDGE_TOKEN=%s", token);
-        snprintf(prefix_variable, sizeof(prefix_variable), "SEVO_STEAM_BRIDGE_PREFIX=%s", prefix);
-        environment[count++] = dyld;
-        environment[count++] = dir;
-        environment[count++] = port_variable;
-        environment[count++] = token_variable;
-        environment[count++] = prefix_variable;
-        const char *trace = getenv("SEVO_STEAM_BRIDGE_LOG");
-        if (trace && *trace == '1') environment[count++] = (char *)"SEVO_STEAM_BRIDGE_LOG=1";
+    if (child == 0) {
+        close(status_pipe[0]);
+        fcntl(status_pipe[1], F_SETFD, 0);
+        if (chdir(parent) != 0) fprintf(stderr, "sevo-shim: cannot enter %s: %s\n", parent, strerror(errno));
+        int error = exec_native(executable, arguments, environment);
+        fprintf(stderr, "sevo-shim: exec of %s failed: %s\n", executable, strerror(error));
+        _exit(127);
     }
-    environment[count] = NULL;
-    fprintf(stderr, "sevo-shim: running %s natively as app %s%s\n", executable, appid,
-            bridged ? " with the steam bridge" : "");
-    fflush(stderr);
-    int error = exec_native(executable, arguments, environment);
-    fprintf(stderr, "sevo-shim: exec of %s failed: %s — staying in wine\n", executable, strerror(error));
-    free(environment);
-    free(arguments);
+    close(status_pipe[1]);
+    fcntl(status_pipe[0], F_SETFD, 0);
+    fprintf(stderr, "sevo-shim: %s runs natively as pid %d (app %s%s); this process waits for it\n",
+            executable, (int)child, appid, bridged ? ", with the steam bridge" : "");
+    char fd_text[16];
+    snprintf(fd_text, sizeof fd_text, "%d", status_pipe[0]);
+    setenv("SEVO_NATIVE_WAIT_FD", fd_text, 1);
+    setenv("SEVO_QUIET", "1", 1);
+    argv[1] = strdup(waiter);
+    argv[2] = (char *)"--wait";
+    for (int i = 3; i < argc; i++) argv[i] = (char *)"";
 }
 
 // MARK: - The owner watch

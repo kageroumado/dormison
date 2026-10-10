@@ -17,14 +17,20 @@ client. This directory holds the pieces that make that work.
    prefix (`sevo-native.exe`) is never run by the Windows client. The dock shim's
    constructor recognizes that process, finds the app id in the library's
    `appmanifest_*.acf`, gives the bundle's Mach-O and script files their executable bit
-   (the Windows client writes 0644), starts the helper (4), and execs
-   `Contents/MacOS/<CFBundleExecutable>` in place, same pid, so Steam keeps tracking it:
-   cwd the bundle's parent, `DYLD_INSERT_LIBRARIES` = `libsevosteamipc.dylib`,
-   `SEVO_STEAM_BRIDGE_DIR/PORT/TOKEN/PREFIX`, `SteamAppId`, `SteamGameId`; wine's and the
-   app's own variables dropped. A bundle with the hardened runtime and no
+   (the Windows client writes 0644), starts the helper (4), and forks the game as a native
+   child (`posix_spawn` with an arm64 binary preference, since a translated parent would
+   otherwise hand a universal game its x86_64 slice) with a clean environment: `HOME`,
+   `USER`, `TMPDIR`, a plain `PATH`, the `Steam*` variables of the launch, and the bridge's
+   own (`DYLD_INSERT_LIBRARIES` = `libsevosteamipc.dylib`, `SEVO_STEAM_BRIDGE_DIR/
+   PORT_FILE/TOKEN/PREFIX/WAITER_PID`), cwd the bundle's parent. The process Steam created
+   goes on as wine running `sevo-native.exe --wait`, holding a pipe the game inherited, so
+   Steam's launch action completes (`CreatingProcess → WaitingGameWindow → Completed`) and
+   Steam's tracked game process lives exactly as long as the game; when Steam or the app
+   ends that waiter, `libsevosteamipc.dylib`'s watch on `SEVO_STEAM_BRIDGE_WAITER_PID`
+   ends the game. A bundle with the hardened runtime and no
    `allow-dyld-environment-variables` entitlement is logged: `DYLD_*` is stripped there and
    the game runs without Steam (Escape Dungeon 2 is ad-hoc signed, fine). Without the
-   bridge files in the engine, the game is still exec'd, bare.
+   bridge files in the engine, the game is still run, bare.
 3. **Path lookup** (`mac/sevo_steam_ipc.c` → `libsevosteamipc.dylib`). Answers libsteam_api's
    `bootstrap_look_up` of `com.valvesoftware.steam.ipctool` from a thread inside the game:
    path `$SEVO_STEAM_BRIDGE_DIR/steam_osx`, pid = the game's own. libsteam_api then dlopens
@@ -36,6 +42,13 @@ client. This directory holds the pieces that make that work.
    version.
 
 ## Measured 2026-10-10 on macbook-16
+
+From Steam's own Play (Sevoflurane 1.1 beta 1 with the test tool, engine
+`dormison-b2-bridge`): the game action completes, Steam tracks `sevo-native.exe --wait`
+as the game, Escape Dungeon 2 runs ARM64 as its child with the bridge connected and stays
+up; `sevo app terminate 1309000` ends waiter, game and helper, and a second launch follows
+cleanly. `SteamClient.Apps.TerminateApp(1309000, false)` from the app's page did nothing
+(an app-side question; its own stop path works).
 
 Escape Dungeon 2 (1309000, Unity, Steamworks.NET 20.x, SDK 1.53), launched natively by
 hand with the helper started in the bottle: `SteamAPI_Init` passes; Steamworks.NET's
@@ -49,6 +62,19 @@ right), the 26-achievement list, `SetAchievement` + `StoreStats` with its
 clean of unknown methods and short frames.
 
 ## Facts the bridge rests on
+
+- **Steam's launch needs the process it created to live.** With the game exec'd in place
+  of `explorer.exe`, that process vanished from wineserver at the exec, Steam's game action
+  stayed at `CreatingProcess`, and no later launch of any game started until the client
+  restarted (or `SteamClient.Apps.CancelGameAction(<id>)`). Hence the fork and the waiter.
+- **The client's environment is not a game's.** The app hands wine processes a built
+  environment (no `HOME`/`USER`/`TMPDIR`, wine's `PATH`, the renderer's variables); Escape
+  Dungeon 2 inherited it and died in Unity's text renderer three seconds after init, on
+  both architectures. With the Finder-style environment above it runs.
+- **Overwriting an engine dylib in place while processes map it** invalidates the vnode's
+  cached code signature: every later process loading it dies `SIGKILL (Code Signature
+  Invalid)` in dyld, and the client restarts in a silent loop. Install through a new inode
+  (`cp` to a temp name, `mv`).
 
 - **Load path in libsteam_api (SDK 1.5x–1.6x):** `SteamAPI_Init` asks ipcserver for the
   path (fails → "ipcserver GetSteamPath failed"), checks the pid with `kill(pid, 0)`, cuts at
@@ -146,7 +172,12 @@ direction, so every pointer argument becomes a sized buffer on the wire.
   contract is "valid until the next call".
 - **Transport:** loopback TCP, `TCP_NODELAY`, one connection per game thread opened at
   the thread's first call (retrying for 30 s while the helper starts; the first connection
-  waits for wine), dropped by `Steam_ReleaseThreadLocalMemory(true)`. The first frame is a
+  waits for wine), dropped by `Steam_ReleaseThreadLocalMemory(true)`, plus one idle
+  keepalive connection held for the life of the process, since a game's init thread can
+  exit between calls and the helper quits when its last connection closes. The helper binds a
+  port of its own (port 0) and publishes it atomically in `steambridge-<appid>.port`; the
+  dylib reads `SEVO_STEAM_BRIDGE_PORT_FILE` (the shim's way) or `SEVO_STEAM_BRIDGE_PORT`
+  (by hand), so no process can take the port between a choice and the bind. The first frame is a
   hello carrying `SEVO_STEAM_BRIDGE_TOKEN` and the protocol hash (a SHA-256 of every method
   name, its wire signature and the callback table); the helper refuses anything else and
   refuses to listen at all without a token. A refused hello disables the dylib for the
@@ -201,6 +232,8 @@ for the hardened-runtime check.
   (networking sockets/messages receive and send), game-side listener objects
   (matchmaking server queries, custom signaling), `ISteamHTMLSurface` paint callbacks.
 - `SetWarningMessageHook` relays nothing; the hook is accepted and ignored.
+- Strings a bridged call cannot answer come back as `""`, never null, since games `strlen`
+  them; a game that reads Steam before the helper is up sees empty names, not a crash.
 - `installscript_osx.vdf` chmod lists; the Mach-O/script magic pass covers every bundle
   seen so far.
 - The Steam overlay in a native game (Steam's own `gameoverlayrenderer.dylib` needs Steam
