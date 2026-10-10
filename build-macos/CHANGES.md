@@ -4,6 +4,21 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>`) as the GitHub release body, and the build names
 itself after the top heading.
 
+## r6
+
+- Every native macOS game runs under `sevo-native-supervisor`, which owns Steam's waiter and the
+  game's process group. Steam's Stop, the app's stop, an app quit and an engine switch end the
+  game and everything it started; a game that restarts itself or hands off from a launcher stays
+  one session; a game whose hardened runtime refuses the Steam bridge is still stopped cleanly.
+- A macOS game launched a second time starts with its Steam connection like the first time, and
+  launch entries naming the executable inside a bundle run that exact executable, whatever their
+  case.
+- The Steam bridge checks every request in full before Steam sees it, names Steam's interfaces
+  by handles the game cannot forge, sizes networking option arrays by their counts and refuses
+  options that carry pointers.
+- A Steam helper that vanishes or stalls makes a game's Steam call fail within its deadline;
+  it never ends or hangs the game.
+
 ## r5
 
 - Engines are regular releases again, named r<N>; the manifest names each one for every app.
