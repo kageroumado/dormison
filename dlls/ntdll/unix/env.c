@@ -2182,7 +2182,9 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
  * in SEVO_NATIVE_WAIT_FD until the game ends. A process started by another wine
  * process takes its image and command line from the server's startup info, so
  * the swap is made here, before the main exe loads. Both variables are cleared
- * so a child of this process starts as itself.
+ * so a child of this process starts as itself. A swap that cannot be made ends
+ * the process: the game's supervisor then ends the game, and Steam sees the
+ * launch fail rather than tracking whatever program it named.
  */
 static void sevo_native_waiter( RTL_USER_PROCESS_PARAMETERS *params, UNICODE_STRING *nt_name )
 {
@@ -2196,8 +2198,8 @@ static void sevo_native_waiter( RTL_USER_PROCESS_PARAMETERS *params, UNICODE_STR
     if (unix_to_nt_file_name( waiter, &nt, FILE_OPEN ) || !nt ||
         nt[0] != '\\' || nt[1] != '?' || nt[2] != '?' || nt[3] != '\\')
     {
-        free( nt );
-        return;
+        MESSAGE( "wine: cannot run the native game's waiter %s\n", waiter );
+        NtTerminateProcess( GetCurrentProcess(), STATUS_OBJECT_PATH_NOT_FOUND );
     }
     dos = nt + 4;
     for (dos_len = 0; dos[dos_len]; dos_len++) ;
@@ -2206,8 +2208,8 @@ static void sevo_native_waiter( RTL_USER_PROCESS_PARAMETERS *params, UNICODE_STR
     size = (2 + dos_len + ARRAY_SIZE(waitW) - 1 + fd_len + 1 + dos_len + 1) * sizeof(WCHAR);
     if (NtAllocateVirtualMemory( NtCurrentProcess(), &block, 0, &size, MEM_COMMIT, PAGE_READWRITE ))
     {
-        free( nt );
-        return;
+        MESSAGE( "wine: no memory for the native game's waiter\n" );
+        NtTerminateProcess( GetCurrentProcess(), STATUS_NO_MEMORY );
     }
     cmdline = block;
     i = 0;
