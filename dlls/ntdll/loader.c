@@ -2365,6 +2365,97 @@ done:
 
 
 /*************************************************************************
+ *		sevo_enable_steam_play
+ *
+ * Steam's Windows client carries the whole compatibility-tool system Steam Play uses on
+ * Linux, switched off by one comparison: CCompatManager sets its enabled flag to
+ * `strcmp( platform, "linux" ) == 0`. With SEVO_STEAM_PLAY=1, the flag is set to true as
+ * steamclient64.dll is mapped, before any of its code runs. Per-app tool mappings then pick
+ * the tool's platform depots and launch through the tool's command line, as on Linux, while
+ * apps with no mapping are untouched. The site is found by shape (a reference to the
+ * "linux" literal followed by `sete al; mov byte [reg+disp32], al`), never by bytes that
+ * move between client builds, and nothing is written unless exactly one site matches.
+ */
+static void sevo_enable_steam_play( WINE_MODREF *wm )
+{
+    static const WCHAR steamclientW[] = L"steamclient64.dll";
+    UNICODE_STRING name = RTL_CONSTANT_STRING( L"SEVO_STEAM_PLAY" );
+    WCHAR value_buffer[4];
+    UNICODE_STRING value = { 0, sizeof(value_buffer), value_buffer };
+    BYTE *base = wm->ldr.DllBase, *text = NULL, *site = NULL;
+    const IMAGE_NT_HEADERS *nt;
+    const IMAGE_SECTION_HEADER *sec;
+    SIZE_T text_size = 0, image_size, i, j;
+    unsigned int matches = 0, k;
+
+    if (wm->ldr.BaseDllName.Length != wcslen( steamclientW ) * sizeof(WCHAR) ||
+        wcsnicmp( wm->ldr.BaseDllName.Buffer, steamclientW, wcslen( steamclientW ) ))
+        return;
+    if (RtlQueryEnvironmentVariable_U( NULL, &name, &value ) || value.Length != sizeof(WCHAR) ||
+        value_buffer[0] != '1')
+        return;
+
+    nt = RtlImageNtHeader( (HMODULE)base );
+    if (!nt || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return;
+    image_size = nt->OptionalHeader.SizeOfImage;
+    sec = IMAGE_FIRST_SECTION( nt );
+    for (k = 0; k < nt->FileHeader.NumberOfSections; k++)
+    {
+        if (!memcmp( sec[k].Name, ".text", 6 ))
+        {
+            text = base + sec[k].VirtualAddress;
+            text_size = sec[k].Misc.VirtualSize;
+        }
+    }
+    if (!text || text_size < 64) return;
+
+    /* lea rdx, [rip+disp32] = 48 8D 15 disp32; its target must read "linux\0" with a NUL
+     * before it, so a "linux" inside a longer string never counts. */
+    for (i = 0; i + 7 + 32 <= text_size; i++)
+    {
+        BYTE *target;
+        INT32 disp;
+
+        if (text[i] != 0x48 || text[i + 1] != 0x8d || text[i + 2] != 0x15) continue;
+        memcpy( &disp, text + i + 3, sizeof(disp) );
+        target = text + i + 7 + disp;
+        if (target <= base || target + 6 > base + image_size) continue;
+        if (target[-1] || memcmp( target, "linux", 6 )) continue;
+        for (j = i + 7; j + 5 <= i + 7 + 32; j++)
+        {
+            /* sete al = 0F 94 C0; mov byte [reg+disp32], al = 88 80+reg, reg != rsp (SIB) */
+            if (text[j] == 0x0f && text[j + 1] == 0x94 && text[j + 2] == 0xc0 &&
+                text[j + 3] == 0x88 && (text[j + 4] & 0xf8) == 0x80 && text[j + 4] != 0x84)
+            {
+                site = text + j;
+                matches++;
+                break;
+            }
+        }
+    }
+    if (matches != 1)
+    {
+        ERR( "Steam Play: %u candidate sites in steamclient64.dll, left unpatched\n", matches );
+        return;
+    }
+    {
+        void *addr = site;
+        SIZE_T size = 3;
+        ULONG old_prot;
+
+        if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, PAGE_EXECUTE_READWRITE, &old_prot ))
+            return;
+        site[0] = 0xb0;  /* mov al, 1 */
+        site[1] = 0x01;
+        site[2] = 0x90;  /* nop */
+        NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, old_prot, &old_prot );
+        NtFlushInstructionCache( NtCurrentProcess(), site, 3 );
+    }
+    MESSAGE( "sevo: Steam Play enabled in steamclient64.dll at +0x%lx\n", (unsigned long)(site - base) );
+}
+
+
+/*************************************************************************
  *		build_module
  *
  * Build the module data for a mapped dll.
@@ -2950,6 +3041,7 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_nam
     if (NT_SUCCESS(status)) status = build_module( load_path, nt_name, &module, image_info, id,
                                                    flags, system, redirected, pwm );
     if (status && module) NtUnmapViewOfSection( NtCurrentProcess(), module );
+    else if (!status) sevo_enable_steam_play( *pwm );
     return status;
 }
 
