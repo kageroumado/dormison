@@ -415,6 +415,64 @@ static NTSTATUS create_cmd_process( HANDLE token, HANDLE debug, SECURITY_ATTRIBU
 }
 
 
+/***********************************************************************
+ *           create_macos_build_process
+ *
+ * A game's macOS build, which Steam Play installs into a Steam library, can name
+ * the executable inside its bundle as its launch target
+ * (`Game.app\Contents\MacOS\Game`). That file is a Mach-O, so the launch is
+ * handed to explorer.exe with the bundle, the same as Steam's shell-open of an
+ * `.app`, which the dock shim turns into the native game. Anything else answers
+ * STATUS_INVALID_IMAGE_NOT_MZ, as the image did.
+ */
+static NTSTATUS create_macos_build_process( HANDLE token, HANDLE debug, SECURITY_ATTRIBUTES *psa,
+                                            SECURITY_ATTRIBUTES *tsa, DWORD flags,
+                                            RTL_USER_PROCESS_PARAMETERS *params,
+                                            RTL_USER_PROCESS_INFORMATION *info, const WCHAR *app_name )
+{
+    static const WCHAR explorer[] = L"C:\\windows\\system32\\explorer.exe";
+    static const WCHAR inner[] = L".app\\Contents\\MacOS\\";
+    static const WCHAR library[] = L"\\steamapps\\common\\";
+    const WCHAR *p, *bundle_end = NULL, *args;
+    WCHAR *newcmdline;
+    NTSTATUS status;
+    UINT len;
+    BOOL in_library = FALSE;
+
+    if (!app_name) return STATUS_INVALID_IMAGE_NOT_MZ;
+    for (p = app_name; *p; p++)
+    {
+        if (!in_library && !wcsnicmp( p, library, ARRAY_SIZE(library) - 1 )) in_library = TRUE;
+        if (in_library && !wcsnicmp( p, inner, ARRAY_SIZE(inner) - 1 ))
+        {
+            bundle_end = p + 4;  /* keep ".app" */
+            break;
+        }
+    }
+    if (!bundle_end) return STATUS_INVALID_IMAGE_NOT_MZ;
+
+    /* The arguments after the program on the original command line. */
+    args = params->CommandLine.Buffer;
+    if (*args == '"')
+    {
+        for (args++; *args && *args != '"'; args++) ;
+        if (*args) args++;
+    }
+    else while (*args && *args != ' ' && *args != '\t') args++;
+
+    len = lstrlenW( explorer ) + 3 + (bundle_end - app_name) + lstrlenW( args ) + 1;
+    if (!(newcmdline = RtlAllocateHeap( GetProcessHeap(), 0, len * sizeof(WCHAR) )))
+        return STATUS_NO_MEMORY;
+    swprintf( newcmdline, len, L"%s \"%.*s\"%s", explorer, (int)(bundle_end - app_name), app_name, args );
+    TRACE( "starting the macOS build %s as %s\n", debugstr_w(app_name), debugstr_w(newcmdline) );
+    RtlInitUnicodeString( &params->ImagePathName, explorer );
+    RtlInitUnicodeString( &params->CommandLine, newcmdline );
+    status = create_nt_process( token, debug, psa, tsa, flags, params, info, 0, 0, NULL, NULL );
+    RtlFreeHeap( GetProcessHeap(), 0, newcmdline );
+    return status;
+}
+
+
 /*********************************************************************
  *           CloseHandle   (kernelbase.@)
  */
@@ -657,6 +715,9 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
                                      nt_flags, params, &rtl_info );
         break;
     case STATUS_INVALID_IMAGE_NOT_MZ:
+        status = create_macos_build_process( token, debug, process_attr, thread_attr,
+                                             nt_flags, params, &rtl_info, app_name );
+        if (status != STATUS_INVALID_IMAGE_NOT_MZ) break;
         /* check for .com or .bat extension */
         if (!(p = wcsrchr( app_name, '.' ))) break;
         if (!wcsicmp( p, L".com" ) || !wcsicmp( p, L".pif" ))
