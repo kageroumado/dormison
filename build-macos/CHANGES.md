@@ -10,6 +10,7 @@ itself after the top heading.
   game's process group. Steam's Stop, the app's stop, an app quit and an engine switch end the
   game and everything it started; a game that restarts itself or hands off from a launcher stays
   one session; a game whose hardened runtime refuses the Steam bridge is still stopped cleanly.
+- A macOS game's run ends with the game's own exit code, so a crash reads as one.
 - A macOS game launched a second time starts with its Steam connection like the first time, and
   launch entries naming the executable inside a bundle run that exact executable, whatever their
   case.

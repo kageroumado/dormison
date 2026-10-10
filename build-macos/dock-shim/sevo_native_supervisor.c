@@ -4,7 +4,8 @@
 // process goes on as wine running sevo-native.exe, the waiter Steam tracks as the game.
 // The supervisor:
 //   - holds the write end of the waiter's pipe, so the waiter (and Steam's view of the game)
-//     lives exactly as long as the session;
+//     lives exactly as long as the session, and writes the game's exit code into it as the
+//     session ends, which the waiter exits with;
 //   - spawns the game, native-arch, as the leader of a new process group, so a launcher that
 //     hands off to a child or a game that execs itself stays one session;
 //   - ends the whole group when the waiter dies (Steam's Stop, the wineserver going down with
@@ -279,6 +280,11 @@ int main(int argc, char **argv) {
         if (leader_gone && !group_alive(game)) break;
     }
     remove_session();
-    say("app %s: session over (status %d)", appid, exit_code(status));
-    return exit_code(status);
+    int code = exit_code(status);
+    say("app %s: session over (status %d)", appid, code);
+    if (status_fd > 2) {
+        unsigned char bytes[4] = { code & 0xff, (code >> 8) & 0xff, (code >> 16) & 0xff, (code >> 24) & 0xff };
+        if (write(status_fd, bytes, sizeof bytes) != sizeof bytes) say("Steam's waiter is gone: exit code not passed on");
+    }
+    return code;
 }

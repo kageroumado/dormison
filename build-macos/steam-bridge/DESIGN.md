@@ -37,7 +37,9 @@ client. This directory holds the pieces that make that work.
    `pgid`, `executable`, `bundle`, `started`). The process Steam created goes on as wine
    running `sevo-native.exe --wait` on the pipe's read end, so Steam's launch action
    completes (`CreatingProcess → WaitingGameWindow → Completed`) and Steam's tracked game
-   process lives exactly as long as the session. The session lasts while the game's process
+   process lives exactly as long as the session. The supervisor writes the game's exit code
+   into the pipe as the session ends, and the waiter exits with it, so the run's result is
+   the game's. The session lasts while the game's process
    group has members, so a game that execs itself or a launcher that hands off to a child
    stays one session. When the waiter dies (Steam's Stop, the wineserver ending with an app
    quit or engine switch) or the supervisor gets SIGTERM (the app's stop), it TERMs the

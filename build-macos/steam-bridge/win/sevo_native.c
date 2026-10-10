@@ -4,11 +4,14 @@
  * The tool's toolmanifest.vdf names this exe as the prefix of a mapped game's
  * launch; Steam's Windows client never runs that prefix (it shell-opens the
  * game's .app instead), so run bare it only exits. The dock shim runs it as
- * `sevo-native.exe --wait <fd>` in the process Steam created for the game,
- * after forking the game natively (ntdll swaps it in for the program Steam
- * asked for): it holds the read end of a pipe the game inherited, the unix
- * descriptor after --wait, and exits at end-of-file, when the game has ended. Steam's launch completes against this process and its tracking of
- * the game is this process's lifetime.
+ * `sevo-native.exe --wait <fd>` in the process Steam created for the game
+ * (ntdll swaps it in for the program Steam asked for), once the game runs
+ * under sevo-native-supervisor. It reads the pipe whose write end the
+ * supervisor holds, the unix descriptor after --wait: the supervisor writes
+ * the game's exit code there (a little-endian int32) as the session ends, and
+ * this process exits with it at end-of-file, or with 1 when none came. Steam's
+ * launch completes against this process, its tracking of the game is this
+ * process's lifetime, and the run's result is this process's exit code.
  *
  * Build: make native   (x86_64-w64-mingw32-gcc)
  */
@@ -31,9 +34,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, LPWSTR command_line,
     if (!to_handle) return 0;
     HANDLE pipe_end = NULL;
     if (to_handle(fd, GENERIC_READ, 0, &pipe_end) != 0 || !pipe_end) return 0;
-    char byte;
-    DWORD read = 0;
-    while (ReadFile(pipe_end, &byte, 1, &read, NULL) && read) {}
+    unsigned char code[4];
+    DWORD got = 0, read = 0;
+    char rest;
+    while (got < sizeof code && ReadFile(pipe_end, code + got, sizeof code - got, &read, NULL) && read) got += read;
+    while (ReadFile(pipe_end, &rest, 1, &read, NULL) && read) {}
     CloseHandle(pipe_end);
-    return 0;
+    if (got < sizeof code) return 1;
+    return (int)(code[0] | (code[1] << 8) | (code[2] << 16) | ((unsigned)code[3] << 24));
 }
