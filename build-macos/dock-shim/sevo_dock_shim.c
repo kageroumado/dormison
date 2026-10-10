@@ -926,6 +926,18 @@ static int ends_with_ci(const char *s, const char *suffix) {
     return n >= m && strcasecmp(s + n - m, suffix) == 0;
 }
 
+// In `…\Game.app\Contents\MacOS\Game`, the position just past `.app`; NULL for
+// any other path. Case and separators as Windows allows them.
+static const char *bundle_inner_executable(const char *path) {
+    for (const char *at = path; *at; at++) {
+        if (strncasecmp(at, ".app", 4) != 0 || !is_separator(at[4])) continue;
+        if (strncasecmp(at + 5, "Contents", 8) != 0 || !is_separator(at[13])) continue;
+        if (strncasecmp(at + 14, "MacOS", 5) != 0 || !is_separator(at[19]) || !at[20]) continue;
+        return at + 4;
+    }
+    return NULL;
+}
+
 // `C:\…` as a unix path under the bottle's drive link; a unix path is kept.
 static int unix_path_of(const char *path, char *out, size_t len) {
     const char *prefix = getenv("WINEPREFIX");
@@ -1018,9 +1030,10 @@ static void warn_if_hardened(const char *bundle) {
 
 // Replaces the calling process with `executable`, running native: a
 // translated process execs a universal binary translated too, and wine is
-// x86_64 under Rosetta, so the game would otherwise take its x86_64 slice.
-// The game keeps stdin, stdout, stderr and `keep_fd` and nothing else of this
-// wine process's descriptors (the wineserver socket among them).
+// x86_64 under Rosetta, so the supervisor would otherwise run translated and
+// hand its translation down to the game. The new image keeps stdin, stdout,
+// stderr and `keep_fd` and nothing else of this wine process's descriptors
+// (the wineserver socket among them).
 // Returns only on failure.
 static int exec_native(const char *executable, char *const *arguments, char *const *environment, int keep_fd) {
     posix_spawnattr_t attributes;
@@ -1089,7 +1102,15 @@ static int spawn_steam_bridge(const char *appid, const char *token) {
 
     char *arguments[] = { loader, helper, NULL };
     pid_t child = 0;
-    int started = posix_spawn(&child, loader, NULL, NULL, arguments, environment) == 0;
+    posix_spawnattr_t attributes;
+    posix_spawnattr_init(&attributes);
+    posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    for (int fd = 0; fd <= 2; fd++) posix_spawn_file_actions_addinherit_np(&actions, fd);
+    int started = posix_spawn(&child, loader, &actions, &attributes, arguments, environment) == 0;
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attributes);
     if (started) fprintf(stderr, "sevo-shim: steam bridge for app %s started (pid %d)\n", appid, child);
     else fprintf(stderr, "sevo-shim: could not start the steam bridge: %s\n", strerror(errno));
     free(environment);
@@ -1101,8 +1122,7 @@ static int spawn_steam_bridge(const char *appid, const char *token) {
 // of wine's or the app's: the client runs with the engine's PATH, the renderer's
 // variables and no HOME, and a native app must not inherit any of that.
 static char **native_environment(const char *appid, int bridged, const char *ipc, const char *bridge,
-                                 const char *port_file, const char *token, const char *prefix, pid_t waiter,
-                                 int status_fd) {
+                                 const char *port_file, const char *token, const char *prefix) {
     char **inherited = *_NSGetEnviron();
     size_t inherited_count = 0;
     while (inherited[inherited_count]) inherited_count++;
@@ -1150,10 +1170,6 @@ static char **native_environment(const char *appid, int bridged, const char *ipc
         snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_TOKEN=%s", token);
         out[n++] = strdup(buffer);
         snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_PREFIX=%s", prefix);
-        out[n++] = strdup(buffer);
-        snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_WAITER_PID=%d", (int)waiter);
-        out[n++] = strdup(buffer);
-        snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_STATUS_FD=%d", status_fd);
         out[n++] = strdup(buffer);
         const char *trace = getenv("SEVO_STEAM_BRIDGE_LOG");
         if (trace && *trace == '1') out[n++] = strdup("SEVO_STEAM_BRIDGE_LOG=1");
@@ -1203,13 +1219,20 @@ static void sevo_run_native_app(void) {
     for (const char *at = argv[1]; *at; at++) {
         if (is_separator(*at)) exe = at + 1;
     }
-    if (strcasecmp(exe, "explorer.exe") != 0) return;
-    if (!ends_with_ci(argv[2], ".app") || !steam_common_segment(argv[2])) return;
+    if (strcasecmp(exe, "explorer.exe") != 0 || !steam_common_segment(argv[2])) return;
+    // Steam shell-opens `Game.app`; kernelbase hands over a launch that names the
+    // executable inside the bundle (`Game.app\Contents\MacOS\Game`), and that
+    // exact executable is the one to run.
+    const char *inner = bundle_inner_executable(argv[2]);
+    if (!inner && !ends_with_ci(argv[2], ".app")) return;
 
-    char bundle[1400], executable[1400], appid[32];
+    char windows_bundle[1400], bundle[1400], executable[1400], appid[32];
     struct stat info;
-    if (!unix_path_of(argv[2], bundle, sizeof(bundle)) || stat(bundle, &info) != 0 || !S_ISDIR(info.st_mode)) {
-        fprintf(stderr, "sevo-shim: %s is not a bundle on disk — staying in wine\n", argv[2]);
+    snprintf(windows_bundle, sizeof windows_bundle, "%.*s",
+             inner ? (int)(inner - argv[2]) : (int)strlen(argv[2]), argv[2]);
+    if (!unix_path_of(windows_bundle, bundle, sizeof(bundle)) || stat(bundle, &info) != 0 || !S_ISDIR(info.st_mode)) {
+        fprintf(stderr, "sevo-shim: %s is not a bundle on disk — staying in wine\n", windows_bundle);
+        if (inner) _exit(1);
         return;
     }
     if (!steam_manifest_value(argv[2], "appid", appid, sizeof(appid))) {
@@ -1217,22 +1240,31 @@ static void sevo_run_native_app(void) {
         snprintf(appid, sizeof(appid), "%s", inherited && *inherited ? inherited : "0");
     }
     if (!mapped_to_macos_tool(prefix, appid)) {
-        fprintf(stderr, "sevo-shim: app %s is not set to its macOS version — staying in wine\n", appid);
+        // A shell-open of a bundle Steam did not map stays explorer's to handle; a
+        // launch of the executable inside it fails, as a Mach-O launch in wine does.
+        fprintf(stderr, "sevo-shim: app %s is not set to its macOS version — %s\n", appid,
+                inner ? "the launch fails" : "staying in wine");
+        if (inner) _exit(1);
         return;
     }
     fix_executable_bits(bundle);
-    if (!bundle_executable(bundle, executable, sizeof(executable)) || access(executable, X_OK) != 0) {
-        fprintf(stderr, "sevo-shim: %s names no runnable executable — staying in wine\n", bundle);
+    int found = inner ? unix_path_of(argv[2], executable, sizeof(executable))
+                      : bundle_executable(bundle, executable, sizeof(executable));
+    if (!found || access(executable, X_OK) != 0) {
+        fprintf(stderr, "sevo-shim: %s names no runnable executable — staying in wine\n", argv[2]);
+        if (inner) _exit(1);
         return;
     }
 
-    char engine[1024], bridge[1100], ipc[1200], client[1200], port_file[1400], waiter[1300];
+    char engine[1024], bridge[1100], ipc[1200], client[1200], port_file[1400], waiter[1300], supervisor[1300];
     int bridged = 0;
     char token[20] = "";
     if (!engine_directory(engine, sizeof(engine))) return;
     snprintf(waiter, sizeof(waiter), "%s/sevo-native.exe", engine);
-    if (access(waiter, R_OK) != 0) {
-        fprintf(stderr, "sevo-shim: no %s — staying in wine\n", waiter);
+    snprintf(supervisor, sizeof(supervisor), "%s/sevo-native-supervisor", engine);
+    if (access(waiter, R_OK) != 0 || access(supervisor, X_OK) != 0) {
+        fprintf(stderr, "sevo-shim: no %s or %s — staying in wine\n", waiter, supervisor);
+        if (inner) _exit(1);
         return;
     }
     snprintf(bridge, sizeof(bridge), "%s/steam-bridge", engine);
@@ -1249,30 +1281,37 @@ static void sevo_run_native_app(void) {
     }
     if (bridged) warn_if_hardened(bundle);
 
-    // The game is a child, so the process Steam created lives on: wine runs
-    // sevo-native.exe --wait in it, holding the read end of a pipe whose write
-    // end the game inherits, and Steam's launch completes and tracks a process
-    // that ends when the game does. The game's end of the bargain is in
-    // libsevosteamipc.dylib: it exits when this process goes.
+    // The game runs under sevo-native-supervisor, a child of this process, so
+    // the process Steam created lives on: wine runs sevo-native.exe --wait in
+    // it, holding the read end of a pipe whose write end only the supervisor
+    // holds. Steam's launch completes and tracks a process that ends when the
+    // session does, and the supervisor ends the game when that process goes.
     int status_pipe[2];
     if (pipe(status_pipe) != 0) {
         fprintf(stderr, "sevo-shim: pipe: %s — staying in wine\n", strerror(errno));
         return;
     }
-    char **arguments = calloc((size_t)argc, sizeof(char *));
-    char **environment = native_environment(appid, bridged, ipc, bridge, port_file, token, prefix, getpid(),
-                                            status_pipe[1]);
-    if (!arguments || !environment) return;
-    size_t written = 0;
-    arguments[written++] = executable;
-    for (int i = 3; i < argc; i++) arguments[written++] = argv[i];
-    arguments[written] = NULL;
-
     // The bundle's parent is the game's install directory, where its files are.
     char parent[1400];
     snprintf(parent, sizeof(parent), "%s", bundle);
     char *slash = strrchr(parent, '/');
     if (slash && slash != parent) *slash = '\0';
+
+    char fd_argument[16], waiter_argument[16];
+    snprintf(fd_argument, sizeof fd_argument, "%d", status_pipe[1]);
+    snprintf(waiter_argument, sizeof waiter_argument, "%d", (int)getpid());
+    char *head[] = {
+        supervisor, "--status-fd", fd_argument, "--waiter", waiter_argument, "--prefix", (char *)prefix,
+        "--appid", appid, "--bundle", bundle, "--cwd", parent, "--", executable,
+    };
+    size_t head_count = sizeof(head) / sizeof(head[0]);
+    char **arguments = calloc(head_count + (size_t)argc, sizeof(char *));
+    char **environment = native_environment(appid, bridged, ipc, bridge, port_file, token, prefix);
+    if (!arguments || !environment) return;
+    size_t written = 0;
+    for (size_t i = 0; i < head_count; i++) arguments[written++] = head[i];
+    for (int i = 3; i < argc; i++) arguments[written++] = argv[i];
+    arguments[written] = NULL;
 
     fflush(stderr);
     pid_t child = fork();
@@ -1283,14 +1322,13 @@ static void sevo_run_native_app(void) {
     if (child == 0) {
         close(status_pipe[0]);
         fcntl(status_pipe[1], F_SETFD, 0);
-        if (chdir(parent) != 0) fprintf(stderr, "sevo-shim: cannot enter %s: %s\n", parent, strerror(errno));
-        int error = exec_native(executable, arguments, environment, status_pipe[1]);
-        fprintf(stderr, "sevo-shim: exec of %s failed: %s\n", executable, strerror(error));
+        int error = exec_native(supervisor, arguments, environment, status_pipe[1]);
+        fprintf(stderr, "sevo-shim: exec of %s failed: %s\n", supervisor, strerror(error));
         _exit(127);
     }
     close(status_pipe[1]);
     fcntl(status_pipe[0], F_SETFD, 0);
-    fprintf(stderr, "sevo-shim: %s runs natively as pid %d (app %s%s); this process waits for it\n",
+    fprintf(stderr, "sevo-shim: %s runs natively under supervisor pid %d (app %s%s); this process waits for it\n",
             executable, (int)child, appid, bridged ? ", with the steam bridge" : "");
     // ntdll reads these as the process starts and runs the waiter in place of
     // the program Steam asked for (dlls/ntdll/unix/env.c, sevo_native_waiter):

@@ -290,6 +290,11 @@ clang -arch arm64 -arch x86_64 -O2 -Wall -dynamiclib -framework ApplicationServi
 codesign -s - -f "$OUT/libsevodockshim.dylib"
 record source "$OUT/libsevodockshim.dylib"
 
+# --- the supervisor every native macOS game runs under (dock-shim/sevo_native_supervisor.c) ---
+clang -arch arm64 -arch x86_64 -O2 -Wall -o "$OUT/sevo-native-supervisor" "$HERE/dock-shim/sevo_native_supervisor.c"
+codesign -s - -f "$OUT/sevo-native-supervisor"
+record source "$OUT/sevo-native-supervisor"
+
 # --- the Steamworks stub a natively run game talks to, both bitnesses (steam-stub/README.md) ---
 make -s -C "$HERE/steam-stub"
 cp "$HERE/steam-stub/sevo-steamstub.exe" "$HERE/steam-stub/sevo-steamstub32.exe" "$OUT/"

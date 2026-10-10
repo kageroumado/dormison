@@ -12,7 +12,7 @@
 //
 // From the game's first moments it also holds the helper's keepalive connection, so
 // sevo-steambridge.exe lives as long as the game however late the game initializes
-// Steam, and it ends the game when Steam's process for it (the dock shim's waiter) goes.
+// Steam. The game's lifetime belongs to sevo-native-supervisor, its parent.
 //
 // The protocol, read from libsteam_api.dylib (SDK 1.5x–1.6x):
 //   every message: mach_msg_header_t, msgh_id = protocol version 0x68, a 32-bit command
@@ -28,8 +28,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <signal.h>
-#include <sys/event.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <servers/bootstrap.h>
@@ -159,37 +157,6 @@ kern_return_t sevo_bootstrap_look_up(mach_port_t bp, const name_t name, mach_por
     return bootstrap_look_up(bp, name, port);
 }
 
-// The process that stands for this game in Steam (sevo-native.exe --wait, the
-// dock shim's) is what Steam stops when the player stops the game, so the game
-// ends with it.
-static void *watch_waiter(void *argument) {
-    pid_t waiter = (pid_t)(intptr_t)argument;
-    pthread_setname_np("sevo-steam-waiter-watch");
-    int queue = kqueue();
-    if (queue < 0) return NULL;
-    struct kevent watch;
-    EV_SET(&watch, (uintptr_t)waiter, EVFILT_PROC, EV_ADD | EV_ENABLE, NOTE_EXIT, 0, NULL);
-    // ESRCH: the waiter is already gone, so the game ends now.
-    int registered = kevent(queue, &watch, 1, NULL, 0, NULL);
-    int already_gone = registered < 0 && errno == ESRCH;
-    if (registered < 0 && !already_gone) {
-        close(queue);
-        return NULL;
-    }
-    if (!already_gone) {
-        struct kevent fired;
-        if (kevent(queue, NULL, 0, &fired, 1, NULL) != 1) {
-            close(queue);
-            return NULL;
-        }
-    }
-    close(queue);
-    fprintf(stderr, "sevo-steam-ipc: Steam's process for this game (pid %d) is gone — ending\n", (int)waiter);
-    kill(getpid(), SIGTERM);
-    sleep(10);
-    _exit(0);
-}
-
 // The keepalive: the helper exits when its last greeted connection closes, or when no
 // game says hello within its idle wait, so this connection, opened as soon as the
 // helper publishes its port and never used or closed, keeps it for the game's life.
@@ -274,17 +241,7 @@ static void *hold_keepalive(void *unused) {
     return NULL;
 }
 
-// The write end of the dock shim's status pipe stays with the game alone: a process the
-// game starts must not hold Steam's waiter open after the game is gone.
-static void keep_status_pipe_private(void) {
-    const char *text = getenv("SEVO_STEAM_BRIDGE_STATUS_FD");
-    long fd = text ? strtol(text, NULL, 10) : -1;
-    if (fd > 2) fcntl((int)fd, F_SETFD, FD_CLOEXEC);
-    unsetenv("SEVO_STEAM_BRIDGE_STATUS_FD");
-}
-
 __attribute__((constructor)) static void sevo_steam_ipc_init(void) {
-    keep_status_pipe_private();
     pthread_t thread;
     const char *token = getenv("SEVO_STEAM_BRIDGE_TOKEN");
     const char *port_file = getenv("SEVO_STEAM_BRIDGE_PORT_FILE");
@@ -292,10 +249,6 @@ __attribute__((constructor)) static void sevo_steam_ipc_init(void) {
     if (token && *token && ((port_file && *port_file) || (port_text && *port_text)) &&
         pthread_create(&thread, NULL, hold_keepalive, NULL) == 0)
         pthread_detach(thread);
-    const char *text = getenv("SEVO_STEAM_BRIDGE_WAITER_PID");
-    long pid = text ? strtol(text, NULL, 10) : 0;
-    if (pid <= 0) return;
-    if (pthread_create(&thread, NULL, watch_waiter, (void *)(intptr_t)pid) == 0) pthread_detach(thread);
 }
 
 __attribute__((used, section("__DATA,__interpose"))) static const struct {

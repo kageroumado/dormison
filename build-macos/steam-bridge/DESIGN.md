@@ -14,26 +14,37 @@ client. This directory holds the pieces that make that work.
    swaps depots by itself when the mapping changes.
 2. **Launch** (`../dock-shim/sevo_dock_shim.c`, `sevo_run_native_app`). Steam shell-opens
    the game's `.app`, an `explorer.exe "<…>\Game.app"` process; the tool's `commandline`
-   prefix (`sevo-native.exe`) is never run by the Windows client. The dock shim's
-   constructor recognizes that process, finds the app id in the library's
-   `appmanifest_*.acf`, gives the bundle's Mach-O and script files their executable bit
-   (the Windows client writes 0644), starts the helper (4), and forks the game as a native
-   child (`posix_spawn` with an arm64 binary preference, since a translated parent would
-   otherwise hand a universal game its x86_64 slice) with a clean environment: `HOME`,
-   `USER`, `TMPDIR`, a plain `PATH`, the `Steam*` variables of the launch, and the bridge's
-   own (`DYLD_INSERT_LIBRARIES` = `libsevosteamipc.dylib`, `SEVO_STEAM_BRIDGE_DIR/
-   PORT_FILE/TOKEN/PREFIX/WAITER_PID/STATUS_FD`), cwd the bundle's parent, and no file
-   descriptor of the wine process but 0–2 and the status pipe (`POSIX_SPAWN_CLOEXEC_DEFAULT`;
-   `libsevosteamipc.dylib` then marks the pipe close-on-exec, so nothing the game starts
-   holds Steam's waiter open). The process Steam created
-   goes on as wine running `sevo-native.exe --wait`, holding a pipe the game inherited, so
-   Steam's launch action completes (`CreatingProcess → WaitingGameWindow → Completed`) and
-   Steam's tracked game process lives exactly as long as the game; when Steam or the app
-   ends that waiter, `libsevosteamipc.dylib`'s watch on `SEVO_STEAM_BRIDGE_WAITER_PID`
-   ends the game. A bundle with the hardened runtime and no
-   `allow-dyld-environment-variables` entitlement is logged: `DYLD_*` is stripped there and
-   the game runs without Steam (Escape Dungeon 2 is ad-hoc signed, fine). Without the
-   bridge files in the engine, the game is still run, bare.
+   prefix (`sevo-native.exe`) is never run by the Windows client. A launch entry that names
+   the executable inside the bundle (`Game.app\Contents\MacOS\Game`) reaches the same place:
+   kernelbase's `create_macos_build_process` turns a Mach-O or `#!` file under
+   `steamapps\common\…\*.app\Contents\MacOS\` into `explorer.exe "<that exact path>"`, and
+   ntdll's `is_steam_macos_build` keeps Wine's own `fork_and_exec` off such files (it would
+   run them bare once they are executable). Both match case-insensitively with either
+   separator, as the volume does. The dock shim's constructor recognizes that process,
+   finds the app id in the library's `appmanifest_*.acf`, confirms Steam maps the app to the
+   macOS tool, gives the bundle's Mach-O and script files their executable bit (the Windows
+   client writes 0644), starts the helper (4) with stdio and nothing else, and forks a child
+   that execs **`sevo-native-supervisor`** (`../dock-shim/sevo_native_supervisor.c`,
+   native-arch through `posix_spawn` with an arm64 binary preference, since a translated
+   parent would otherwise hand a universal binary its x86_64 slice). The supervisor holds
+   the write end of the status pipe alone, spawns the game (the exact executable, or the
+   bundle's `CFBundleExecutable`) as the leader of a new process group with a clean
+   environment — `HOME`, `USER`, `TMPDIR`, a plain `PATH`, the `Steam*` variables of the
+   launch, and the bridge's own (`DYLD_INSERT_LIBRARIES` = `libsevosteamipc.dylib`,
+   `SEVO_STEAM_BRIDGE_DIR/PORT_FILE/TOKEN/PREFIX`) — cwd the bundle's parent and no file
+   descriptor but 0–2, and publishes the session in
+   `<prefix>/.sevo/native-sessions/<supervisor pid>.json` (`appid`, `supervisor`, `game`,
+   `pgid`, `executable`, `bundle`, `started`). The process Steam created goes on as wine
+   running `sevo-native.exe --wait` on the pipe's read end, so Steam's launch action
+   completes (`CreatingProcess → WaitingGameWindow → Completed`) and Steam's tracked game
+   process lives exactly as long as the session. The session lasts while the game's process
+   group has members, so a game that execs itself or a launcher that hands off to a child
+   stays one session. When the waiter dies (Steam's Stop, the wineserver ending with an app
+   quit or engine switch) or the supervisor gets SIGTERM (the app's stop), it TERMs the
+   group, waits 10 s and KILLs the rest. None of this needs the game to load anything: a
+   bundle with the hardened runtime and no `allow-dyld-environment-variables` entitlement
+   is logged, runs without Steam (`DYLD_*` is stripped), and is supervised the same way.
+   Without the bridge files in the engine, the game is still run, bare.
 3. **Path lookup** (`mac/sevo_steam_ipc.c` → `libsevosteamipc.dylib`). Answers libsteam_api's
    `bootstrap_look_up` of `com.valvesoftware.steam.ipctool` from a thread inside the game:
    path `$SEVO_STEAM_BRIDGE_DIR/steam_osx`, pid = the game's own. libsteam_api then dlopens
