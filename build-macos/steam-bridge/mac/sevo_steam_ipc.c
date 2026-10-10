@@ -10,6 +10,10 @@
 // steamclient.dylib) and the game's own pid. Every other lookup goes to launchd as usual,
 // and Steam for Mac's own ipcserver is never contacted.
 //
+// From the game's first moments it also holds the helper's keepalive connection, so
+// sevo-steambridge.exe lives as long as the game however late the game initializes
+// Steam, and it ends the game when Steam's process for it (the dock shim's waiter) goes.
+//
 // The protocol, read from libsteam_api.dylib (SDK 1.5x–1.6x):
 //   every message: mach_msg_header_t, msgh_id = protocol version 0x68, a 32-bit command
 //   at offset 0x18; the reply carries msgh_id 0x68 back. The client receives into a buffer
@@ -19,16 +23,21 @@
 //   command 14 (GetSteamPath): pid at 0x1c, NUL-terminated path from 0x20.
 //   command 100000 (stop request): acknowledged and ignored.
 
+#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <sys/event.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <servers/bootstrap.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #define IPCTOOL_SERVICE "com.valvesoftware.steam.ipctool"
@@ -181,11 +190,111 @@ static void *watch_waiter(void *argument) {
     _exit(0);
 }
 
+// The keepalive: the helper exits when its last greeted connection closes, or when no
+// game says hello within its idle wait, so this connection, opened as soon as the
+// helper publishes its port and never used or closed, keeps it for the game's life.
+// The hello matches shared/wire.h: u32 length, u32 method 1, u64 object 0, the token as
+// a blob with its NUL, u64 protocol hash (0, unchecked for this kind), u32 kind 2.
+#define KEEPALIVE_WAIT_SECONDS 120
+#define HELLO_METHOD 1
+#define HELLO_KIND_KEEPALIVE 2
+#define PORT_FILE_FAILED "failed"
+
+// The port in the helper's port file: 0 while absent, -1 when it says it cannot serve.
+static int published_port(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char text[32] = "";
+    if (!fgets(text, sizeof text, f)) text[0] = 0;
+    fclose(f);
+    if (strncmp(text, PORT_FILE_FAILED, strlen(PORT_FILE_FAILED)) == 0) return -1;
+    int port = atoi(text);
+    return port > 0 && port < 65536 ? port : 0;
+}
+
+static int send_keepalive_hello(int fd, const char *token) {
+    uint32_t token_size = (uint32_t)strlen(token) + 1;
+    uint8_t frame[4 + 4 + 8 + 4 + 256 + 8 + 4];
+    if (token_size > 256) return 0;
+    uint32_t length = 4 + 8 + 4 + token_size + 8 + 4, method = HELLO_METHOD, kind = HELLO_KIND_KEEPALIVE;
+    uint64_t zero = 0;
+    size_t at = 0;
+    memcpy(frame + at, &length, 4); at += 4;
+    memcpy(frame + at, &method, 4); at += 4;
+    memcpy(frame + at, &zero, 8); at += 8;
+    memcpy(frame + at, &token_size, 4); at += 4;
+    memcpy(frame + at, token, token_size); at += token_size;
+    memcpy(frame + at, &zero, 8); at += 8;
+    memcpy(frame + at, &kind, 4); at += 4;
+    if (write(fd, frame, at) != (ssize_t)at) return 0;
+    uint8_t reply[8];
+    size_t got = 0;
+    while (got < sizeof reply) {
+        ssize_t n = read(fd, reply + got, sizeof reply - got);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return 0;
+        got += (size_t)n;
+    }
+    uint32_t status;
+    memcpy(&status, reply + 4, 4);
+    return status == 0;
+}
+
+static void *hold_keepalive(void *unused) {
+    (void)unused;
+    pthread_setname_np("sevo-steam-keepalive");
+    const char *port_text = getenv("SEVO_STEAM_BRIDGE_PORT");
+    const char *port_file = getenv("SEVO_STEAM_BRIDGE_PORT_FILE");
+    const char *token = getenv("SEVO_STEAM_BRIDGE_TOKEN");
+    int fixed_port = port_text ? atoi(port_text) : 0;
+    for (int attempt = 0; attempt < KEEPALIVE_WAIT_SECONDS * 4; attempt++, usleep(250 * 1000)) {
+        int port = fixed_port > 0 ? fixed_port : port_file ? published_port(port_file) : 0;
+        if (port < 0) return NULL;
+        if (port == 0) continue;
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return NULL;
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+        struct sockaddr_in address;
+        memset(&address, 0, sizeof address);
+        address.sin_family = AF_INET;
+        address.sin_port = htons((uint16_t)port);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (connect(fd, (struct sockaddr *)&address, sizeof address) != 0) {
+            close(fd);
+            continue;
+        }
+        if (!send_keepalive_hello(fd, token)) {
+            close(fd);
+            fprintf(stderr, "sevo-steam-ipc: the helper refused the keepalive\n");
+            return NULL;
+        }
+        if (tracing()) fprintf(stderr, "sevo-steam-ipc: keepalive held on port %d\n", port);
+        return NULL;
+    }
+    return NULL;
+}
+
+// The write end of the dock shim's status pipe stays with the game alone: a process the
+// game starts must not hold Steam's waiter open after the game is gone.
+static void keep_status_pipe_private(void) {
+    const char *text = getenv("SEVO_STEAM_BRIDGE_STATUS_FD");
+    long fd = text ? strtol(text, NULL, 10) : -1;
+    if (fd > 2) fcntl((int)fd, F_SETFD, FD_CLOEXEC);
+    unsetenv("SEVO_STEAM_BRIDGE_STATUS_FD");
+}
+
 __attribute__((constructor)) static void sevo_steam_ipc_init(void) {
+    keep_status_pipe_private();
+    pthread_t thread;
+    const char *token = getenv("SEVO_STEAM_BRIDGE_TOKEN");
+    const char *port_file = getenv("SEVO_STEAM_BRIDGE_PORT_FILE");
+    const char *port_text = getenv("SEVO_STEAM_BRIDGE_PORT");
+    if (token && *token && ((port_file && *port_file) || (port_text && *port_text)) &&
+        pthread_create(&thread, NULL, hold_keepalive, NULL) == 0)
+        pthread_detach(thread);
     const char *text = getenv("SEVO_STEAM_BRIDGE_WAITER_PID");
     long pid = text ? strtol(text, NULL, 10) : 0;
     if (pid <= 0) return;
-    pthread_t thread;
     if (pthread_create(&thread, NULL, watch_waiter, (void *)(intptr_t)pid) == 0) pthread_detach(thread);
 }
 

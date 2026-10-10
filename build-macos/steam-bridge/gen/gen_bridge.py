@@ -132,9 +132,28 @@ FIXED_RETURN_VERSIONS = {
 }
 
 # Pointer parameters the naming rules get wrong: "Class_Method": {"param": decision},
-# where a decision is "single", "string", "count:<param>" (elements), "bytes:<param>"
-# or "unsupported".
+# where a decision is "single", "fixed:<n>" (an array of n elements the callee fills, as
+# the SDK's STEAM_OUT_ARRAY_COUNT(<constant>) says), "string", "count:<param>"
+# (elements), "bytes:<param>" or "unsupported". A count parameter that is itself a
+# pointer is read through (`*punCount`).
+_INPUT_ARRAYS = {
+    "GetConnectedControllers": {"handlesOut": "fixed:16"},   # STEAM_{INPUT,CONTROLLER}_MAX_COUNT
+    "GetDigitalActionOrigins": {"originsOut": "fixed:8"},    # STEAM_{INPUT,CONTROLLER}_MAX_ORIGINS
+    "GetAnalogActionOrigins": {"originsOut": "fixed:8"},
+    "GetActiveActionSetLayers": {"handlesOut": "fixed:16"},  # STEAM_{INPUT,CONTROLLER}_MAX_ACTIVE_LAYERS
+}
 PARAM_OVERRIDES = {
+    **{f"{klass}_{method}": decisions for klass in ("ISteamInput", "ISteamController")
+       for method, decisions in _INPUT_ARRAYS.items()},
+    "ISteamInventory_GetResultItems": {"pOutItemsArray": "count:punOutItemsArraySize"},
+    "ISteamInventory_GetItemDefinitionIDs": {"pItemDefIDs": "count:punItemDefIDsArraySize"},
+    "ISteamInventory_GetEligiblePromoItemDefinitionIDs": {"pItemDefIDs": "count:punItemDefIDsArraySize"},
+    "ISteamInventory_DeserializeResult": {"pOutResultHandle": "single"},
+    "ISteamNetworkingUtils_GetPOPList": {"list": "count:nListSz"},
+    "ISteamNetworkingSockets_GetConnectionRealTimeStatus": {"pLanes": "count:nLanes"},
+    "ISteamMatchmaking_RequestLobbyList": {"pFilters": "count:nFilters"},
+    "ISteamHTTP_GetHTTPRequestWasTimedOut": {"pbWasTimedOut": "single"},
+    "ISteamHTTP_GetHTTPDownloadProgressPct": {"pflPercentOut": "single"},
     "ISteamInventory_ExchangeItems": {"pResultHandle": "single"},
     "ISteamInventory_GenerateItems": {"pResultHandle": "single"},
     "ISteamInventory_GetItemsByID": {"pResultHandle": "single"},
@@ -152,7 +171,27 @@ DEFINE_INTERFACE_VERSION = re.compile(r'^#define\s*(?P<name>STEAM(?:\w*)_VERSION
 
 # --- parsing ---------------------------------------------------------------------------
 
-MINGW_INCLUDE = "/opt/homebrew/opt/mingw-w64/toolchain-x86_64/x86_64-w64-mingw32/include"
+MINGW_TRIPLE = "x86_64-w64-mingw32"
+MINGW_INCLUDE_FALLBACK = f"/opt/homebrew/opt/mingw-w64/toolchain-x86_64/{MINGW_TRIPLE}/include"
+
+
+def mingw_include():
+    """mingw-w64's Windows headers: $MINGW_INCLUDE, else under the cross gcc's sysroot,
+    else Homebrew's location."""
+    configured = os.environ.get("MINGW_INCLUDE")
+    if configured:
+        return configured
+    try:
+        sysroot = subprocess.check_output([f"{MINGW_TRIPLE}-gcc", "-print-sysroot"], text=True,
+                                          stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        sysroot = ""
+    candidate = os.path.join(sysroot, MINGW_TRIPLE, "include") if sysroot else ""
+    if candidate and os.path.isfile(os.path.join(candidate, "windows.h")):
+        return candidate
+    return MINGW_INCLUDE_FALLBACK
+
+
 TARGETS = {
     "win": "x86_64-w64-windows-gnu",
     "mac": "arm64-apple-macos11",
@@ -165,7 +204,7 @@ def clang_args(target, sdk_root):
     args = ["-x", "c++", "-std=c++14", f"--target={TARGETS[target]}", "-I" + sdk_root,
             "-isystem", os.path.join(resource_dir, "include"), "-Wno-everything"]
     if target == "win":
-        args += ["-fms-extensions", "-isystem", MINGW_INCLUDE]
+        args += ["-fms-extensions", "-isystem", mingw_include()]
     else:
         sysroot = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
         args += ["-isysroot", sysroot]
@@ -468,7 +507,8 @@ class Param:
         self.count = None         # count parameter name (array kinds)
         self.count_ptr = False    # the count is *param
         self.count_bytes = False  # the count is in bytes, not elements
-        self.fixed = None         # fixed element count (array references)
+        self.fixed = None         # fixed element count (array references, fixed:<n>, singles)
+        self.guessed_single = False  # a single only because nothing sized it
         self.inout = False        # non-const pointer: contents go both ways
         self.always = False       # a reference: never null
         self.elem = None          # element type (array kinds) / record type
@@ -553,9 +593,16 @@ def classify_method(mm):
         if override == "single":
             p.fixed = 1
             continue
+        if override and override.startswith("fixed:"):
+            p.fixed = int(override.split(":", 1)[1])
+            continue
         if override and override.startswith(("count:", "bytes:")):
             p.count = override.split(":", 1)[1]
             p.count_bytes = override.startswith("bytes:")
+            named = next((q for q in params if q.name == p.count), None)
+            if named is None:
+                raise GenError(f"{mm.full}: override names no parameter {p.count}")
+            p.count_ptr = named.type["k"] == "ptr"
             continue
         count = find_count(params, i)
         if count is not None:
@@ -566,6 +613,7 @@ def classify_method(mm):
             p.kind, p.reason = "unsupported", f"{p.name}: {t['spell']} with no size"
             continue
         p.fixed = 1
+        p.guessed_single = True
 
     if mm.m["spelling"] == "GetAPICallResult" and mm.klass["name"] == "ISteamUtils":
         mm.special = "apicallresult"
@@ -631,8 +679,8 @@ def find_count(params, i):
     nt = nxt.type
     pointee = p.type["pointee"]
     bytes_type = pointee["k"] == "void" or (pointee["k"] in ("int", "uint") and pointee.get("size") == 1)
-    if nt["k"] == "ptr" and not nt["const"] and is_int(nt["pointee"]) and is_count_name(nxt.name) \
-            and nxt.name[0] == "p" and (bytes_type or ARRAY_PREFIX.match(p.name)):
+    if nt["k"] == "ptr" and not nt["const"] and is_int(nt["pointee"]) and nt["pointee"]["size"] >= 2 \
+            and is_count_name(nxt.name) and nxt.name[0] == "p" and (bytes_type or ARRAY_PREFIX.match(p.name)):
         return nxt, True
     j = i + 1
     while j < len(params) and params[j].type["k"] == "ptr":
@@ -641,6 +689,34 @@ def find_count(params, i):
             and all(ARRAY_PREFIX.match(params[q].name) for q in range(i, j)):
         return params[j], False
     return None
+
+
+ARRAY_LOOKING = re.compile(r"(Out|List|list|Array|array|Arr|Vec)$|^(prg|pvec|pArray)")
+SINGULAR_S = re.compile(r"(ss|us|is|Details|Stats|Status|Flags|Bytes|Progress)$")
+
+
+def looks_like_array(name):
+    """Whether a pointer the rules took for one element is named like several: *Out,
+    *List, *Array, prg*/pvec*, or a plural. Such a guess sized wrong overflows the
+    helper's buffer, so each one needs a PARAM_OVERRIDES decision."""
+    if is_count_name(name):
+        return False
+    if ARRAY_LOOKING.search(name):
+        return True
+    return name.endswith("s") and not SINGULAR_S.search(name)
+
+
+def guessed_arrays(interfaces):
+    """Every writable pointer guessed to be a single element whose name says otherwise."""
+    found = set()
+    for iface in interfaces:
+        for mm in iface["methods"]:
+            if mm.m["dtor"] or mm.unsupported or mm.local:
+                continue
+            for p in mm.params:
+                if p.kind == "array" and p.guessed_single and p.inout and looks_like_array(p.name):
+                    found.add(f"{mm.key} {p.name} ({p.type['spell']})")
+    return sorted(found)
 
 
 # --- emission helpers ------------------------------------------------------------------
@@ -867,9 +943,18 @@ def emit_mac_method(em, mm, sdkver, method_id):
     for p in mm.params:
         if p.path_out:
             ret_size = PATH_CONV_METHODS_UTOW[mm.key].get("ret_size", False)
-            # The buffer now holds a Windows path; rewrite it in place as a macOS one.
-            out.insert(len(out) - (1 if mm.ret != "void" else 0),
-                       f"        {'ret = ' if ret_size else ''}bridge::path_out_to_mac({p.name}, {p.path_out}{', ret' if ret_size else ''});")
+            # The buffer holds a Windows path; rewrite it in place as a macOS one. A path
+            # too long for the game's buffer comes back empty, with the size it needs
+            # (size-returning methods) or a false result.
+            capacity = f"bridge::count({p.path_out})"
+            convert = f"bridge::path_out_to_mac({p.name}, {capacity})"
+            if ret_size:
+                line = f"        ret = ret ? {convert} : 0;"
+            elif mm.ret == "scalar" and r["k"] == "bool":
+                line = f"        if ({convert} > {capacity}) ret = false;"
+            else:
+                raise GenError(f"{mm.full}: path out-buffer on a method returning {r['spell']}")
+            out.insert(len(out) - (1 if mm.ret != "void" else 0), line)
     out.append("    }")
     return "\n".join(out)
 
@@ -948,13 +1033,16 @@ def emit_win_method(em, mm, sdkver):
                 fn_params.append("const void *")
                 args.append(f"{v}.data")
         elif p.kind == "array":
+            # A fixed-size array is allocated at its full Windows size whatever the
+            # game sent, since the callee fills all of it.
+            least = f"{p.fixed * win_elem_size(em, sdkver, p)}" if p.fixed is not None else ""
             if p.inout:
-                out.append(f"    bridge::InOut {v} = q.get_inout();")
+                out.append(f"    bridge::InOut {v} = q.get_inout({least});")
                 post.append(f"    p.put_inout({v});")
                 fn_params.append("void *")
                 args.append(f"{v}.ptr()")
             else:
-                out.append(f"    bridge::Blob {v} = q.get_in();")
+                out.append(f"    bridge::Blob {v} = q.get_in({least});")
                 fn_params.append("const void *")
                 args.append(f"{v}.data")
         elif p.kind == "outstr":
@@ -964,6 +1052,7 @@ def emit_win_method(em, mm, sdkver):
             post.append(f"    if (has_{p.name}) p.w.str(s_{p.name});")
         else:
             raise GenError(f"{mm.full}: {p.name} unclassified")
+    out.extend(win_count_limits(em, mm, sdkver))
     r = mm.m["result"]
     if mm.ret == "record":
         info = em.record_info(sdkver, r["name"])
@@ -1001,6 +1090,40 @@ def emit_win_method(em, mm, sdkver):
     out.extend(post)
     out.append("}")
     return "\n".join(out)
+
+
+def win_elem_size(em, sdkver, p):
+    """The Windows size of one element of an array parameter."""
+    if p.elem["k"] == "record":
+        info = em.record_info(sdkver, p.elem["name"])
+        if info is None:
+            raise GenError(f"no layout for {p.elem['name']}")
+        return info[0]
+    return type_size(p.elem)
+
+
+def win_count_limits(em, mm, sdkver):
+    """Clamps every count the callee receives to the buffer this process allocated for
+    it, so no sizing rule, right or wrong, lets the callee write past a buffer."""
+    out = []
+    by_name = {q.name: q for q in mm.params}
+    for p in mm.params:
+        if p.kind != "array" or p.count is None:
+            continue
+        q = by_name.get(p.count)
+        if q is None:
+            raise GenError(f"{mm.full}: {p.name} is sized by {p.count}, which is no parameter")
+        unit = 1 if p.count_bytes else win_elem_size(em, sdkver, p)
+        capacity = f"bridge::capacity_of(a_{p.name})"
+        if p.count_ptr:
+            if q.kind != "array" or not is_int(q.elem):
+                raise GenError(f"{mm.full}: count pointer {q.name} is no integer")
+            out.append(f"    bridge::limit_at<{c_type(q.elem)}>(a_{q.name}, {capacity}, {unit});")
+        else:
+            if q.kind != "scalar" or not is_int(q.type):
+                raise GenError(f"{mm.full}: count {q.name} is no integer")
+            out.append(f"    bridge::limit(a_{q.name}, {capacity}, {unit});")
+    return out
 
 
 class GenError(Exception):
@@ -1183,6 +1306,11 @@ def main():
             mm.slot = slots[m["name"]]
             methods.append(mm)
         interfaces.append({"klass": klass, "sdkver": sdkver, "methods": methods, "version": version})
+
+    suspects = guessed_arrays(interfaces)
+    if suspects:
+        sys.exit("pointers sized as one element but named like arrays; give each a PARAM_OVERRIDES "
+                 "decision (\"single\" when it really is one):\n  " + "\n  ".join(suspects))
 
     all_methods = [mm for iface in interfaces for mm in iface["methods"] if not mm.m["dtor"]]
     method_ids = {}

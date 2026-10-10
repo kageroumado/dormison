@@ -41,6 +41,20 @@ enum Status : uint32_t {
     kStatusRefused = 3,             // hello rejected: token or protocol mismatch
 };
 
+// The hello's last field: what the connection is for. A client connection carries the
+// protocol hash and serves calls; a keepalive (libsevosteamipc.dylib's, held from the
+// game's start) carries only the token and serves nothing.
+enum HelloKind : uint32_t {
+    kHelloClient = 1,
+    kHelloKeepalive = 2,
+};
+
+// The largest first frame the helper reads from a connection that has not said hello.
+constexpr uint32_t kMaxHelloFrame = 4096;
+
+// What the helper writes to its port file instead of a port when it cannot serve.
+constexpr const char *kPortFileFailed = "failed";
+
 // A blob is u32 length + bytes; this length means "null pointer".
 constexpr uint32_t kNullBlob = 0xFFFFFFFFu;
 

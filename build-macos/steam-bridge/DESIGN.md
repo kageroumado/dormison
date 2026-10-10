@@ -22,7 +22,10 @@ client. This directory holds the pieces that make that work.
    otherwise hand a universal game its x86_64 slice) with a clean environment: `HOME`,
    `USER`, `TMPDIR`, a plain `PATH`, the `Steam*` variables of the launch, and the bridge's
    own (`DYLD_INSERT_LIBRARIES` = `libsevosteamipc.dylib`, `SEVO_STEAM_BRIDGE_DIR/
-   PORT_FILE/TOKEN/PREFIX/WAITER_PID`), cwd the bundle's parent. The process Steam created
+   PORT_FILE/TOKEN/PREFIX/WAITER_PID/STATUS_FD`), cwd the bundle's parent, and no file
+   descriptor of the wine process but 0–2 and the status pipe (`POSIX_SPAWN_CLOEXEC_DEFAULT`;
+   `libsevosteamipc.dylib` then marks the pipe close-on-exec, so nothing the game starts
+   holds Steam's waiter open). The process Steam created
    goes on as wine running `sevo-native.exe --wait`, holding a pipe the game inherited, so
    Steam's launch action completes (`CreatingProcess → WaitingGameWindow → Completed`) and
    Steam's tracked game process lives exactly as long as the game; when Steam or the app
@@ -105,8 +108,8 @@ clean of unknown methods and short frames.
   passed by value in a register; others by pointer to a copy. On macOS the compiler handles
   all of it, since the proxy is a C++ subclass of the SDK class.
 - **libclang targets that parse cleanly:** `x86_64-w64-windows-gnu` with mingw headers
-  (`/opt/homebrew/opt/mingw-w64/toolchain-x86_64/x86_64-w64-mingw32/include`,
-  `-fms-extensions`) and `arm64-apple-macos11` / `x86_64-apple-macos11` with `xcrun
+  (`$(x86_64-w64-mingw32-gcc -print-sysroot)/x86_64-w64-mingw32/include`, else Homebrew's
+  `/opt/homebrew/opt/mingw-w64/toolchain-x86_64/…`; `MINGW_INCLUDE` overrides; `-fms-extensions`) and `arm64-apple-macos11` / `x86_64-apple-macos11` with `xcrun
   --show-sdk-path`; plus `clang -print-resource-dir`/include. Parsing 91 SDKs × 3 targets
   takes about 10 s in a process pool and is cached in `parsed.json`.
 - **SDK 1.53 is missing from Proton** (it has 1.52 with `SteamNetworkingSockets009` and
@@ -144,12 +147,18 @@ direction, so every pointer argument becomes a sized buffer on the wire.
 - **Argument rules** (the generator; overrides in `PARAM_OVERRIDES`): scalars and enums by
   value; records by value with conversion; `const char *` as a string; a pointer sized by
   the count parameter right after it (`cch*`/`cub*`/`cb*`/`c<Upper>`/`*Size*`/`*Count*`…;
-  bytes when the name says `cub`/`cb`/`cch`/`Size`/`Bytes`, elements otherwise), by a count
-  *pointer* right after it (`punCount`), or by a count after a run of array-named pointers
-  (`prg*`, `pArray*`, `pvec*`…); any other typed pointer or reference is a single element;
-  `void *`/`char *`/`uint8 *` with no size is unsupported. Every non-const pointer travels
-  both ways (present flag, Windows capacity, contents) so in, out and in/out buffers are
-  one case. `char **` is an out string. Interface returns resolve through the `pchVersion`
+  bytes when the name says `cub`/`cb`/`cch`/`Size`/`Bytes`, elements otherwise), by an
+  integer count *pointer* right after it (`punCount`), or by a count after a run of
+  array-named pointers (`prg*`, `pArray*`, `pvec*`…); any other typed pointer or reference
+  is a single element; `void *`/`char *`/`uint8 *` with no size is unsupported. The SDK's
+  `STEAM_OUT_ARRAY_COUNT(<constant>)` arrays (Input and Controller handles, origins, layers)
+  are `fixed:<n>` overrides; the generator refuses to run while any writable pointer it
+  guessed to be one element is named like several (`*Out`, `*List`, `*Array`, `prg*`, a
+  plural), so each new one gets a decision. Every non-const pointer travels both ways
+  (present flag, Windows capacity, contents) so in, out and in/out buffers are one case.
+  The helper allocates a fixed array at its full Windows size, and clamps every count and
+  size it passes to the callee (`*punCount` included) to the buffer it allocated, so a
+  sizing rule that is wrong costs a short answer, never a write past a buffer. `char **` is an out string. Interface returns resolve through the `pchVersion`
   argument (`FIXED_RETURN_VERSIONS` for the rest) into a handle the macOS side wraps in that
   version's proxy, cached per (version, handle). Function-pointer setters are answered
   locally. A record holding pointers (`SteamParamStringArray_t`,
@@ -159,7 +168,8 @@ direction, so every pointer argument becomes a sized buffer on the wire.
   listed in the report; none that Escape Dungeon 2 reaches.
 - **Paths:** `GetAppInstallDir`, `GetUserDataFolder`, `GetItemInstallInfo`, `GetAppInstallDir`
   (AppList) rewrite their out-buffer from Windows to macOS (`Z:\…` → `/…`, other drives →
-  `$SEVO_STEAM_BRIDGE_PREFIX/dosdevices/<l>:/…`); the glyph methods convert their returned
+  `$SEVO_STEAM_BRIDGE_PREFIX/dosdevices/<l>:/…`); a macOS path too long for the game's
+  buffer leaves it empty, and the method answers false or the size the path needs; the glyph methods convert their returned
   string; the `PATH_CONV_METHODS_WTOU` methods (screenshots, workshop files, manifests)
   convert their string arguments the other way (`<prefix>/drive_c/…` → `C:\…`, else `Z:`).
 - **Callbacks:** `Steam_BGetCallback` returns the Windows `CallbackMsg_t` payload; the macOS
@@ -170,24 +180,31 @@ direction, so every pointer argument becomes a sized buffer on the wire.
   table (319 layouts, one per distinct id and size pair across SDKs).
 - **Strings** a method returns are copied into a per-thread ring of 256; Steam's own
   contract is "valid until the next call".
-- **Transport:** loopback TCP, `TCP_NODELAY`, one connection per game thread opened at
-  the thread's first call (retrying for 30 s while the helper starts; the first connection
-  waits for wine), dropped by `Steam_ReleaseThreadLocalMemory(true)`, plus one idle
-  keepalive connection held for the life of the process, since a game's init thread can
-  exit between calls and the helper quits when its last connection closes. The helper binds a
+- **Transport:** loopback TCP, `TCP_NODELAY`, close-on-exec, one connection per game
+  thread opened at the thread's first call (retrying for 30 s while the helper starts; the
+  first connection waits for wine), dropped by `Steam_ReleaseThreadLocalMemory(true)`. The
+  first wait that runs out, a refused hello, or a port file reading `failed` (the helper's
+  word that it cannot serve) turns the bridge off for the process: every later call fails
+  at once instead of waiting again. `libsevosteamipc.dylib` holds one idle keepalive
+  connection from the game's start (hello kind 2: token only, serves nothing), since a
+  game's threads come and go between calls, a game may initialize Steam late, and the
+  helper quits when its last greeted connection closes. The helper binds a
   port of its own (port 0) and publishes it atomically in `steambridge-<appid>.port`; the
   dylib reads `SEVO_STEAM_BRIDGE_PORT_FILE` (the shim's way) or `SEVO_STEAM_BRIDGE_PORT`
   (by hand), so no process can take the port between a choice and the bind. The first frame is a
   hello carrying `SEVO_STEAM_BRIDGE_TOKEN` and the protocol hash (a SHA-256 of every method
   name, its wire signature and the callback table); the helper refuses anything else and
-  refuses to listen at all without a token. A refused hello disables the dylib for the
+  refuses to listen at all without a token. Before the hello a connection gets 10 s and one
+  frame of at most 4 KB; the token compares in constant time; only greeted connections
+  count toward the helper's exit. A refused hello disables the dylib for the
   process, so `SteamAPI_Init` fails fast instead of hanging.
 - **The helper** loads `steamclient64.dll` from
   `HKCU\Software\Valve\Steam\ActiveProcess\SteamClientDll64`, serves one thread per
   connection, logs to `%LOCALAPPDATA%\Sevoflurane\steambridge-<appid>.log` (every call with
-  `SEVO_STEAM_BRIDGE_LOG=1`) and writes its port to `steambridge-<appid>.port`. It exits
-  when the last connection closes (2 s grace) or after `SEVO_STEAM_BRIDGE_IDLE` seconds
-  (120) with no client.
+  `SEVO_STEAM_BRIDGE_LOG=1`) and writes its port to `steambridge-<appid>.port` (or
+  `failed`). It exits when the last greeted connection closes (2 s grace), which with the
+  keepalive is when the game ends, or after `SEVO_STEAM_BRIDGE_IDLE` seconds (120) when no
+  game ever said hello (a failed launch, or a hardened runtime that stripped the bridge).
 
 ## Build
 
@@ -196,7 +213,8 @@ make -C build-macos/steam-bridge sdk venv generate   # SDK headers, libclang ven
 make -C build-macos/steam-bridge -j12 mac win ipc native
 ```
 
-Everything lands under `$DORMISON_BUILD/steam-bridge/` (`sdk/`, `parsed.json`,
+`make venv` installs libclang 18.1.1 exactly. Everything lands under
+`$DORMISON_BUILD/steam-bridge/` (`sdk/`, `parsed.json`,
 `generated/`, `obj/`, `out/`). `fetch-sdk.sh` links a `PROTON_DIR` checkout or makes a
 blob-less sparse clone of Proton's `lsteamclient` at the pinned commit. `package-engine.sh`
 runs all of it and ships `steam-bridge/steamclient.dylib`, `steam-bridge/libsevosteamipc.dylib`,

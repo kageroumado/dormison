@@ -19,7 +19,8 @@ release body.
   headers with struct layouts converted between the two ABIs; achievements, stats, Remote
   Storage saves, callbacks and async call results work; workshop tags, networking message
   buffers and game-side listener objects are not bridged yet (`steam-bridge/REPORT.md`).
-  Engines declare it as `steam-play-macos`.
+  When the helper cannot start, the game runs without Steam after one wait of at most
+  30 s. Engines declare it as `steam-play-macos`.
 
 ## b2
 

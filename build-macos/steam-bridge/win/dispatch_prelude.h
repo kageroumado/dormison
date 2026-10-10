@@ -33,14 +33,38 @@ struct Blob {
     }
 };
 
-// A buffer the callee may write: present or null, `capacity` bytes, primed with what
-// the game had in it.
+// A buffer the callee may write: present or null, `capacity` bytes on the wire (what
+// the game's buffer holds), primed with what the game had in it. `store` can be larger
+// than `capacity` when the callee always fills a fixed size.
 struct InOut {
     bool present = false;
     uint32_t capacity = 0;
     std::vector<uint8_t> store;
     void *ptr() { return present ? store.data() : nullptr; }
 };
+
+// What a count argument may say at most: the bytes this process allocated for the
+// buffer it sizes, or no limit for a null buffer.
+constexpr uint64_t kNoLimit = UINT64_MAX;
+inline uint64_t capacity_of(const InOut &io) { return io.present ? io.store.size() : kNoLimit; }
+inline uint64_t capacity_of(const Blob &b) { return b.data ? b.size : kNoLimit; }
+
+// Clamps a count of `unit`-byte elements to `capacity` bytes; negative counts become 0.
+template <typename T> inline void limit(T &n, uint64_t capacity, uint32_t unit) {
+    if (n < 0) { n = 0; return; }
+    if (capacity == kNoLimit) return;
+    uint64_t most = capacity / unit;
+    if ((uint64_t)n > most) n = (T)most;
+}
+
+// The same for a count the callee reads through a pointer (`*punCount`).
+template <typename T> inline void limit_at(InOut &count, uint64_t capacity, uint32_t unit) {
+    if (!count.present || count.store.size() < sizeof(T)) return;
+    T n;
+    std::memcpy(&n, count.store.data(), sizeof n);
+    limit(n, capacity, unit);
+    std::memcpy(count.store.data(), &n, sizeof n);
+}
 
 struct Req {
     Reader r;
@@ -55,18 +79,22 @@ struct Req {
         r.take(b.data, size);
         return b;
     }
-    // A read-only buffer: one blob, null included.
-    Blob get_in() {
+    // A read-only buffer: one blob, null included, zero-padded to `least` bytes.
+    Blob get_in(uint32_t least = 0) {
         Blob b;
         uint32_t n;
         const uint8_t *p = r.blob(&n);
         if (!p) return b;
         b.store.assign(p, p + n);
+        if (b.store.size() < least) b.store.resize(least, 0);
+        b.size = (uint32_t)b.store.size();
+        // An empty buffer is still a buffer: the callee gets a pointer and a count of 0.
+        if (b.store.empty()) b.store.resize(1, 0);
         b.data = b.store.data();
-        b.size = n;
         return b;
     }
-    InOut get_inout() {
+    // A writable buffer of the game's capacity, allocated at `least` bytes at minimum.
+    InOut get_inout(uint32_t least = 0) {
         InOut io;
         io.present = r.u8() != 0;
         if (!io.present) return io;
@@ -78,7 +106,7 @@ struct Req {
         }
         uint32_t n;
         const uint8_t *p = r.blob(&n);
-        io.store.assign(io.capacity, 0);
+        io.store.assign(io.capacity > least ? io.capacity : least, 0);
         if (p) std::memcpy(io.store.data(), p, n < io.capacity ? n : io.capacity);
         return io;
     }

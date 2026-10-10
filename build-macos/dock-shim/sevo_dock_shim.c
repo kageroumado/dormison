@@ -1019,11 +1019,17 @@ static void warn_if_hardened(const char *bundle) {
 // Replaces the calling process with `executable`, running native: a
 // translated process execs a universal binary translated too, and wine is
 // x86_64 under Rosetta, so the game would otherwise take its x86_64 slice.
+// The game keeps stdin, stdout, stderr and `keep_fd` and nothing else of this
+// wine process's descriptors (the wineserver socket among them).
 // Returns only on failure.
-static int exec_native(const char *executable, char *const *arguments, char *const *environment) {
+static int exec_native(const char *executable, char *const *arguments, char *const *environment, int keep_fd) {
     posix_spawnattr_t attributes;
     posix_spawnattr_init(&attributes);
-    posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETEXEC);
+    posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETEXEC | POSIX_SPAWN_CLOEXEC_DEFAULT);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    for (int fd = 0; fd <= 2; fd++) posix_spawn_file_actions_addinherit_np(&actions, fd);
+    if (keep_fd > 2) posix_spawn_file_actions_addinherit_np(&actions, keep_fd);
     int arm64 = 0;
     size_t size = sizeof arm64;
     if (sysctlbyname("hw.optional.arm64", &arm64, &size, NULL, 0) == 0 && arm64) {
@@ -1032,7 +1038,8 @@ static int exec_native(const char *executable, char *const *arguments, char *con
         posix_spawnattr_setbinpref_np(&attributes, 2, preferred, &set);
     }
     pid_t pid;
-    int error = posix_spawn(&pid, executable, NULL, &attributes, arguments, environment);
+    int error = posix_spawn(&pid, executable, &actions, &attributes, arguments, environment);
+    posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attributes);
     return error;
 }
@@ -1094,7 +1101,8 @@ static int spawn_steam_bridge(const char *appid, const char *token) {
 // of wine's or the app's: the client runs with the engine's PATH, the renderer's
 // variables and no HOME, and a native app must not inherit any of that.
 static char **native_environment(const char *appid, int bridged, const char *ipc, const char *bridge,
-                                 const char *port_file, const char *token, const char *prefix, pid_t waiter) {
+                                 const char *port_file, const char *token, const char *prefix, pid_t waiter,
+                                 int status_fd) {
     char **inherited = *_NSGetEnviron();
     size_t inherited_count = 0;
     while (inherited[inherited_count]) inherited_count++;
@@ -1144,6 +1152,8 @@ static char **native_environment(const char *appid, int bridged, const char *ipc
         snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_PREFIX=%s", prefix);
         out[n++] = strdup(buffer);
         snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_WAITER_PID=%d", (int)waiter);
+        out[n++] = strdup(buffer);
+        snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_STATUS_FD=%d", status_fd);
         out[n++] = strdup(buffer);
         const char *trace = getenv("SEVO_STEAM_BRIDGE_LOG");
         if (trace && *trace == '1') out[n++] = strdup("SEVO_STEAM_BRIDGE_LOG=1");
@@ -1250,7 +1260,8 @@ static void sevo_run_native_app(void) {
         return;
     }
     char **arguments = calloc((size_t)argc, sizeof(char *));
-    char **environment = native_environment(appid, bridged, ipc, bridge, port_file, token, prefix, getpid());
+    char **environment = native_environment(appid, bridged, ipc, bridge, port_file, token, prefix, getpid(),
+                                            status_pipe[1]);
     if (!arguments || !environment) return;
     size_t written = 0;
     arguments[written++] = executable;
@@ -1273,7 +1284,7 @@ static void sevo_run_native_app(void) {
         close(status_pipe[0]);
         fcntl(status_pipe[1], F_SETFD, 0);
         if (chdir(parent) != 0) fprintf(stderr, "sevo-shim: cannot enter %s: %s\n", parent, strerror(errno));
-        int error = exec_native(executable, arguments, environment);
+        int error = exec_native(executable, arguments, environment, status_pipe[1]);
         fprintf(stderr, "sevo-shim: exec of %s failed: %s\n", executable, strerror(error));
         _exit(127);
     }

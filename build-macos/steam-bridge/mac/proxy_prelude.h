@@ -51,8 +51,9 @@ void note_unsupported(const char *method);
 std::string path_to_win(const char *mac_path);
 std::string path_to_mac(const char *win_path);
 // Rewrites an out-buffer holding a Windows path as a macOS path, in place within
-// `capacity` bytes; answers the new length including the NUL.
-uint32_t path_out_to_mac(char *buffer, uint32_t capacity, uint32_t ret = 0);
+// `capacity` bytes; answers the macOS path's size including the NUL. A size above
+// `capacity` means it did not fit, and the buffer is left empty.
+uint32_t path_out_to_mac(char *buffer, uint32_t capacity);
 
 // ISteamUtils::GetAPICallResult through the bridge, with callback struct conversion.
 bool api_call_result(uint64_t handle, uint32_t method, uint64_t call, void *callback,

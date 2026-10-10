@@ -14,12 +14,16 @@
  *   SteamAppId                the game, so steamclient knows whose pipe this is
  *   SEVO_STEAM_BRIDGE_PORT    listening port (0 or unset: any free port)
  *   SEVO_STEAM_BRIDGE_TOKEN   what every connection's hello must carry
- *   SEVO_STEAM_BRIDGE_IDLE    seconds to wait for a first client, default 120
+ *   SEVO_STEAM_BRIDGE_IDLE    seconds to wait for a first greeted connection, default 120
  *
  * The port it bound is written to %LOCALAPPDATA%\Sevoflurane\steambridge-<appid>.port,
  * which is how the game's steamclient.dylib finds it, and a transcript to
- * steambridge-<appid>.log beside it. The process exits when the
- * last client disconnects, or after the idle wait with no client at all.
+ * steambridge-<appid>.log beside it; when it cannot serve, the port file says "failed"
+ * so the game stops waiting. The game's libsevosteamipc.dylib holds a keepalive
+ * connection from the game's first moments, so the process lives exactly as long as
+ * the game: it exits when the last greeted connection closes, or after the idle wait
+ * when no game ever said hello (one whose launch failed, or whose hardened runtime
+ * stripped the bridge).
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -229,8 +233,25 @@ namespace {
 /* --------------------------------------------------------------- transport */
 
 std::string g_token;
-volatile LONG g_clients;
-volatile LONG g_ever_connected;
+volatile LONG g_clients;          // greeted connections
+volatile LONG g_ever_connected;   // a connection has been greeted
+
+// Seconds an unauthenticated connection may take to say hello.
+constexpr DWORD kHelloTimeoutMs = 10000;
+
+// Token comparison in time independent of where the first difference is.
+bool token_matches(const char *token) {
+    if (!token) return false;
+    size_t n = strlen(token);
+    unsigned char diff = (unsigned char)(n != g_token.size());
+    for (size_t i = 0; i < g_token.size(); i++)
+        diff |= (unsigned char)(g_token[i] ^ (i < n ? token[i] : 0));
+    return diff == 0;
+}
+
+void set_receive_timeout(SOCKET s, DWORD ms) {
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&ms, sizeof ms);
+}
 
 bool send_all(SOCKET s, const void *data, size_t n) {
     const char *p = static_cast<const char *>(data);
@@ -263,26 +284,37 @@ bool reply(SOCKET s, bridge::Rep &p, uint32_t status) {
     return send_all(s, frame.buf.data(), frame.buf.size());
 }
 
+enum Greeting { kUngreeted, kClient, kKeepalive };
+
 /* One request: returns false when the connection should end. */
-bool serve_frame(SOCKET s, std::vector<uint8_t> &frame, bool &greeted) {
+bool serve_frame(SOCKET s, std::vector<uint8_t> &frame, Greeting &greeting) {
     bridge::Req q;
     q.r = bridge::Reader(frame.data(), frame.size());
     q.method = q.r.u32();
     q.obj = q.r.u64();
     bridge::Rep p;
 
-    if (!greeted) {
+    if (greeting == kUngreeted) {
         if (q.method != bridge::kMethodHello) return false;
         const char *token = q.r.str();
         uint64_t hash = q.r.u64();
-        uint32_t version = q.r.u32();
-        bool ok = token && token == g_token && hash == bridge_protocol_hash && version == 1;
-        logf_("hello: protocol %016llx%s, version %u -> %s", (unsigned long long)hash,
-              hash == bridge_protocol_hash ? "" : " (ours differs)", version, ok ? "accepted" : "refused");
+        uint32_t kind = q.r.u32();
+        bool token_ok = token_matches(token);
+        bool ok = !q.r.failed && token_ok &&
+                  ((kind == bridge::kHelloClient && hash == bridge_protocol_hash) || kind == bridge::kHelloKeepalive);
+        logf_("hello: %s, protocol %016llx%s -> %s", kind == bridge::kHelloKeepalive ? "keepalive" : "client",
+              (unsigned long long)hash,
+              kind != bridge::kHelloClient || hash == bridge_protocol_hash ? "" : " (ours differs)",
+              ok ? "accepted" : token_ok ? "refused" : "refused (token)");
         reply(s, p, ok ? bridge::kStatusOK : bridge::kStatusRefused);
-        greeted = ok;
-        return ok;
+        if (!ok) return false;
+        greeting = kind == bridge::kHelloKeepalive ? kKeepalive : kClient;
+        InterlockedIncrement(&g_clients);
+        InterlockedExchange(&g_ever_connected, 1);
+        set_receive_timeout(s, 0);
+        return true;
     }
+    if (greeting == kKeepalive) return false;
 
     uint32_t status = bridge::kStatusOK;
     if (q.method < bridge::kFirstGeneratedMethod) {
@@ -308,20 +340,24 @@ DWORD WINAPI serve_client(LPVOID arg) {
     SOCKET s = (SOCKET)(uintptr_t)arg;
     int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
-    bool greeted = false;
+    set_receive_timeout(s, kHelloTimeoutMs);
+    Greeting greeting = kUngreeted;
     std::vector<uint8_t> frame;
     for (;;) {
         uint32_t length;
         if (!recv_all(s, &length, 4)) break;
-        if (length < 12 || length > bridge::kMaxBlob + 1024) break;
+        uint32_t most = greeting == kUngreeted ? bridge::kMaxHelloFrame : bridge::kMaxBlob + 1024;
+        if (length < 12 || length > most) break;
         frame.resize(length);
         if (!recv_all(s, frame.data(), length)) break;
-        if (!serve_frame(s, frame, greeted)) break;
+        if (!serve_frame(s, frame, greeting)) break;
     }
-    if (g_steam.ReleaseThreadLocalMemory) g_steam.ReleaseThreadLocalMemory(1);
+    if (greeting == kClient && g_steam.ReleaseThreadLocalMemory) g_steam.ReleaseThreadLocalMemory(1);
     closesocket(s);
-    LONG left = InterlockedDecrement(&g_clients);
-    logf_("client gone, %ld left", left);
+    if (greeting != kUngreeted) {
+        LONG left = InterlockedDecrement(&g_clients);
+        logf_("%s gone, %ld left", greeting == kKeepalive ? "keepalive" : "client", left);
+    }
     return 0;
 }
 
@@ -330,6 +366,16 @@ std::string local_app_data() {
     DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", buffer, sizeof buffer);
     if (n == 0 || n >= sizeof buffer) return "C:\\";
     return std::string(buffer) + "\\Sevoflurane";
+}
+
+/* Tells the game's dylib to stop waiting: the port file says "failed" instead of a port. */
+void publish_failure(const std::string &stem) {
+    std::string tmp = stem + ".port.tmp";
+    FILE *f = fopen(tmp.c_str(), "w");
+    if (!f) return;
+    fprintf(f, "%s\n", bridge::kPortFileFailed);
+    fclose(f);
+    MoveFileExA(tmp.c_str(), (stem + ".port").c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
 }  // namespace
@@ -354,14 +400,19 @@ int main() {
     if (!appid) logf_("SteamAppId is not set: steamclient will not know the game");
     if (g_token.empty()) {
         logf_("SEVO_STEAM_BRIDGE_TOKEN is not set: nothing could tell the game's connections from anyone else's, so not listening");
+        publish_failure(stem);
         return 1;
     }
 
-    if (!load_steamclient()) return 1;
+    if (!load_steamclient()) {
+        publish_failure(stem);
+        return 1;
+    }
 
     WSADATA data;
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
         logf_("WSAStartup failed");
+        publish_failure(stem);
         return 1;
     }
     SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -372,6 +423,7 @@ int main() {
     addr.sin_port = htons((u_short)(port_text ? atoi(port_text) : 0));
     if (bind(listener, (sockaddr *)&addr, sizeof addr) != 0 || listen(listener, 16) != 0) {
         logf_("bind/listen on port %s failed: %d", port_text ? port_text : "0", WSAGetLastError());
+        publish_failure(stem);
         return 1;
     }
     int len = sizeof addr;
@@ -398,16 +450,14 @@ int main() {
         if (ready > 0) {
             SOCKET client = accept(listener, NULL, NULL);
             if (client == INVALID_SOCKET) continue;
-            InterlockedIncrement(&g_clients);
-            InterlockedExchange(&g_ever_connected, 1);
             HANDLE thread = CreateThread(NULL, 0, serve_client, (LPVOID)(uintptr_t)client, 0, NULL);
             if (thread) CloseHandle(thread);
-            else { closesocket(client); InterlockedDecrement(&g_clients); }
+            else closesocket(client);
             continue;
         }
         if (g_ever_connected) {
             if (g_clients == 0) {
-                /* A brief grace: a game's threads reconnect one by one at start. */
+                /* A brief grace for a connection being replaced. */
                 Sleep(2000);
                 if (g_clients == 0) {
                     logf_("last client gone: exiting");
@@ -415,7 +465,7 @@ int main() {
                 }
             }
         } else if (--idle_seconds <= 0) {
-            logf_("no client within the idle wait: exiting");
+            logf_("no game said hello within the idle wait: exiting");
             break;
         }
     }

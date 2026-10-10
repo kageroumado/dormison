@@ -17,10 +17,12 @@
 //   SEVO_STEAM_BRIDGE_LOG     1 traces every call on stderr
 
 #include <arpa/inet.h>
+#include <atomic>
 #include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <map>
 #include <mutex>
 #include <netinet/in.h>
@@ -72,7 +74,9 @@ static const char *method_name(uint32_t method) {
 // MARK: - The connection
 
 // One connection per game thread, opened at the thread's first call. The helper may
-// still be starting when the game first asks, so the first connect retries for a while.
+// still be starting when the game first asks, so the first connect retries for a while;
+// once one wait has run out, or the helper has refused a hello or published that it
+// cannot serve, the bridge is off for the process and every call fails at once.
 struct Connection {
     int fd = -1;
     bool tried = false;
@@ -82,8 +86,11 @@ struct Connection {
 };
 
 static thread_local Connection connection;
-static std::mutex disabled_lock;
-static bool disabled = false;   // a refused hello: no connection will ever work
+static std::atomic<bool> disabled{false};   // no connection will ever work
+
+static void disable(const char *why) {
+    if (!disabled.exchange(true)) log("Steam is out of reach for this process: %s", why);
+}
 
 static bool write_all(int fd, const void *data, size_t n) {
     const uint8_t *p = static_cast<const uint8_t *>(data);
@@ -124,22 +131,25 @@ static bool round_trip(int fd, const std::vector<uint8_t> &frame, std::vector<ui
     return read_all(fd, reply.data(), length);
 }
 
-// The port the helper published, or 0 while the file is not there yet.
+// The port the helper published, 0 while the file is not there yet, or -1 when the
+// helper wrote that it cannot serve.
 static int port_from_file(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
-    int port = 0;
-    if (fscanf(f, "%d", &port) != 1) port = 0;
+    char text[32] = "";
+    if (!fgets(text, sizeof text, f)) text[0] = 0;
     fclose(f);
+    if (strncmp(text, kPortFileFailed, strlen(kPortFileFailed)) == 0) return -1;
+    int port = atoi(text);
     return port > 0 && port < 65536 ? port : 0;
 }
 
 static bool hello(int fd);
-static void hold_keepalive();
 
 static int connect_once(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     sockaddr_in addr;
@@ -162,16 +172,14 @@ static bool hello(int fd) {
     w.u64(0);
     w.str(token ? token : "");
     w.u64(bridge_protocol_hash);
-    w.u32(1);
+    w.u32(kHelloClient);
     w.close(0);
     std::vector<uint8_t> reply;
     if (!round_trip(fd, w.buf, reply)) return false;
     Reader r(reply.data(), reply.size());
     uint32_t status = r.u32();
     if (status != kStatusOK) {
-        log("the helper refused this connection (status %u): token or protocol mismatch", status);
-        std::lock_guard<std::mutex> guard(disabled_lock);
-        disabled = true;
+        disable("the helper refused the hello (token or protocol mismatch)");
         return false;
     }
     return true;
@@ -182,10 +190,7 @@ static int current_fd() {
     if (c.fd >= 0) return c.fd;
     if (c.tried) return -1;
     c.tried = true;
-    {
-        std::lock_guard<std::mutex> guard(disabled_lock);
-        if (disabled) return -1;
-    }
+    if (disabled) return -1;
     const char *port_text = getenv("SEVO_STEAM_BRIDGE_PORT");
     const char *port_file = getenv("SEVO_STEAM_BRIDGE_PORT_FILE");
     int port = port_text ? atoi(port_text) : 0;
@@ -195,10 +200,14 @@ static int current_fd() {
         return -1;
     }
     // Up to 30 s for the helper to come up: wine's own start is most of it.
-    for (int attempt = 0; attempt < 300; attempt++) {
+    for (int attempt = 0; attempt < 300 && !disabled; attempt++) {
         if (port <= 0) {
             port = port_from_file(port_file);
-            if (port <= 0) {
+            if (port < 0) {
+                disable("the helper could not start (its log is steambridge-<appid>.log in the bottle)");
+                return -1;
+            }
+            if (port == 0) {
                 usleep(100 * 1000);
                 continue;
             }
@@ -211,34 +220,12 @@ static int current_fd() {
             }
             c.fd = fd;
             if (tracing()) log("connected to port %d on thread %p", port, (void *)pthread_self());
-            hold_keepalive();
             return fd;
-        }
-        {
-            std::lock_guard<std::mutex> guard(disabled_lock);
-            if (disabled) return -1;
         }
         usleep(100 * 1000);
     }
-    log("no helper on port %d after 30 s", port);
+    if (!disabled) disable(port > 0 ? "no helper answered within 30 s" : "the helper published no port within 30 s");
     return -1;
-}
-
-// One connection that is never used and never closed: the helper exits when its last
-// connection closes, and a game's threads come and go between calls, so this one keeps
-// the helper alive for exactly as long as the process that holds it.
-static void hold_keepalive() {
-    static std::once_flag once;
-    std::call_once(once, [] {
-        const char *port_text = getenv("SEVO_STEAM_BRIDGE_PORT");
-        const char *port_file = getenv("SEVO_STEAM_BRIDGE_PORT_FILE");
-        int port = port_text ? atoi(port_text) : 0;
-        if (port <= 0 && port_file) port = port_from_file(port_file);
-        if (port <= 0) return;
-        int fd = connect_once(port);
-        if (fd < 0) return;
-        if (!hello(fd)) close(fd);
-    });
 }
 
 static void drop_connection() {
@@ -438,16 +425,18 @@ std::string path_to_win(const char *mac_path) {
     return out;
 }
 
-uint32_t path_out_to_mac(char *buffer, uint32_t capacity, uint32_t ret) {
-    (void)ret;
+uint32_t path_out_to_mac(char *buffer, uint32_t capacity) {
     if (!buffer || capacity == 0) return 0;
     buffer[capacity - 1] = 0;
     std::string converted = path_to_mac(buffer);
-    size_t n = converted.size();
-    if (n >= capacity) n = capacity - 1;
-    memcpy(buffer, converted.data(), n);
-    buffer[n] = 0;
-    return (uint32_t)n + 1;
+    size_t needed = converted.size() + 1;
+    if (needed > capacity) {
+        log("a path of %zu bytes does not fit the game's %u-byte buffer", needed, capacity);
+        buffer[0] = 0;
+        return needed > UINT32_MAX ? UINT32_MAX : (uint32_t)needed;
+    }
+    memcpy(buffer, converted.c_str(), needed);
+    return (uint32_t)needed;
 }
 
 // MARK: - Callbacks
