@@ -6,16 +6,16 @@
 # name the release in the manifest the app reads and upload the manifest
 # with its signature.
 #
-# usage: publish-engine.sh r<N>|b<N> [--channel stable|beta] [--dry-run]
+# usage: publish-engine.sh r<N> [--dry-run]
 #                          [--engine <dir>] [--key <ed25519.pem>]
 #                          [--identity "<Developer ID Application: …>"]
 #                          [--notes-file <file>] [--min-app-version <x.y>]
 #                          [--fresh-manifest]
 #
-# A release r<N> goes to the stable channel and a beta b<N> to the beta
-# channel. --fresh-manifest writes a manifest that names this release alone,
-# instead of adding it to the one already published: every other channel and
-# the component list start empty.
+# Every engine is a regular GitHub release named r<N>, and the manifest names
+# it as the engine the app installs. --fresh-manifest writes a manifest that
+# names this release alone, instead of updating the one already published:
+# the component list starts empty and holds only what this engine ships.
 #
 # The engine key is required (--key, or DORMISON_ED25519_KEY): every release
 # carries a signature the app verifies against the key pinned in
@@ -30,9 +30,8 @@
 # Helpers) for the manifest gate.
 set -euo pipefail
 
-VERSION="${1:?usage: publish-engine.sh r<N>|b<N> [--channel stable|beta] [--dry-run] [--engine <dir>] [--key <pem>] [--identity <id>] [--notes-file <file>] [--fresh-manifest]}"
+VERSION="${1:?usage: publish-engine.sh r<N> [--dry-run] [--engine <dir>] [--key <pem>] [--identity <id>] [--notes-file <file>] [--fresh-manifest]}"
 shift
-CHANNEL=stable
 DRY_RUN=0
 ENGINE_DIR=""
 KEY="${DORMISON_ED25519_KEY:-}"
@@ -42,7 +41,6 @@ FRESH_MANIFEST=0
 MIN_APP_VERSION="${SEVO_MIN_APP_VERSION:-1.0}"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --channel) CHANNEL="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --engine) ENGINE_DIR="$2"; shift 2 ;;
         --key) KEY="$2"; shift 2 ;;
@@ -54,10 +52,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[[ "$VERSION" =~ ^[rb][0-9]+$ ]] || { echo "version must be r<N> or b<N>, got $VERSION"; exit 2; }
-[[ "$CHANNEL" =~ ^(stable|beta)$ ]] || { echo "channel must be stable or beta"; exit 2; }
-[ "${VERSION:0:1}" = b ] && [ "$CHANNEL" != beta ] && { echo "a beta ($VERSION) goes to the beta channel: pass --channel beta (kagerou: -p)"; exit 2; }
-[ "${VERSION:0:1}" = r ] && [ "$CHANNEL" != stable ] && { echo "a release ($VERSION) goes to the stable channel"; exit 2; }
+[[ "$VERSION" =~ ^r[0-9]+$ ]] || { echo "version must be r<N>, got $VERSION"; exit 2; }
 [ -n "$KEY" ] || { echo "no engine key: pass --key <ed25519.pem> or set DORMISON_ED25519_KEY"; exit 2; }
 [ -f "$KEY" ] || { echo "engine key not found at $KEY"; exit 2; }
 [ -z "$NOTES_FILE" ] || [ -f "$NOTES_FILE" ] || { echo "notes file not found at $NOTES_FILE"; exit 2; }
@@ -167,26 +162,29 @@ sign_file() {
 echo "==> signing $NAME.tar.xz"
 sign_file "$TARBALL"
 
-# --- the manifest: the current one (or, with --fresh-manifest, none), with this release in its channel ---
+# --- the manifest: the current one (or, with --fresh-manifest, none), naming this release ---
 URL="$ENGINE_REPO_URL/releases/download/$VERSION/$NAME.tar.xz"
 MANIFEST="$RELEASES/engine.json"
-echo "==> manifest: $CHANNEL -> $VERSION"
+echo "==> manifest: $VERSION"
 if [ "$FRESH_MANIFEST" = 1 ]; then
     echo '{"schema": 2, "channels": {}, "components": {}}' > "$MANIFEST"
 else
     gh release download manifest --repo "$ENGINE_REPO" --pattern engine.json --output "$MANIFEST" --clobber
 fi
-python3 - "$MANIFEST" "$CHANNEL" "$NAME" "$URL" "$SHA256" "$SIZE" "$MIN_APP_VERSION" "$STAGE/engine-info.json" <<'PY'
+python3 - "$MANIFEST" "$NAME" "$URL" "$SHA256" "$SIZE" "$MIN_APP_VERSION" "$STAGE/engine-info.json" <<'PY'
 import hashlib, json, sys, urllib.request
-path, channel, version, url, sha256, size, min_app, info_path = sys.argv[1:]
+path, version, url, sha256, size, min_app, info_path = sys.argv[1:]
 manifest = json.load(open(path))
 info = json.load(open(info_path))
 manifest["schema"] = max(manifest.get("schema", 1), 2)
-manifest.setdefault("channels", {})[channel] = {
+release = {
     "version": version, "minAppVersion": min_app, "url": url,
     "sha256": sha256, "sizeBytes": int(size),
     "notes": f"wine {info['wine']}; commit {info['commit'][:12]}",
 }
+# The app reads `stable`. `beta` carries the same release because installed 1.1 betas set to
+# Beta read that key until they update themselves.
+manifest["channels"] = {"stable": release, "beta": release}
 
 def digest(source):
     """The sha256 of the component payload, streamed from its release asset.
@@ -220,7 +218,7 @@ for key in ("dxmt", "dxvk"):
         entry["sha256"] = digest(source)
 json.dump(manifest, open(path, "w"), indent=2)
 open(path, "a").write("\n")
-print(json.dumps(manifest["channels"][channel], indent=2))
+print(json.dumps(release, indent=2))
 PY
 sign_file "$MANIFEST"
 echo "==> manifest gate: $SEVO engine check-manifest"
@@ -255,13 +253,9 @@ echo "==> tag $VERSION"
 git -C "$REPO" tag -s "$VERSION" -m "Engine $VERSION"
 git -C "$REPO" push origin "$VERSION"
 
-# Expanded as ${PRERELEASE[@]+"${PRERELEASE[@]}"}: an empty array is an unbound
-# variable to the bash 3.2 macOS ships, and set -u would stop the release here.
-PRERELEASE=()
-[ "$CHANNEL" = beta ] && PRERELEASE=(--prerelease)
 echo "==> release $VERSION on $ENGINE_REPO"
 gh release create "$VERSION" --repo "$ENGINE_REPO" --verify-tag --title "Engine $VERSION" \
-    --notes-file "$NOTES" ${PRERELEASE[@]+"${PRERELEASE[@]}"} \
+    --notes-file "$NOTES" \
     "$TARBALL" "$TARBALL.sha256" "$TARBALL.sig" "$RELEASES/$NAME-engine-info.json" "$RELEASES/$NAME.patch"
 
 # --- what GitHub holds is what was signed ---
@@ -269,6 +263,7 @@ UPLOADED="$(gh api "repos/$ENGINE_REPO/releases/tags/$VERSION" -q ".assets[] | s
 [ "$UPLOADED" = "sha256:$SHA256" ] || { echo "GitHub reports $UPLOADED for the tarball, expected sha256:$SHA256 — the manifest was NOT published"; exit 1; }
 
 echo "==> manifest on $ENGINE_REPO, release manifest"
+# A prerelease, so the repository's Latest release stays the newest engine.
 gh release view manifest --repo "$ENGINE_REPO" >/dev/null 2>&1 || gh release create manifest --repo "$ENGINE_REPO" --prerelease \
     --title "Engine manifest" --notes "The signed manifest Sevoflurane reads: engine.json and engine.json.sig." --target main
 # --clobber deletes each old asset before its upload, so a failed upload leaves the release
@@ -282,4 +277,4 @@ for attempt in 1 2 3 4 5; do
     sleep $((attempt * 10))
 done
 [ "$LIVE" = "$EXPECTED" ] || { echo "the manifest on $ENGINE_REPO does not match $MANIFEST — upload it by hand now"; exit 1; }
-echo "==> published $VERSION as $CHANNEL"
+echo "==> published $VERSION"

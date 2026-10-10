@@ -29,7 +29,7 @@ Sevoflurane 会下载引擎并管理它的设置。想直接用它玩游戏，�
 [构建指南](build-macos/README.md)介绍了工具链、配置、打包和发布流程。
 [CONTRIBUTING.md](CONTRIBUTING.md)说明了如何报告问题、验证改动。
 
-每个正式版本都有一个 `r<N>` 标签，每个测试版本都有一个 `b<N>` 标签，附带引擎 tar 包、校验和、Ed25519 签名、
+每个版本都有一个 `r<N>` 标签，附带引擎 tar 包、校验和、Ed25519 签名、
 `engine-info.json`，以及相对 `wine-staging-base` 的差异文件。
 Sevoflurane 通过带签名的发布清单查找引擎版本。
 

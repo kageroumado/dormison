@@ -1,8 +1,10 @@
 # Engine releases
 
 One section per release, written when the work lands. `publish-engine.sh`
-uses the section for the version (`r<N>` for a release, `b<N>` for a beta) as the GitHub
-release body.
+uses the section for the version (`r<N>`) as the GitHub release body, and the build names
+itself after the top heading.
+
+## r5
 
 ## b4
 

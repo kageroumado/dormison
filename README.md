@@ -31,7 +31,7 @@ The [build guide](build-macos/README.md) covers the toolchain, configuration,
 packaging and releases. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to
 report a problem and verify a change.
 
-Each release has an `r<N>` tag and each beta a `b<N>` tag. Both include the
+Each release has an `r<N>` tag and includes the
 engine tarball, checksum, Ed25519 signature, `engine-info.json` and the diff
 against `wine-staging-base`. Sevoflurane finds engines through its signed release
 manifest.

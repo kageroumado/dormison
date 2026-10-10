@@ -124,10 +124,9 @@ it was not linked against.
 
 ## Release names
 
-A release is `dormison-r<N>` and a beta `dormison-b<N>`, the same `N` when the beta is what
-becomes the release. `kagerou publish dormison -v b<N> -p` writes `channels.beta`;
-`-v r<N>` writes `channels.stable`. The app shows either as "Dormison r<N>" / "Dormison b<N>"
-and takes the channel Settings › Engine names (`sevo engine channel beta`).
+Every engine is a regular GitHub release named `r<N>`, its engine `dormison-r<N>`, published
+with `kagerou publish dormison -v r<N>`. The app shows it as "Dormison r<N>". The betas
+`b1`–`b4` came before r5 and keep their names.
 
 ## Build, stage, package
 
@@ -319,9 +318,8 @@ it was for.
 ## Releasing
 
 ```bash
-build-macos/publish-engine.sh b1 --key <ed25519.pem> --channel beta --dry-run   # pack, sign, check; nothing leaves the Mac
-build-macos/publish-engine.sh b1 --key <ed25519.pem> --channel beta             # tag, GitHub release, manifest
-build-macos/publish-engine.sh r1 --key <ed25519.pem>                            # a release, on the stable channel
+build-macos/publish-engine.sh r5 --key <ed25519.pem> --dry-run   # pack, sign, check; nothing leaves the Mac
+build-macos/publish-engine.sh r5 --key <ed25519.pem>             # tag, GitHub release, manifest
 ```
 
 A release is the engine directory `package-engine.sh` assembled, staged as
@@ -330,8 +328,9 @@ a copy, packed as `dormison-r<N>.tar.xz`, and published as GitHub release
 `engine-info.json`, and the diff against `wine-staging-base`. The manifest
 Sevoflurane reads (`engine.json` on this repository's `manifest` release, beside the
 `shaders` release that holds the presenter's shader packages)
-then names it as `channels.stable` (or `channels.beta`) and goes up with its
-own `engine.json.sig`. The release body is the `## r<N>` section of
+then names it as `channels.stable` and goes up with its own `engine.json.sig`.
+The same entry goes under `channels.beta`, which installed 1.1 betas set to Beta
+read until they update themselves. The release body is the `## r<N>` section of
 `CHANGES.md`, or `--notes-file`.
 
 What the app verifies, and the script therefore produces:
@@ -346,8 +345,7 @@ What the app verifies, and the script therefore produces:
 - After the upload, the tarball's digest as GitHub reports it is compared
   with the local sha256; the manifest is published only when they agree.
 
-The script refuses a dirty tree, a version that is not `r<N>` or `b<N>` (a beta
-goes to the beta channel and a release to stable), a tag that
+The script refuses a dirty tree, a version that is not `r<N>`, a tag that
 exists locally or on origin, an engine packaged from a commit other than
 HEAD, and a HEAD that is not on `origin/main`. Binaries carry the ad-hoc
 signature `package-engine.sh` left; `--identity "Developer ID Application:
