@@ -2394,6 +2394,17 @@ static void sevo_enable_steam_play( WINE_MODREF *wm )
     if (RtlQueryEnvironmentVariable_U( NULL, &name, &value ) || value.Length != sizeof(WCHAR) ||
         value_buffer[0] != '1')
         return;
+    /* Games inherit steam.exe's environment and load steamclient64.dll too; only the client
+     * process owns the compatibility manager. */
+    {
+        const UNICODE_STRING *image = &NtCurrentTeb()->Peb->ProcessParameters->ImagePathName;
+        static const WCHAR steamW[] = L"\\steam.exe";
+        SIZE_T len = wcslen( steamW );
+
+        if (image->Length < len * sizeof(WCHAR) ||
+            wcsnicmp( image->Buffer + image->Length / sizeof(WCHAR) - len, steamW, len ))
+            return;
+    }
 
     nt = RtlImageNtHeader( (HMODULE)base );
     if (!nt || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return;
