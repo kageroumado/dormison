@@ -1292,13 +1292,14 @@ static void sevo_run_native_app(void) {
     fcntl(status_pipe[0], F_SETFD, 0);
     fprintf(stderr, "sevo-shim: %s runs natively as pid %d (app %s%s); this process waits for it\n",
             executable, (int)child, appid, bridged ? ", with the steam bridge" : "");
+    // ntdll reads these as the process starts and runs the waiter in place of
+    // the program Steam asked for (dlls/ntdll/unix/env.c, sevo_native_waiter):
+    // a process wine starts takes its program from the server, never argv.
     char fd_text[16];
     snprintf(fd_text, sizeof fd_text, "%d", status_pipe[0]);
+    setenv("SEVO_NATIVE_WAITER", waiter, 1);
     setenv("SEVO_NATIVE_WAIT_FD", fd_text, 1);
     setenv("SEVO_QUIET", "1", 1);
-    argv[1] = strdup(waiter);
-    argv[2] = (char *)"--wait";
-    for (int i = 3; i < argc; i++) argv[i] = (char *)"";
 }
 
 // MARK: - The owner watch

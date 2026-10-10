@@ -2173,6 +2173,63 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
 /*************************************************************************
  *		init_startup_info
  */
+/*************************************************************************
+ *		sevo_native_waiter
+ *
+ * The dock shim forks a native macOS game out of the process Steam created for
+ * it, then names the program this process runs instead of the one Steam asked
+ * for: SEVO_NATIVE_WAITER (a unix path to sevo-native.exe), waiting on the pipe
+ * in SEVO_NATIVE_WAIT_FD until the game ends. A process started by another wine
+ * process takes its image and command line from the server's startup info, so
+ * the swap is made here, before the main exe loads. Both variables are cleared
+ * so a child of this process starts as itself.
+ */
+static void sevo_native_waiter( RTL_USER_PROCESS_PARAMETERS *params, UNICODE_STRING *nt_name )
+{
+    static const WCHAR waitW[] = {' ','-','-','w','a','i','t',' ',0};
+    const char *waiter = getenv( "SEVO_NATIVE_WAITER" ), *fd = getenv( "SEVO_NATIVE_WAIT_FD" );
+    WCHAR *nt = NULL, *dos, *cmdline;
+    SIZE_T dos_len, fd_len, size, i;
+    void *block = NULL;
+
+    if (!waiter || !fd || !*fd) return;
+    if (unix_to_nt_file_name( waiter, &nt, FILE_OPEN ) || !nt ||
+        nt[0] != '\\' || nt[1] != '?' || nt[2] != '?' || nt[3] != '\\')
+    {
+        free( nt );
+        return;
+    }
+    dos = nt + 4;
+    for (dos_len = 0; dos[dos_len]; dos_len++) ;
+    fd_len = strlen( fd );
+    /* "<dos>" --wait <fd>, then the image path */
+    size = (2 + dos_len + ARRAY_SIZE(waitW) - 1 + fd_len + 1 + dos_len + 1) * sizeof(WCHAR);
+    if (NtAllocateVirtualMemory( NtCurrentProcess(), &block, 0, &size, MEM_COMMIT, PAGE_READWRITE ))
+    {
+        free( nt );
+        return;
+    }
+    cmdline = block;
+    i = 0;
+    cmdline[i++] = '"';
+    memcpy( cmdline + i, dos, dos_len * sizeof(WCHAR) );
+    i += dos_len;
+    cmdline[i++] = '"';
+    memcpy( cmdline + i, waitW, (ARRAY_SIZE(waitW) - 1) * sizeof(WCHAR) );
+    i += ARRAY_SIZE(waitW) - 1;
+    for (SIZE_T j = 0; j < fd_len; j++) cmdline[i++] = (unsigned char)fd[j];
+    cmdline[i++] = 0;
+    init_unicode_string( &params->CommandLine, cmdline );
+    memcpy( cmdline + i, dos, (dos_len + 1) * sizeof(WCHAR) );
+    init_unicode_string( &params->ImagePathName, cmdline + i );
+
+    free( nt_name->Buffer );
+    init_unicode_string( nt_name, nt );
+    unsetenv( "SEVO_NATIVE_WAITER" );
+    unsetenv( "SEVO_NATIVE_WAIT_FD" );
+}
+
+
 void init_startup_info(void)
 {
     WCHAR *src, *dst, *env;
@@ -2279,6 +2336,7 @@ void init_startup_info(void)
     free( env );
     free( info );
 
+    sevo_native_waiter( params, &nt_name );
     status = load_main_exe( &nt_name, machine, &module );
     if (!NT_SUCCESS(status))
     {
