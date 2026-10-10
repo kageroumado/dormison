@@ -10,8 +10,10 @@ release body.
   `SEVO_STEAM_PLAY=1` in `steam.exe`'s environment the client's dormant Steam Play system is
   switched on as `steamclient64.dll` loads, so a game mapped to the app's macOS tool gets its
   macOS depots on install and update. When Steam launches such a game (shell-opening its
-  `.app`), the dock shim execs the bundle's executable in place, same pid, with the Windows
-  client's files given their executable bits.
+  `.app`), the dock shim runs the bundle's executable natively, arm64 first, as a child of the
+  process Steam created, which waits as `sevo-native.exe` so Steam tracks the game until it
+  quits; the Windows client's files get their executable bits. Only apps Steam maps to the
+  macOS tool are handed off.
 - The Steam bridge: such a game's `libsteam_api.dylib` finds `steamclient.dylib` through
   `libsevosteamipc.dylib` and reaches the signed-in Windows client through
   `sevo-steambridge.exe` in the bottle, which loads the real `steamclient64.dll`. Every
