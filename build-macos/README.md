@@ -48,6 +48,46 @@ and configure looks for a `libSDL2-2.0*` install name. Keep SDL in: the
 IOHID backend alone does not get an Xbox Wireless Controller over
 Bluetooth (`045E:02E0`) to a game, and the SDL backend does.
 
+## A build that corrupts Genshin's asset reads
+
+The engines published as b1 and b2 corrupt data the game reads during a scene
+load: Genshin logs `HK4EUpload: error asr_003: BlobSignature not match
+[...blocks/00/<blk>@<offset>]` by the dozen, or Unity's `The file 'CAB-…' is
+corrupted!` / `Mismatched serialization`, then hangs on the loading screen or
+dies with `c0000005`. The files on disk are intact, Wine's file I/O reads them
+correctly (14,700 overlapped, unbuffered and mapped reads per block, compared
+byte for byte), and nothing in the launch environment matters: it happens
+with DXMT and with D3DMetal, with and without the presenter, the GPU identity,
+AVX, Sevoflurane's launcher bundle, or the fps unlocker. b1 survived five
+hours through a plain `wine steam.exe GenshinImpact.exe` script; b2 fails on
+the first or second load through either path.
+
+The same b2 commit built on an M4 Max with Xcode 27.0 (27A5194q, Apple clang
+21.0.0, `ld-1328.2`) and `configure-from-engine.sh` below, installed over a
+copy of the published b2 (its arm64 wineserver, loader, renderer payloads and
+`winegstreamer.so` kept), ran 2 h 10 min and 21 scene loads without a single
+bad read, and Yaagl's wine-11.0 with the same DXMT 0.80 is clean too. The
+published `x86_64-unix/*.so` carry `LC_BUILD_VERSION` tool `ld 27037.1`
+against the same 27.0 SDK; the local ones `ld 1328.2`. Both use chained
+fixups; neither contains AVX code. So the difference is the toolchain (or a
+flag that differs from the recipe in this file, or the i386+x86_64 build),
+not the source. Until that is pinned down, build the engine with Xcode 27.0's
+linker, or at least run Genshin through a few teleports before publishing.
+
+## Configuring against an installed engine
+
+`configure-from-engine.sh <src> <build> [<engine>]` replaces `deps/`: the
+headers come from this Mac's Homebrew (arch-neutral), the x86_64 dylibs
+configure links and reads sonames from are the engine's own `wine/lib`, and
+the sonames are pinned to the file names the engine's unix halves `dlopen`
+(configure's `otool -L` parsing misreads `@rpath` install names otherwise and
+writes `"\tlibgnutls.dylib (compatibility version …)"` into `config.h`, which
+leaves `secur32` without schannel and the HoYoverse sign-in with "connection
+failed"). It is x86_64-only and leaves GStreamer out, so keep the engine's
+`winegstreamer.so`/`.dll` and i386 files. `make -k`: the `fonts/*.fon` targets
+abort because `sfnt2fon` has no rpath to that freetype; nothing else needs
+them.
+
 ## Configure
 
 `build-macos/configure.sh` runs exactly this block against `$DORMISON_BUILD`; use it
