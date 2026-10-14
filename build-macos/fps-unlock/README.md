@@ -1,7 +1,9 @@
 # sevo-fpsunlock
 
-Genshin Impact holds itself to 60 fps on PC. This raises the cap from beside the game, the
-way genshin-fps-unlock does, in two megabytes instead of a .NET desktop application.
+A small Wine executable raises Genshin Impact’s 60 fps cap by loading genshin-fps-unlock’s stub into the running game and writing a target frame rate.
+
+<details>
+<summary>Unlocker behavior and integration</summary>
 
 - `sevo-fpsunlock-stub.dll` is genshin-fps-unlock's `UnlockerStub` (MIT, `stub/LICENSE`),
   built here with mingw-w64 and linked static. Loaded into the game, it finds the frame-rate
@@ -24,3 +26,5 @@ upstream's `UnlockerStub/dllmain.cpp` again.
 ```sh
 make            # both, stripped; needs `brew install mingw-w64`
 ```
+
+</details>

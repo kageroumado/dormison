@@ -1,7 +1,6 @@
 # SDK overlay
 
-Headers the generator needs that no pinned Proton commit carries. `fetch-sdk.sh` lays
-them over the Proton set.
+Steamworks 1.53 headers supply `SteamNetworkingSockets011`, requested by Steamworks.NET 20.x games and absent from the pinned Proton SDKs. `fetch-sdk.sh` overlays them on the Proton set.
 
 ## steamworks_sdk_153
 

@@ -1,14 +1,12 @@
 # sevo-steamstub — Steamworks for native NW.js games
 
-The app runs NW.js games in native macOS NW.js: the dock shim execs `nwjs` in
-place of the wine process, so Steam keeps counting the same pid as the game.
-The native process is then outside the bottle and cannot call the game's
-`steam_api.dll`.
+`sevo-steamstub` gives native macOS NW.js games access to their Windows Steamworks DLL through newline-delimited JSON on loopback. The Wine stub loads the DLL and calls `SteamAPI_Init`; Sevoflurane’s `greenworks.js` forwards the game’s API calls.
 
-This stub stays inside. It loads the game's Steamworks dll, calls
-`SteamAPI_Init`, and answers newline-delimited JSON on loopback. The native
-half is the app's `greenworks.js`, which presents the greenworks API to the
-game and forwards each call here.
+The dock shim replaces the Wine process with `nwjs`, preserving the PID Steam tracks as the game.
+
+
+<details>
+<summary>Protocol and build reference</summary>
 
 ## Build
 
@@ -103,3 +101,5 @@ printf '{"op":"init"}\n{"op":"getAchievementNames"}\n{"op":"quit"}\n' | nc -w 3 
 Steam must be running. App id 480 is Spacewar, the Steamworks sample: it has
 achievements and stats defined, so it exercises the paths that a game without
 achievements cannot.
+
+</details>
