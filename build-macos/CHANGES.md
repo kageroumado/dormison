@@ -4,6 +4,12 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>`) as the GitHub release body, and the build names
 itself after the top heading.
 
+## r7
+
+- An inactive program's topmost windows stay below the Dock. A game's fullscreen-mode window is
+  topmost, and after a switch to another app it still covered the Dock and took the clicks meant
+  for it; the level above the Dock is now for the active program only.
+
 ## r6
 
 - Every native macOS game runs under `sevo-native-supervisor`, which owns Steam's waiter and the

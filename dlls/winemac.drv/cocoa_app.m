@@ -1386,8 +1386,11 @@ static const NSTimeInterval kUnansweredRequestSeconds = 5;
         NSUInteger nextFloatingIndex = 0;
         __block NSInteger maxLevel = NSIntegerMin;
         __block NSInteger maxNonfloatingLevel = NSNormalWindowLevel;
-        /* Windows with WS_EX_TOPMOST should have a window level higher than the macOS dock */
-        __block NSInteger minFloatingLevel = kCGDockWindowLevel + 1;
+        /* Windows with WS_EX_TOPMOST have a window level higher than the macOS
+           Dock while the app is active. An inactive app's topmost windows stay
+           below it: a game's fullscreen-mode window is topmost, and one that
+           covered the Dock after a switch away took the clicks meant for it. */
+        __block NSInteger minFloatingLevel = active ? kCGDockWindowLevel + 1 : NSFloatingWindowLevel;
         __block WineWindow* prev = nil;
         WineWindow* window;
 
