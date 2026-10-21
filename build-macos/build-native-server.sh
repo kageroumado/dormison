@@ -29,7 +29,9 @@ if [ ! -f "$N/deps/lib/libinotify.0.dylib" ]; then
         "https://github.com/libinotify-kqueue/libinotify-kqueue/releases/download/$INOTIFY/libinotify-$INOTIFY.tar.gz"
     tar -xzf "libinotify-$INOTIFY.tar.gz"
     cd "libinotify-$INOTIFY"
-    ./configure --prefix="$N/deps" "CFLAGS=-O2 -arch arm64 -arch x86_64 -mmacosx-version-min=$MIN" "LDFLAGS=-arch arm64 -arch x86_64 -mmacosx-version-min=$MIN" > "$N/inotify-configure.log" 2>&1
+    # fdclosedir is in the SDK from macOS 26.4, past the floor: configure would
+    # find it and the library would not load on 26.0-26.3.
+    ./configure --prefix="$N/deps" ac_cv_func_fdclosedir=no "CFLAGS=-O2 -arch arm64 -arch x86_64 -mmacosx-version-min=$MIN" "LDFLAGS=-arch arm64 -arch x86_64 -mmacosx-version-min=$MIN" > "$N/inotify-configure.log" 2>&1
     make -j6 > "$N/inotify-build.log" 2>&1 && make install >> "$N/inotify-build.log" 2>&1
     lipo -info "$N/deps/lib/libinotify.0.dylib"
 fi
@@ -39,7 +41,7 @@ if [ "${1:-}" = --reconfigure ] || [ ! -f Makefile ]; then
     echo "==> configuring the arm64 server tree against $REPO"
     "$REPO/configure" --enable-win64 --enable-archs=i386,x86_64 --disable-tests --without-x \
         --without-freetype --without-opengl --without-gnutls --without-vulkan --without-gstreamer \
-        --without-sdl --without-ffmpeg --without-oss --without-alsa \
+        --without-sdl --without-ffmpeg --without-oss --without-alsa ac_cv_func_pipe2=no \
         "CC=clang -arch arm64 -mmacosx-version-min=$MIN -std=gnu23" 'CFLAGS=-g -O2 -DDORMISON_X86_64_GUEST' \
         "CPPFLAGS=-I$N/deps/include" "LDFLAGS=-L$N/deps/lib" > "$N/configure.log" 2>&1
 fi

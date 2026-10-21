@@ -1,6 +1,10 @@
 #!/bin/bash
 # The configure block from README.md, as a script so the two cannot drift: every
 # flag here is one r9 was built with, plus SDL (winebus needs it for Bluetooth pads).
+# The SDK declares functions newer than macos-min, and configure's link test
+# finds them: pipe2 is macOS 27, so it is ruled out and ntdll takes the
+# pipe-and-fcntl path. A new -Wunguarded-availability-new warning in the build
+# log names the next one.
 # usage: DORMISON_BUILD=<tree> build-macos/configure.sh [extra configure flags]
 set -euo pipefail
 W=${DORMISON_BUILD:-$HOME/Developer/build/dormison}
@@ -23,4 +27,5 @@ OBJC=gcc PATH="/opt/homebrew/opt/bison/bin:$PATH" \
   --without-gphoto --without-krb5 --without-netapi --without-fontconfig \
   --without-gssapi --without-opengl --without-capi --without-cups --without-pcap \
   --without-pcsclite --with-mingw --prefix=$W/stage \
+  ac_cv_func_pipe2=no \
   "$@"
