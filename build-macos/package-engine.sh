@@ -39,6 +39,7 @@ ENGINES="$HOME/Library/Application Support/Sevoflurane/Engines"
 LIVE="${SEVO_LIVE_ENGINE:-$ENGINES/$(ls "$ENGINES" 2>/dev/null | grep -E '^dormison-[rb][0-9]+$' | sort -t- -k2.2 -n | tail -1)}"
 OUT="$ENGINES/$VERSION"
 
+MIN="$(cat "$HERE/macos-min")"
 # shellcheck source=engine-gates.sh
 . "$HERE/engine-gates.sh"
 
@@ -285,13 +286,13 @@ fi
 
 # --- the dock shim, from this repository's source: it is the engine's face ---
 echo "==> building the dock shim"
-clang -arch arm64 -arch x86_64 -O2 -Wall -dynamiclib -framework ApplicationServices -framework Security \
+clang -arch arm64 -arch x86_64 -mmacosx-version-min="$MIN" -O2 -Wall -dynamiclib -framework ApplicationServices -framework Security \
     -o "$OUT/libsevodockshim.dylib" "$HERE/dock-shim/sevo_dock_shim.c"
 codesign -s - -f "$OUT/libsevodockshim.dylib"
 record source "$OUT/libsevodockshim.dylib"
 
 # --- the supervisor every native macOS game runs under (dock-shim/sevo_native_supervisor.c) ---
-clang -arch arm64 -arch x86_64 -O2 -Wall -o "$OUT/sevo-native-supervisor" "$HERE/dock-shim/sevo_native_supervisor.c"
+clang -arch arm64 -arch x86_64 -mmacosx-version-min="$MIN" -O2 -Wall -o "$OUT/sevo-native-supervisor" "$HERE/dock-shim/sevo_native_supervisor.c"
 codesign -s - -f "$OUT/sevo-native-supervisor"
 record source "$OUT/sevo-native-supervisor"
 
@@ -360,6 +361,11 @@ cat > "$OUT/engine-info.json" <<EOF
 }
 EOF
 record packaging "$OUT/engine-info.json"
+
+# --- every Mach-O runs on the engine's floor, whatever built it: ours, the
+# donor's dylibs, GStreamer's. ---
+echo "==> checking every binary against the macOS $MIN floor"
+gate_macos_floor "$OUT" "$MIN" || { echo "$OUT is incomplete: trash it, fix the build, package again"; exit 1; }
 
 # --- the manifest: every file, its sha256 and where it came from, the source
 # the build was made from, and the donor the payloads were taken from. The

@@ -13,12 +13,13 @@
 # build-macos/package-engine.sh refuses a staged winemac.so whose id is not
 # the archive's.
 #
-# The target triple matches the engine's: x86_64, deployment target 14. The
+# The target triple matches the engine's: x86_64, and the deployment target
+# every engine binary is built for (build-macos/macos-min). The
 # Swift runtime is in the dyld shared cache in both slices, so nothing ships
 # alongside the archive.
 
 SWIFTC ?= swiftc
-TARGET ?= x86_64-apple-macos14
+TARGET ?= x86_64-apple-macos$(shell cat ../../../build-macos/macos-min)
 SOURCES = Presenter.swift SurfacePresenter.swift GLPresenter.swift FinalPass.swift Scalers.swift MPVHook.swift
 BUILD_ID = $(shell cat $(SOURCES) Makefile | shasum -a 256 | cut -c1-16)
 

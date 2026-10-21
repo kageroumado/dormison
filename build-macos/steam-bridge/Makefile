@@ -53,7 +53,7 @@ test-gen: $(if $(filter $(VENV)/bin/python,$(PYTHON)),$(VENV)/bin/python)
 # --- macOS: the generated proxies plus the runtime, one universal dylib ---
 MAC_GEN := $(addprefix $(GEN)/mac/,$(shell cat $(GEN)/mac/sources.txt 2>/dev/null))
 MAC_OBJS := $(patsubst $(GEN)/mac/%.cpp,$(OBJ)/mac/%.o,$(MAC_GEN)) $(OBJ)/mac/bridge.o $(OBJ)/mac/transport.o
-MAC_ARCH := -arch arm64 -arch x86_64
+MAC_ARCH := -arch arm64 -arch x86_64 -mmacosx-version-min=$(shell cat $(HERE)../macos-min)
 MACFLAGS := -std=c++17 -O2 $(MAC_ARCH) -fvisibility=hidden -I$(HERE)mac -I$(HERE)shared -I$(BUILD)
 MAC_DEPS := $(HERE)mac/proxy_prelude.h $(HERE)shared/wire.h $(HERE)mac/transport.h
 

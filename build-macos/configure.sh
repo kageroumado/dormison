@@ -4,8 +4,9 @@
 # usage: DORMISON_BUILD=<tree> build-macos/configure.sh [extra configure flags]
 set -euo pipefail
 W=${DORMISON_BUILD:-$HOME/Developer/build/dormison}
+MIN="$(cat "$(dirname "$0")/macos-min")"
 cd $W/build
-CC='clang -arch x86_64 -std=gnu23 -m64' \
+CC="clang -arch x86_64 -mmacosx-version-min=$MIN -std=gnu23 -m64" \
 CFLAGS='-g -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0' \
 CPPFLAGS="-I$W/deps/include" \
 LDFLAGS="-L$W/deps/lib -Wl,-rpath,@loader_path/../lib -Wl,-rpath,@loader_path/../../" \

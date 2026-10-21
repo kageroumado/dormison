@@ -116,4 +116,18 @@ echo untracked > "$T/repo/scratch"
 git -C "$T/repo" checkout -q -- file
 expect_acceptance "an untracked file alone does not make the tree dirty" gate_clean_tree "$T/repo" 0
 
+# --- the macOS floor: a file built for a newer macOS than macos-min ---
+printf 'int main(void) { return 0; }\n' > "$T/floor.c"
+mkdir -p "$T/floor-ok/lib" "$T/floor-new/lib" "$T/floor-mixed/lib"
+clang -arch arm64 -mmacosx-version-min=26.0 -o "$T/floor-ok/lib/old-enough" "$T/floor.c"
+clang -arch arm64 -arch x86_64 -mmacosx-version-min=15.0 -o "$T/floor-ok/lib/universal" "$T/floor.c"
+printf 'MZ not a Mach-O\n' > "$T/floor-ok/lib/module.dll"
+expect_acceptance "binaries at or below the floor are accepted" gate_macos_floor "$T/floor-ok" 26.0
+clang -arch arm64 -mmacosx-version-min=27.0 -o "$T/floor-new/lib/too-new" "$T/floor.c"
+expect_refusal "a binary built for a newer macOS is refused" "lib/too-new needs macOS 27.0" gate_macos_floor "$T/floor-new" 26.0
+clang -arch x86_64 -mmacosx-version-min=26.0 -o "$T/x" "$T/floor.c"
+clang -arch arm64 -mmacosx-version-min=27.0 -o "$T/y" "$T/floor.c"
+lipo -create -output "$T/floor-mixed/lib/mixed" "$T/x" "$T/y"
+expect_refusal "a universal binary with one slice too new is refused" "lib/mixed needs macOS 27.0" gate_macos_floor "$T/floor-mixed" 26.0
+
 [ "$FAILED" = 0 ] && echo "every gate behaved" || exit 1

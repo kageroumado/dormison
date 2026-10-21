@@ -76,3 +76,66 @@ gate_clean_tree() {
     printf '%s\n' "$dirty" | sed 's/^/    /'
     return 1
 }
+
+# Every Mach-O under a directory runs on the engine's floor: each slice's
+# LC_BUILD_VERSION minos (or LC_VERSION_MIN_MACOSX) is at most the version in
+# macos-min. clang stamps the build Mac's own version when no deployment target
+# is passed, and dyld then refuses the file on any older macOS.
+#   gate_macos_floor <directory> <floor, e.g. 26.0>
+gate_macos_floor() {
+    python3 - "$1" "$2" <<'PY'
+import os, struct, sys
+
+root = sys.argv[1]
+floor = tuple((list(map(int, sys.argv[2].split("."))) + [0, 0])[:3])
+LC_BUILD_VERSION, LC_VERSION_MIN_MACOSX, PLATFORM_MACOS = 0x32, 0x24, 1
+
+def version(packed):
+    return (packed >> 16, (packed >> 8) & 0xFF, packed & 0xFF)
+
+def slice_minimums(data, offset):
+    magic = struct.unpack_from("<I", data, offset)[0]
+    if magic not in (0xFEEDFACF, 0xFEEDFACE):
+        return []
+    ncmds = struct.unpack_from("<I", data, offset + 16)[0]
+    cursor = offset + (32 if magic == 0xFEEDFACF else 28)
+    found = []
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from("<II", data, cursor)
+        if cmd == LC_BUILD_VERSION and struct.unpack_from("<I", data, cursor + 8)[0] == PLATFORM_MACOS:
+            found.append(version(struct.unpack_from("<I", data, cursor + 12)[0]))
+        elif cmd == LC_VERSION_MIN_MACOSX:
+            found.append(version(struct.unpack_from("<I", data, cursor + 8)[0]))
+        cursor += size
+    return found
+
+def minimums(path):
+    with open(path, "rb") as f:
+        head = f.read(4)
+        if head not in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe"):
+            return []
+        data = head + f.read()
+    if head == b"\xca\xfe\xba\xbe":
+        count = struct.unpack_from(">I", data, 4)[0]
+        if count > 16:
+            return []  # a Java class file shares the fat magic
+        offsets = [struct.unpack_from(">I", data, 8 + 20 * i + 8)[0] for i in range(count)]
+        return [m for o in offsets for m in slice_minimums(data, o)]
+    return slice_minimums(data, 0)
+
+refused = []
+for directory, _, files in os.walk(root):
+    for name in files:
+        path = os.path.join(directory, name)
+        if os.path.islink(path):
+            continue
+        newest = max(minimums(path), default=None)
+        if newest and newest > floor:
+            shown = ".".join(map(str, newest if newest[2] else newest[:2]))
+            refused.append(f"    {os.path.relpath(path, root)} needs macOS {shown}")
+if refused:
+    print(f"{len(refused)} file(s) need a newer macOS than the engine's floor {sys.argv[2]} (build-macos/macos-min):")
+    print("\n".join(sorted(refused)))
+    sys.exit(1)
+PY
+}
