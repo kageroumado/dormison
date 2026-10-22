@@ -4,6 +4,17 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>`) as the GitHub release body, and the build names
 itself after the top heading.
 
+## r8
+
+- Runs on macOS 26. Every binary in the engine is built for macOS 26 (`build-macos/macos-min`),
+  where the earlier releases asked for the macOS the build Mac ran, 27, and dyld refused
+  `ntdll.so` at bottle creation on Tahoe. Packaging refuses an engine with any binary built for a
+  newer macOS. `pipe2` and libinotify's `fdclosedir`, which macOS 27 and 26.4 add, are left out
+  at configure, and their fallbacks run instead.
+- Steam's screenshot key works in OpenGL games. `wglGetProcAddress` gives the ARB vertex buffer
+  functions on any GL 1.5 context, core profile included, as Windows drivers do; Steam's overlay
+  asks for `glMapBufferARB` by that name, and without it every capture failed.
+
 ## r7
 
 - An inactive program's topmost windows stay below the Dock. A game's fullscreen-mode window is
