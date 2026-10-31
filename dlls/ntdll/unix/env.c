@@ -877,16 +877,22 @@ static void apply_env_file( const char *path, BOOL bottle_wide )
 /***********************************************************************
  *              load_sevo_env
  *
- * Per-bottle and per-program environment, applied at process start in three
+ * Per-bottle and per-program environment, applied at process start in
  * passes, each overriding the one before: <prefix>/.sevo/bottle.env, then
  * <prefix>/.sevo/debug.env, then <prefix>/.sevo/apps/<exe>.env, <exe> being
- * the program's basename in lower case. A value written to any of them
+ * the program's basename in lower case, then <prefix>/.sevo/apps/<folder>/
+ * <exe>.env for the lower-case names of the program's grandparent, parent
+ * and own directory, in that order, so the nearest folder wins. The app
+ * writes the folder files under a game's install folder, the one under
+ * steamapps/common, because games share exe names (every RPG Maker game is
+ * game.exe) and a file keyed by name alone can carry only what its claimants
+ * agree on; the folder is one game's. A value written to any of them
  * reaches the next program start, whichever process spawns it. debug.env is
  * the app's debug mode: it is written when the mode turns on and deleted
  * when it turns off, so the user's own bottle settings survive underneath it.
  * Runs before the dll path, the locale and the debug channels are read, so
  * WINEDLLPATH_PREPEND, LC_ALL and WINEDEBUG can live here. SEVO_ENV_FILES=0
- * skips all three files and the SEVO_LOADER exec in loader_exec with them.
+ * skips every file and the SEVO_LOADER exec in loader_exec with them.
  */
 
 /* Whether the .sevo env files are read at all. */
@@ -897,56 +903,112 @@ BOOL sevo_env_files_enabled(void)
     return !(skip && !strcmp( skip, "0" ));
 }
 
-/* The per-program file for a program given as a unix or Windows path, or NULL. */
-static char *sevo_program_file( const char *program )
+static char *ascii_lower_copy( const char *start, size_t len )
+{
+    char *copy = malloc( len + 1 ), *p;
+
+    memcpy( copy, start, len );
+    copy[len] = 0;
+    for (p = copy; *p; p++) *p = tolower( (unsigned char)*p );
+    return copy;
+}
+
+/* How many of a program's enclosing folders its env file may be keyed on: an exe
+ * the app records sits at most three levels under the game's install folder. */
+#define SEVO_FOLDER_LEVELS 3
+
+/* The lower-case names of the directories enclosing a program given as a unix
+ * or Windows path, nearest first, up to SEVO_FOLDER_LEVELS of them; the count.
+ * None for a program given by name alone. */
+static int sevo_program_folders( const char *program, char *folders[SEVO_FOLDER_LEVELS] )
+{
+    const char *end = program + strlen( program ), *start;
+    int count = 0;
+
+    while (end > program && end[-1] != '/' && end[-1] != '\\') end--;   /* drop the exe */
+    while (count < SEVO_FOLDER_LEVELS && end > program)
+    {
+        const char *separator = end - 1;
+        start = separator;
+        while (start > program && start[-1] != '/' && start[-1] != '\\') start--;
+        if (separator > start) folders[count++] = ascii_lower_copy( start, separator - start );
+        end = start;
+    }
+    return count;
+}
+
+/* The env files of a program given as a unix or Windows path, in the order they
+ * are applied: the file keyed by its name alone, then the folder-keyed files
+ * from the farthest folder to the nearest. The count, 0 for a program with no
+ * name; `paths` holds SEVO_FOLDER_LEVELS + 1. */
+static int sevo_program_files( const char *program, char **paths )
 {
     const char *exe = program;
-    char *path, *name, *p;
+    char *name, *folders[SEVO_FOLDER_LEVELS], *p;
+    int count, i, n = 0;
 
-    if (!program) return NULL;
+    if (!program) return 0;
     if ((p = strrchr( exe, '/' ))) exe = p + 1;
     if ((p = strrchr( exe, '\\' ))) exe = p + 1;
-    if (!*exe) return NULL;
-    name = strdup( exe );
-    for (p = name; *p; p++) *p = tolower( (unsigned char)*p );
-    asprintf( &path, "%s/.sevo/apps/%s.env", config_dir, name );
+    if (!*exe) return 0;
+    name = ascii_lower_copy( exe, strlen( exe ) );
+    asprintf( &paths[n++], "%s/.sevo/apps/%s.env", config_dir, name );
+    count = sevo_program_folders( program, folders );
+    for (i = count - 1; i >= 0; i--)
+    {
+        asprintf( &paths[n++], "%s/.sevo/apps/%s/%s.env", config_dir, folders[i], name );
+        free( folders[i] );
+    }
     free( name );
-    return path;
+    return n;
+}
+
+/* One key's value out of one env file, or NULL when the file or the key is absent. */
+static char *env_file_value( const char *path, const char *key )
+{
+    size_t key_len = strlen( key );
+    char *found = NULL;
+    char line[4096];
+    FILE *file;
+
+    if (!(file = fopen( path, "r" ))) return NULL;
+    while (fgets( line, sizeof(line), file ))
+    {
+        char *p = line, *end;
+
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp( p, key, key_len ) || p[key_len] != '=') continue;
+        p += key_len + 1;
+        end = p + strlen( p );
+        while (end > p && (end[-1] == '\n' || end[-1] == '\r')) *--end = 0;
+        if (*p) found = strdup( p );
+        break;
+    }
+    fclose( file );
+    return found;
 }
 
 
 /***********************************************************************
  *              sevo_program_env
  *
- * One value out of a program's file. The loader reads SEVO_LOADER this way,
- * before the process exists to have an environment.
+ * One value out of a program's files, the nearest folder's first and the
+ * file keyed by name alone last, which is the order load_sevo_env's passes
+ * leave in force. The loader reads SEVO_LOADER this way, before the process
+ * exists to have an environment.
  */
 char *sevo_program_env( const char *program, const char *key )
 {
-    size_t key_len = strlen( key );
-    char *path, *found = NULL;
-    char line[4096];
-    FILE *file;
+    char *paths[SEVO_FOLDER_LEVELS + 1], *found = NULL;
+    int count, i;
 
     if (!sevo_env_files_enabled()) return NULL;
-    if (!(path = sevo_program_file( program ))) return NULL;
-    if ((file = fopen( path, "r" )))
+    count = sevo_program_files( program, paths );
+    for (i = count - 1; i >= 0; i--)
     {
-        while (fgets( line, sizeof(line), file ))
-        {
-            char *p = line, *end;
-
-            while (*p == ' ' || *p == '\t') p++;
-            if (strncmp( p, key, key_len ) || p[key_len] != '=') continue;
-            p += key_len + 1;
-            end = p + strlen( p );
-            while (end > p && (end[-1] == '\n' || end[-1] == '\r')) *--end = 0;
-            if (*p) found = strdup( p );
-            break;
-        }
-        fclose( file );
+        if (!found) found = env_file_value( paths[i], key );
+        free( paths[i] );
     }
-    free( path );
     return found;
 }
 
@@ -966,10 +1028,15 @@ void load_sevo_env(void)
     free( path );
 
     if (main_argc < 2) return;
-    if ((path = sevo_program_file( main_argv[1] )))
     {
-        apply_env_file( path, FALSE );
-        free( path );
+        char *paths[SEVO_FOLDER_LEVELS + 1];
+        int count = sevo_program_files( main_argv[1], paths ), i;
+
+        for (i = 0; i < count; i++)
+        {
+            apply_env_file( paths[i], FALSE );
+            free( paths[i] );
+        }
     }
 }
 

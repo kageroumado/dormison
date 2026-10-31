@@ -14,6 +14,10 @@ itself after the top heading.
 - A decoder that is given thirty buffers and produces nothing says so, once, at the error level every
   log carries (`transform … decoded none of N buffers (video/x-h264 -> video/x-raw)`). Sevoflurane
   reads the line and offers the game the other video decoder.
+- A program's env file is also looked up by its install folder: `apps/<folder>/<exe>.env` for the
+  lower-case names of its own, parent and grandparent directories, applied after `apps/<exe>.env` so the
+  nearest folder wins, and `SEVO_LOADER` is read the same way. Two games that ship the same exe (every RPG
+  Maker game is `game.exe`) each keep their own settings and Dock identity.
 
 ## r8
 
