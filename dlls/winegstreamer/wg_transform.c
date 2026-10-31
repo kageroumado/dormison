@@ -95,6 +95,8 @@ struct wg_transform
     GstCaps *input_caps;
 
     bool draining;
+    /* Whether a buffer has been queued since the transform was created or last flushed. */
+    bool fed;
     INT64 ts_offset;
 };
 
@@ -932,6 +934,7 @@ NTSTATUS wg_transform_push_data(void *args)
         GST_INFO("Wrapped %u/%u bytes from sample %p to %"GST_PTR_FORMAT, sample->size, sample->max_size, sample, buffer);
     }
 
+    transform->fed = true;
     input_mime = gst_structure_get_name(gst_caps_get_structure(transform->input_caps, 0));
     if (!strcmp(input_mime, "video/x-raw") && gst_video_info_from_caps(&video_info, transform->input_caps))
     {
@@ -1361,6 +1364,18 @@ NTSTATUS wg_transform_flush(void *args)
     NTSTATUS status;
 
     GST_LOG("transform %p", transform);
+
+    /* A flush before the first buffer has nothing to discard, and GStreamer's vtdec never
+     * recovers from one: flush-start sets its flushing flag, only the drain of a live
+     * VideoToolbox session clears it, and a decoder flushed before its caps arrive drops
+     * every frame of the stream. Unity's VideoPlayer sends MFT_MESSAGE_COMMAND_FLUSH right
+     * after SetOutputType, so an H.264 title clip decoded nothing (Umamusume). */
+    if (!transform->fed)
+    {
+        GST_INFO("transform %p, nothing to flush before the first buffer", transform);
+        return STATUS_SUCCESS;
+    }
+    transform->fed = false;
 
     /* this ensures no messages are travelling through the pipeline whilst we flush */
     event = gst_event_new_flush_start();

@@ -4,6 +4,14 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>`) as the GitHub release body, and the build names
 itself after the top heading.
 
+## r9
+
+- Video plays in Unity games whose title clip decoded nothing (Umamusume: a white screen after the
+  Cygames logo). Unity's VideoPlayer flushes its H.264 decoder right after setting the output type,
+  before the first frame; GStreamer's `vtdec` sets its flushing flag on that flush-start and clears it
+  only when a live VideoToolbox session drains, so a decoder flushed before its caps dropped every
+  frame of the stream. A transform flushed before its first buffer now sends no flush events.
+
 ## r8
 
 - Runs on macOS 26. Every binary in the engine is built for macOS 26 (`build-macos/macos-min`),
