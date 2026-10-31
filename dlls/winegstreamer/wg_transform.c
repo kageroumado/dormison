@@ -97,6 +97,10 @@ struct wg_transform
     bool draining;
     /* Whether a buffer has been queued since the transform was created or last flushed. */
     bool fed;
+    /* Buffers queued and samples handed out over the transform's life, for the line that
+     * says a decoder produced nothing (note_starved_transform). */
+    unsigned int pushed, delivered;
+    bool starved_noted;
     INT64 ts_offset;
 };
 
@@ -486,12 +490,31 @@ static gboolean transform_sink_event_cb(GstPad *pad, GstObject *parent, GstEvent
     return TRUE;
 }
 
+/* How many buffers a transform is given before a decoder that produced nothing is worth a
+ * line: about a second of video, more than any decoder holds back for reordering. */
+#define WG_TRANSFORM_STARVED_BUFFERS 30
+
+/* One line, at the error level every log carries, when a transform has consumed that much
+ * input and produced nothing: what a game stuck on a video it cannot decode looks like from
+ * outside. Sevoflurane keys its video-decoding offer on it. Said once per transform, when
+ * the input runs dry, at a flush and at the end. */
+static void note_starved_transform(struct wg_transform *transform)
+{
+    if (transform->starved_noted || transform->delivered || transform->pushed < WG_TRANSFORM_STARVED_BUFFERS)
+        return;
+    transform->starved_noted = true;
+    GST_ERROR("transform %p decoded none of %u buffers (%s -> %s)", transform, transform->pushed,
+            gst_structure_get_name(gst_caps_get_structure(transform->input_caps, 0)),
+            gst_structure_get_name(gst_caps_get_structure(transform->output_caps, 0)));
+}
+
 NTSTATUS wg_transform_destroy(void *args)
 {
     struct wg_transform *transform = get_transform(*(wg_transform_t *)args);
     GstSample *sample;
     GstBuffer *buffer;
 
+    note_starved_transform(transform);
     while ((buffer = gst_atomic_queue_pop(transform->input_queue)))
         gst_buffer_unref(buffer);
     gst_atomic_queue_unref(transform->input_queue);
@@ -935,6 +958,7 @@ NTSTATUS wg_transform_push_data(void *args)
     }
 
     transform->fed = true;
+    transform->pushed++;
     input_mime = gst_structure_get_name(gst_caps_get_structure(transform->input_caps, 0));
     if (!strcmp(input_mime, "video/x-raw") && gst_video_info_from_caps(&video_info, transform->input_caps))
     {
@@ -1251,6 +1275,7 @@ NTSTATUS wg_transform_read_data(void *args)
 
     if (!transform->output_sample && !get_transform_output(transform, sample))
     {
+        note_starved_transform(transform);
         sample->size = 0;
         params->result = MF_E_TRANSFORM_NEED_MORE_INPUT;
         GST_INFO("Cannot read %u bytes, no output available", sample->max_size);
@@ -1330,6 +1355,7 @@ NTSTATUS wg_transform_read_data(void *args)
         transform->output_sample = NULL;
     }
 
+    transform->delivered++;
     params->result = S_OK;
     wg_allocator_release_sample(transform->allocator, sample, discard_data);
     return STATUS_SUCCESS;
@@ -1370,6 +1396,7 @@ NTSTATUS wg_transform_flush(void *args)
      * VideoToolbox session clears it, and a decoder flushed before its caps arrive drops
      * every frame of the stream. Unity's VideoPlayer sends MFT_MESSAGE_COMMAND_FLUSH right
      * after SetOutputType, so an H.264 title clip decoded nothing (Umamusume). */
+    note_starved_transform(transform);
     if (!transform->fed)
     {
         GST_INFO("transform %p, nothing to flush before the first buffer", transform);

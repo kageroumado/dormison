@@ -11,6 +11,9 @@ itself after the top heading.
   before the first frame; GStreamer's `vtdec` sets its flushing flag on that flush-start and clears it
   only when a live VideoToolbox session drains, so a decoder flushed before its caps dropped every
   frame of the stream. A transform flushed before its first buffer now sends no flush events.
+- A decoder that is given thirty buffers and produces nothing says so, once, at the error level every
+  log carries (`transform … decoded none of N buffers (video/x-h264 -> video/x-raw)`). Sevoflurane
+  reads the line and offers the game the other video decoder.
 
 ## r8
 
