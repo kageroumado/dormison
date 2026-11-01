@@ -2079,6 +2079,59 @@ BOOL get_thread_times(int unix_pid, int unix_tid, LARGE_INTEGER *kernel_time, LA
     }
     procstat_close(pstat);
     return ret;
+#elif defined(__APPLE__)
+    /* Mach answers for this task's own threads: the one whose kernel thread
+       id is unix_tid (get_unix_tid in server.c), or the whole task when the
+       tid is -1, live threads plus the ones already gone. Another process's
+       task port needs an entitlement this process has not got. */
+    BOOL ret = FALSE;
+
+    if (unix_pid != getpid()) return FALSE;
+    if (unix_tid == -1)
+    {
+        task_basic_info_data_t basic;
+        task_thread_times_info_data_t live;
+        mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
+
+        if (task_info( mach_task_self(), TASK_BASIC_INFO, (task_info_t)&basic, &count ) != KERN_SUCCESS)
+            return FALSE;
+        count = TASK_THREAD_TIMES_INFO_COUNT;
+        if (task_info( mach_task_self(), TASK_THREAD_TIMES_INFO, (task_info_t)&live, &count ) != KERN_SUCCESS)
+            return FALSE;
+        user_time->QuadPart = ((ULONGLONG)basic.user_time.seconds + live.user_time.seconds) * 10000000
+            + ((ULONGLONG)basic.user_time.microseconds + live.user_time.microseconds) * 10;
+        kernel_time->QuadPart = ((ULONGLONG)basic.system_time.seconds + live.system_time.seconds) * 10000000
+            + ((ULONGLONG)basic.system_time.microseconds + live.system_time.microseconds) * 10;
+        return TRUE;
+    }
+    else
+    {
+        thread_act_array_t threads;
+        mach_msg_type_number_t count, i;
+
+        if (task_threads( mach_task_self(), &threads, &count ) != KERN_SUCCESS) return FALSE;
+        for (i = 0; i < count; i++)
+        {
+            thread_identifier_info_data_t ident;
+            thread_basic_info_data_t basic;
+            mach_msg_type_number_t n = THREAD_IDENTIFIER_INFO_COUNT;
+
+            if (!ret && thread_info( threads[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ident, &n ) == KERN_SUCCESS
+                && (int)ident.thread_id == unix_tid)
+            {
+                n = THREAD_BASIC_INFO_COUNT;
+                if (thread_info( threads[i], THREAD_BASIC_INFO, (thread_info_t)&basic, &n ) == KERN_SUCCESS)
+                {
+                    user_time->QuadPart = (ULONGLONG)basic.user_time.seconds * 10000000 + basic.user_time.microseconds * 10;
+                    kernel_time->QuadPart = (ULONGLONG)basic.system_time.seconds * 10000000 + basic.system_time.microseconds * 10;
+                    ret = TRUE;
+                }
+            }
+            mach_port_deallocate( mach_task_self(), threads[i] );
+        }
+        vm_deallocate( mach_task_self(), (vm_address_t)threads, count * sizeof(*threads) );
+        return ret;
+    }
 #else
     static int once;
     if (!once++) FIXME("not implemented on this platform\n");
