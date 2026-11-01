@@ -137,7 +137,14 @@ mkdir -p "$OUT/wine/lib/external"
 # and winebus.so shares it. ---
 if [ "$SERVER_ARCH" = arm64 ]; then
     echo "==> universal wineserver: native arm64 + the build's x86_64"
-    lipo -create "$NATIVE_SERVER" "$STAGE/bin/wineserver" -output "$OUT/wine/bin/wineserver"
+    # The build's server carries the @loader_path/../lib rpath from its link;
+    # the native one is given it before the two are joined, because the rpath
+    # pass below reads a fat file's load commands as one list and would take
+    # the x86_64 slice's rpath for both.
+    cp "$NATIVE_SERVER" "$OUT/wine/bin/wineserver.arm64"
+    install_name_tool -add_rpath "@loader_path/../lib" "$OUT/wine/bin/wineserver.arm64"
+    lipo -create "$OUT/wine/bin/wineserver.arm64" "$STAGE/bin/wineserver" -output "$OUT/wine/bin/wineserver"
+    rm -f "$OUT/wine/bin/wineserver.arm64"
     cp "$ROOT/server-native/deps/lib/libinotify.0.dylib" "$OUT/wine/lib/libinotify.0.dylib"
     install_name_tool -id "@rpath/libinotify.0.dylib" "$OUT/wine/lib/libinotify.0.dylib"
     otool -L "$OUT/wine/bin/wineserver" | awk '/libinotify/ {print $1}' | sort -u | while read -r dep; do
