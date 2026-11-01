@@ -1584,14 +1584,8 @@ static int get_unix_tid(void)
 #elif defined(__sun)
     ret = pthread_self();
 #elif defined(__APPLE__)
-    /* The kernel's unique thread id, which THREAD_IDENTIFIER_INFO reports for
-       every thread of the task, so get_thread_times can find the thread again.
-       A Mach port name would not: the right it names is deallocated at once. */
-    {
-        uint64_t tid = 0;
-        pthread_threadid_np( NULL, &tid );
-        ret = (int)tid;
-    }
+    ret = mach_thread_self();
+    mach_port_deallocate(mach_task_self(), ret);
 #elif defined(__NetBSD__)
     ret = _lwp_self();
 #elif defined(__FreeBSD__)

@@ -2080,12 +2080,11 @@ BOOL get_thread_times(int unix_pid, int unix_tid, LARGE_INTEGER *kernel_time, LA
     procstat_close(pstat);
     return ret;
 #elif defined(__APPLE__)
-    /* Mach answers for this task's own threads: the one whose kernel thread
-       id is unix_tid (get_unix_tid in server.c), or the whole task when the
-       tid is -1, live threads plus the ones already gone. Another process's
-       task port needs an entitlement this process has not got. */
-    BOOL ret = FALSE;
-
+    /* unix_tid is the thread's own Mach port name in its task (get_unix_tid in
+       server.c; the server extracts the thread port by that name too, so it
+       stays as it is), which thread_info reads directly for this process's
+       threads. The whole task when the tid is -1: live threads plus the ones
+       already gone. Another process's task needs an entitlement this one lacks. */
     if (unix_pid != getpid()) return FALSE;
     if (unix_tid == -1)
     {
@@ -2106,31 +2105,14 @@ BOOL get_thread_times(int unix_pid, int unix_tid, LARGE_INTEGER *kernel_time, LA
     }
     else
     {
-        thread_act_array_t threads;
-        mach_msg_type_number_t count, i;
+        thread_basic_info_data_t basic;
+        mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
 
-        if (task_threads( mach_task_self(), &threads, &count ) != KERN_SUCCESS) return FALSE;
-        for (i = 0; i < count; i++)
-        {
-            thread_identifier_info_data_t ident;
-            thread_basic_info_data_t basic;
-            mach_msg_type_number_t n = THREAD_IDENTIFIER_INFO_COUNT;
-
-            if (!ret && thread_info( threads[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ident, &n ) == KERN_SUCCESS
-                && (int)ident.thread_id == unix_tid)
-            {
-                n = THREAD_BASIC_INFO_COUNT;
-                if (thread_info( threads[i], THREAD_BASIC_INFO, (thread_info_t)&basic, &n ) == KERN_SUCCESS)
-                {
-                    user_time->QuadPart = (ULONGLONG)basic.user_time.seconds * 10000000 + basic.user_time.microseconds * 10;
-                    kernel_time->QuadPart = (ULONGLONG)basic.system_time.seconds * 10000000 + basic.system_time.microseconds * 10;
-                    ret = TRUE;
-                }
-            }
-            mach_port_deallocate( mach_task_self(), threads[i] );
-        }
-        vm_deallocate( mach_task_self(), (vm_address_t)threads, count * sizeof(*threads) );
-        return ret;
+        if (thread_info( (thread_act_t)unix_tid, THREAD_BASIC_INFO, (thread_info_t)&basic, &count ) != KERN_SUCCESS)
+            return FALSE;
+        user_time->QuadPart = (ULONGLONG)basic.user_time.seconds * 10000000 + basic.user_time.microseconds * 10;
+        kernel_time->QuadPart = (ULONGLONG)basic.system_time.seconds * 10000000 + basic.system_time.microseconds * 10;
+        return TRUE;
     }
 #else
     static int once;
