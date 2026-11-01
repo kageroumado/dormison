@@ -22,6 +22,10 @@ itself after the top heading.
   that file's hash: a game pinned to DXMT over a D3DMetal engine now reads `renderer=dxmt source=payload`
   instead of the engine's staged renderer, so the app's run records and the shared statistics group
   runs by what rendered them.
+- The presenter's Lanczos final pass is Apple's `MPSImageLanczosScale` with clamped edges, writing the
+  drawable directly (the layer is no longer framebuffer-only). Measured against the former two-pass shader
+  on real frames at ×2 to 5K: the same picture to one level, at about half the GPU time
+  (`bispectral/presenter/correctness/compare`).
 
 ## r8
 

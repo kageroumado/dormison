@@ -1,6 +1,6 @@
 /*
- * The presenter's final pass: the full-screen draws that resample the
- * scaled frame into the on-screen drawable.
+ * The presenter's final pass: the resample of the scaled frame into the
+ * on-screen drawable.
  *
  * Copyright 2026 kageroumado
  *
@@ -21,15 +21,16 @@
 
 import Foundation
 import Metal
+import MetalPerformanceShaders
 
-/// The last pass of every frame: full-screen triangles that sample the
-/// scaled frame with the chosen filter and write the on-screen drawable.
-/// Nearest and bilinear are one draw. Lanczos is two, horizontal into an
-/// intermediate the caller owns and vertical into the drawable, with the
-/// kernel weights read from tables built once per geometry; at 1:1 it is
-/// the nearest draw, which produces the same bytes. Pipelines and tables
-/// are kept for the life of the process. One instance serves every
-/// presenter, so nothing here holds per-frame state.
+/// The last pass of every frame: the scaled frame resampled with the chosen
+/// filter into the on-screen drawable. Nearest and bilinear are one
+/// full-screen draw each. Lanczos is Apple's `MPSImageLanczosScale`, a
+/// compute kernel that writes the drawable directly, which is why the
+/// presenter's layer is not framebuffer-only; at 1:1 it is the nearest
+/// draw, which produces the same bytes. Pipelines are kept for the life of
+/// the process. One instance serves every presenter, so nothing here holds
+/// per-frame state.
 final class FinalPass {
     private let device: MTLDevice
     private let library: MTLLibrary
@@ -37,34 +38,23 @@ final class FinalPass {
     let vertexFunction: MTLFunction
     private let lock = NSLock()
     private var pipelines: [PipelineKey: MTLRenderPipelineState] = [:]
-    private var tables: [TableKey: MTLBuffer] = [:]
-
-    /// The format of the horizontal pass's intermediate: wide enough to
-    /// carry the kernel's negative lobes into the vertical pass.
-    static let intermediateFormat = MTLPixelFormat.rgba16Float
-    /// Taps per axis at the widest kernel, a 4x reduction: `SevoTaps` in
-    /// the shader has this many weights.
-    static let maximumTaps = 24
-    /// Tables the pass keeps before starting over; a buffer an encoded
-    /// command buffer still references lives on until that buffer completes.
-    private static let tableLimit = 32
+    /// Lanczos-3 as MetalPerformanceShaders encodes it. Measured against the
+    /// driver's former two-pass shader on real frames at ×2 to 5K: the same
+    /// picture to one level inside the frame, at about 0.6 of the GPU time
+    /// (`bispectral/presenter/correctness/compare`, 2026-11-01). Encoded
+    /// under ``lock``: presenters encode from their own threads and one
+    /// kernel object serves them all.
+    private let lanczos: MPSImageLanczosScale
+    private var warnedUnwritable = false
 
     private enum Stage: String {
         case nearest = "sevo_final_nearest"
         case bilinear = "sevo_final_bilinear"
-        case lanczosHorizontal = "sevo_final_lanczos_h"
-        case lanczosVertical = "sevo_final_lanczos_v"
     }
 
     private struct PipelineKey: Hashable {
         let stage: Stage
         let format: MTLPixelFormat
-    }
-
-    /// One axis's geometry; the kernel's scale follows from the two sizes.
-    private struct TableKey: Hashable {
-        let source: Int
-        let target: Int
     }
 
     init?(device: MTLDevice) {
@@ -77,17 +67,17 @@ final class FinalPass {
         }
         guard let vertexFunction = library.makeFunction(name: "sevo_fullscreen") else { return nil }
         self.vertexFunction = vertexFunction
+        lanczos = MPSImageLanczosScale(device: device)
+        // The kernel's taps past the edge read the edge pixel, as the draws'
+        // samplers do; its default reads zero and darkens the outer rows.
+        lanczos.edgeMode = .clamp
     }
 
-    /// Encodes the draws into `commandBuffer`. `pass` is the caller's
+    /// Encodes the pass into `commandBuffer`. `pass` is the caller's
     /// descriptor, reused across frames so the hot path allocates nothing.
-    /// `intermediate` supplies the Lanczos horizontal pass's target of the
-    /// given width and height in ``intermediateFormat``; the caller owns it
-    /// and keeps it untouched until the command buffer completes.
     func encode(
         source: MTLTexture, into target: MTLTexture, filter: FinalFilter,
-        pass: MTLRenderPassDescriptor, intermediate: (_ width: Int, _ height: Int) -> MTLTexture?,
-        in commandBuffer: MTLCommandBuffer
+        pass: MTLRenderPassDescriptor, in commandBuffer: MTLCommandBuffer
     ) {
         if Presenter.shared.debugClear {
             // PresenterDebug=clear: the drawable is cleared to red and nothing
@@ -111,20 +101,36 @@ final class FinalPass {
         case .lanczos where identity:
             draw(.nearest, from: source, into: target, pass: pass, in: commandBuffer)
         case .lanczos:
-            guard let columns = table(source: source.width, target: target.width),
-                  let rows = table(source: source.height, target: target.height),
-                  let middle = intermediate(target.width, source.height)
-            else {
-                log("final pass: no tables or intermediate for \(source.width)x\(source.height) -> \(target.width)x\(target.height); frame skipped")
-                return
-            }
-            draw(.lanczosHorizontal, from: source, into: middle, taps: columns, pass: pass, in: commandBuffer)
-            draw(.lanczosVertical, from: middle, into: target, taps: rows, pass: pass, in: commandBuffer)
+            resample(from: source, into: target, pass: pass, in: commandBuffer)
         }
     }
 
+    /// The Lanczos kernel into `target`, which a compute kernel can write
+    /// only when the texture allows it; a target that does not (a
+    /// framebuffer-only drawable, a render-only texture) gets the bilinear
+    /// draw and one line in the log, never a skipped frame.
+    private func resample(
+        from source: MTLTexture, into target: MTLTexture,
+        pass: MTLRenderPassDescriptor, in commandBuffer: MTLCommandBuffer
+    ) {
+        guard target.usage.contains(.shaderWrite), !target.isFramebufferOnly else {
+            lock.lock()
+            let warn = !warnedUnwritable
+            warnedUnwritable = true
+            lock.unlock()
+            if warn {
+                log("final pass: \(target.label ?? "the target") takes no compute writes (usage \(target.usage.rawValue), framebuffer-only \(target.isFramebufferOnly)); Lanczos draws bilinear")
+            }
+            draw(.bilinear, from: source, into: target, pass: pass, in: commandBuffer)
+            return
+        }
+        lock.lock()
+        lanczos.encode(commandBuffer: commandBuffer, sourceTexture: source, destinationTexture: target)
+        lock.unlock()
+    }
+
     private func draw(
-        _ stage: Stage, from source: MTLTexture, into target: MTLTexture, taps: MTLBuffer? = nil,
+        _ stage: Stage, from source: MTLTexture, into target: MTLTexture,
         pass: MTLRenderPassDescriptor, in commandBuffer: MTLCommandBuffer
     ) {
         guard let pipeline = pipeline(for: stage, format: target.pixelFormat) else { return }
@@ -139,7 +145,6 @@ final class FinalPass {
         encoder.label = "sevo final \(stage)"
         encoder.setRenderPipelineState(pipeline)
         encoder.setFragmentTexture(source, index: 0)
-        if let taps { encoder.setFragmentBuffer(taps, offset: 0, index: 0) }
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
         attachment.texture = nil
@@ -163,59 +168,6 @@ final class FinalPass {
             log("final pass pipeline \(stage) for \(format.rawValue): \(error)")
             return nil
         }
-    }
-
-    // MARK: Weight tables
-
-    /// The Lanczos-3 taps of one axis, one `SevoTaps` entry per target
-    /// pixel: the first source index, the tap count, and the normalized
-    /// weights. The kernel widens by the source pixels per target pixel, at
-    /// least one and at most four, so minification averages instead of
-    /// aliasing; a tap window is capped at ``maximumTaps``.
-    private func table(source: Int, target: Int) -> MTLBuffer? {
-        let key = TableKey(source: source, target: target)
-        lock.lock()
-        defer { lock.unlock() }
-        if let table = tables[key] { return table }
-        let scale = min(4, max(1, Float(source) / Float(target)))
-        let radius = 3 * scale
-        let words = 2 + FinalPass.maximumTaps
-        var entries = [UInt32](repeating: 0, count: target * words)
-        var weights = [Float](repeating: 0, count: FinalPass.maximumTaps)
-        for pixel in 0..<target {
-            let position = (Float(pixel) + 0.5) / Float(target) * Float(source) - 0.5
-            let first = Int32((position - radius).rounded(.up))
-            let last = Int32((position + radius).rounded(.down))
-            let count = min(Int(last - first + 1), FinalPass.maximumTaps)
-            var sum: Float = 0
-            for tap in 0..<count {
-                weights[tap] = FinalPass.lanczos((Float(first) + Float(tap) - position) / scale)
-                sum += weights[tap]
-            }
-            let base = pixel * words
-            entries[base] = UInt32(bitPattern: first)
-            entries[base + 1] = UInt32(count)
-            for tap in 0..<count {
-                entries[base + 2 + tap] = (sum > 0 ? weights[tap] / sum : 0).bitPattern
-            }
-        }
-        guard let table = device.makeBuffer(bytes: entries, length: entries.count * 4, options: .storageModeShared) else {
-            log("final pass: no buffer for a \(source) -> \(target) weight table")
-            return nil
-        }
-        table.label = "sevo lanczos \(source) -> \(target)"
-        if tables.count >= FinalPass.tableLimit { tables.removeAll() }
-        tables[key] = table
-        return table
-    }
-
-    private static func lanczos(_ x: Float) -> Float {
-        let a: Float = 3
-        let ax = abs(x)
-        if ax < 1e-4 { return 1 }
-        if ax >= a { return 0 }
-        let px = Float.pi * x
-        return a * sin(px) * sin(px / a) / (px * px)
     }
 
     /// Compiled once per process. Texture coordinates put the source's first
@@ -248,44 +200,6 @@ final class FinalPass {
     {
         constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);
         return src.sample(s, in.uv);
-    }
-
-    /* Lanczos-3 in two passes. One table entry per target pixel of the
-       axis holds the first source index and the normalized weights; the
-       taps are read directly, so every sample lands on a pixel center and
-       nothing is softened by a half-texel offset. */
-    struct SevoTaps {
-        int first;
-        int count;
-        float weight[24];
-    };
-
-    fragment float4 sevo_final_lanczos_h(SevoVertex in [[stage_in]], texture2d<float> src [[texture(0)]],
-                                         constant SevoTaps* taps [[buffer(0)]])
-    {
-        uint2 p = uint2(in.position.xy);
-        constant SevoTaps& t = taps[p.x];
-        int limit = int(src.get_width()) - 1;
-        float4 color = float4(0.0);
-        for (int i = 0; i < t.count; i++) {
-            int x = clamp(t.first + i, 0, limit);
-            color += src.read(uint2(x, p.y)) * t.weight[i];
-        }
-        return color;
-    }
-
-    fragment float4 sevo_final_lanczos_v(SevoVertex in [[stage_in]], texture2d<float> src [[texture(0)]],
-                                         constant SevoTaps* taps [[buffer(0)]])
-    {
-        uint2 p = uint2(in.position.xy);
-        constant SevoTaps& t = taps[p.y];
-        int limit = int(src.get_height()) - 1;
-        float4 color = float4(0.0);
-        for (int i = 0; i < t.count; i++) {
-            int y = clamp(t.first + i, 0, limit);
-            color += src.read(uint2(p.x, y)) * t.weight[i];
-        }
-        return color;
     }
     """
 }

@@ -551,14 +551,6 @@ class ViewPresenter: NSObject {
     private var onscreenLayer: CAMetalLayer?
     private let onscreenLock = NSLock()
 
-    /// The final pass's Lanczos intermediates, one per on-screen drawable
-    /// the layer can have in flight, indexed by the acquisition that took
-    /// the drawable: drawable N+3 is handed out only once N is on screen,
-    /// after N's command buffer completed, so the intermediate N drew into
-    /// is free by then whatever queue the frames were encoded on.
-    private var intermediates: [MTLTexture?] = []
-    private var acquisitions = 0
-
     private let statsLock = NSLock()
     private var presented = 0
     private var dropped = 0
@@ -580,7 +572,9 @@ class ViewPresenter: NSObject {
         dispatchPrecondition(condition: .onQueue(.main))
         let layer = CAMetalLayer()
         layer.device = device
-        layer.framebufferOnly = true
+        // Writable by compute as well as drawn into: the final pass's Lanczos
+        // is an MPS kernel that writes the drawable directly.
+        layer.framebufferOnly = false
         layer.isOpaque = true
         layer.contentsGravity = .resize
         layer.backgroundColor = CGColor(gray: 0, alpha: 1)
@@ -686,45 +680,19 @@ class ViewPresenter: NSObject {
             summarize()
             return nil
         }
-        if intermediates.isEmpty {
-            intermediates = Array(repeating: nil, count: max(1, onscreen.maximumDrawableCount))
-        }
         adoptOptions()
-        acquisitions += 1
-        let slot = acquisitions % intermediates.count
         let target = real.texture
         noteForReadout(source: source, target: target)
         let upscaled = scaler?.encode(source: source, target: MTLSize(width: target.width, height: target.height, depth: 1), in: commandBuffer)
         noteEffective(source: source, target: target, upscaled: upscaled != nil)
         let scaled = upscaled ?? source
-        finalPass.encode(
-            source: scaled, into: target, filter: filter, pass: renderPass,
-            intermediate: { width, height in self.intermediate(slot, width: width, height: height) },
-            in: commandBuffer)
+        finalPass.encode(source: scaled, into: target, filter: filter, pass: renderPass, in: commandBuffer)
         statsLock.lock()
         presented += 1
         statsLock.unlock()
         sevoStatsNotePresent(sevoStatsSourcePresenter)
         summarize()
         return real
-    }
-
-    /// The intermediate of one slot at the size the final pass asks for,
-    /// remade when that changes; the texture a command buffer still reads
-    /// lives on until it completes.
-    private func intermediate(_ slot: Int, width: Int, height: Int) -> MTLTexture? {
-        if let texture = intermediates[slot], texture.width == width, texture.height == height { return texture }
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: FinalPass.intermediateFormat, width: width, height: height, mipmapped: false)
-        descriptor.usage = [.shaderRead, .renderTarget]
-        descriptor.storageMode = .private
-        guard let texture = device.makeTexture(descriptor: descriptor) else {
-            log("could not allocate a \(width)x\(height) final pass intermediate")
-            return nil
-        }
-        texture.label = "sevo final intermediate \(slot)"
-        intermediates[slot] = texture
-        return texture
     }
 
     /// The source's part of the trace summary.
@@ -1011,7 +979,7 @@ final class MetalViewPresenter: ViewPresenter {
     /// Held from the encoding of a frame through the present of its drawable. The
     /// renderer's thread, on the hooked or the blocking direct route, and the ready
     /// signal's listener each take it, so one frame is encoded at a time whichever route
-    /// it came by: `encodeFrame`'s scaler, intermediates and render pass are one set per
+    /// it came by: `encodeFrame`'s scaler and render pass are one set per
     /// presenter. Taken before `lock`, never while holding it.
     private let encoding = NSLock()
 

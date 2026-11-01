@@ -11,6 +11,7 @@ UNIX_LIBS    = \
 	-framework IOKit \
 	-framework Metal \
 	-weak_framework MetalFX \
+	-framework MetalPerformanceShaders \
 	-framework OpenGL \
 	-framework QuartzCore \
 	-framework Security \
