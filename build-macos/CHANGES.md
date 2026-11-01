@@ -18,6 +18,10 @@ itself after the top heading.
   lower-case names of its own, parent and grandparent directories, applied after `apps/<exe>.env` so the
   nearest folder wins, and `SEVO_LOADER` is read the same way. Two games that ship the same exe (every RPG
   Maker game is `game.exe`) each keep their own settings and Dock identity.
+- The `sevo:gfx` line names the renderer that drew from the file its d3d module was mapped from, with
+  that file's hash: a game pinned to DXMT over a D3DMetal engine now reads `renderer=dxmt source=payload`
+  instead of the engine's staged renderer, so the app's run records and the shared statistics group
+  runs by what rendered them.
 
 ## r8
 

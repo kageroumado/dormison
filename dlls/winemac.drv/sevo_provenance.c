@@ -26,6 +26,8 @@
 #include "config.h"
 
 #include <dlfcn.h>
+#include <libproc.h>
+#include <CommonCrypto/CommonDigest.h>
 #include <stdarg.h>
 #include <ctype.h>
 #include <stdatomic.h>
@@ -55,6 +57,7 @@ static unsigned long long start_ns;
 /* The configured renderer and its neighbours, read once at init. The header
    line they fill is held back until a frame is drawn, when the module list
    says which renderer actually answered. */
+static char cfg_engine_dir[PATH_MAX];
 static char cfg_renderer[64];
 static char cfg_toolkit[64];
 static char cfg_upscaler[64];
@@ -247,10 +250,11 @@ static int base_name_is(const WCHAR *base, USHORT byte_len, const char *name, si
     return 1;
 }
 
-/* Whether a module of this base name is resident on the wow64 process's 32-bit
-   loader list. The 32-bit PEB shares this address space, so its ULONG pointers
-   dereference directly. A 64-bit process has no WowTebOffset and answers 0. */
-static int module_loaded_wow32(const char *name)
+/* The base of a module of this name resident on the wow64 process's 32-bit
+   loader list, 0 when absent. The 32-bit PEB shares this address space, so its
+   ULONG pointers dereference directly. A 64-bit process has no WowTebOffset
+   and answers 0. */
+static ULONG_PTR module_base_wow32(const char *name)
 {
     const TEB *teb = NtCurrentTeb();
     const TEB32 *teb32;
@@ -273,15 +277,15 @@ static int module_loaded_wow32(const char *name)
 
         if (base_name_is((const WCHAR *)(ULONG_PTR)mod->BaseDllName.Buffer,
                          mod->BaseDllName.Length, name, len))
-            return 1;
+            return mod->DllBase;
     }
     return 0;
 }
 
-/* Whether a module of this base name is resident, walking the loader's
-   in-memory module list. A 32-bit game loads its d3d DLLs on the 32-bit
+/* The base of a resident module of this name, walking the loader's in-memory
+   module list, 0 when absent. A 32-bit game loads its d3d DLLs on the 32-bit
    loader list, which the 64-bit list this code runs on does not carry. */
-static int module_loaded(const char *name)
+static ULONG_PTR module_base(const char *name)
 {
     const PEB_LDR_DATA *ldr = RtlGetCurrentPeb()->LdrData;
     const LIST_ENTRY *head, *entry;
@@ -296,10 +300,96 @@ static int module_loaded(const char *name)
                 CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
 
             if (base_name_is(mod->BaseDllName.Buffer, mod->BaseDllName.Length, name, len))
-                return 1;
+                return (ULONG_PTR)mod->DllBase;
         }
     }
-    return module_loaded_wow32(name);
+    return module_base_wow32(name);
+}
+
+static int module_loaded(const char *name)
+{
+    return module_base(name) != 0;
+}
+
+/* The file a resident module was mapped from, by its mapping's own vnode.
+   The loader names a builtin it found on WINEDLLPATH_PREPEND as system32's,
+   so the module list cannot tell a per-game DXMT from the engine's staged
+   D3DMetal; the file it was read from can. */
+static int module_file(const char *name, char *path, size_t size)
+{
+    char buffer[PROC_PIDPATHINFO_MAXSIZE];
+    ULONG_PTR base = module_base(name);
+    int len;
+
+    if (!base) return 0;
+    len = proc_regionfilename(getpid(), (uint64_t)base, buffer, sizeof(buffer));
+    if (len <= 0) return 0;
+    snprintf(path, size, "%.*s", len, buffer);
+    return 1;
+}
+
+/* The renderer a module's file belongs to, by where it lies under the engine:
+   a payload directory (`dxmt`, `dxvk`) is that renderer; the staged tree
+   (`wine/lib/wine/<arch>`) holds whatever the engine's record says was staged
+   there; the tree of originals holds wined3d's own; a file outside the engine
+   is the game's or Windows' own. `source` says which of those it was. */
+static void renderer_from_file(const char *path, char *out, size_t size, char *source, size_t source_size)
+{
+    size_t dir_len = strlen(cfg_engine_dir);
+    const char *rel, *slash;
+
+    if (!dir_len || strncmp(path, cfg_engine_dir, dir_len) || path[dir_len] != '/')
+    {
+        snprintf(out, size, "native");
+        snprintf(source, source_size, "outside");
+        return;
+    }
+    rel = path + dir_len + 1;
+    if (!strncmp(rel, "wine/lib/wine/", 14))
+    {
+        if (strstr(rel, "-windows-original/"))
+        {
+            snprintf(out, size, "wined3d");
+            snprintf(source, source_size, "originals");
+        }
+        else
+        {
+            snprintf(out, size, "%s", cfg_renderer);
+            snprintf(source, source_size, "staged");
+        }
+        return;
+    }
+    slash = strchr(rel, '/');
+    snprintf(out, size, "%.*s", (int)(slash ? (size_t)(slash - rel) : strlen(rel)), rel);
+    snprintf(source, source_size, "payload");
+}
+
+/* The sha256 of a file, hex, for the DLL that drew. The largest renderer DLL
+   is a few megabytes, so this is milliseconds, once per process. */
+static int file_sha256(const char *path, char *out, size_t size)
+{
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH], buffer[65536];
+    CC_SHA256_CTX ctx;
+    FILE *file;
+    size_t n, i;
+
+    if (!(file = fopen(path, "rb"))) return 0;
+    CC_SHA256_Init(&ctx);
+    while ((n = fread(buffer, 1, sizeof(buffer), file)) > 0) CC_SHA256_Update(&ctx, buffer, (CC_LONG)n);
+    fclose(file);
+    CC_SHA256_Final(digest, &ctx);
+    for (i = 0; i < sizeof(digest) && i * 2 + 2 < size; i++) snprintf(out + i * 2, 3, "%02x", digest[i]);
+    return 1;
+}
+
+/* The hash of the file a resident d3d module was mapped from, or the engine's
+   record for a module not resident (what would have answered). */
+static void loaded_hash(const char *name, const char *record, char *out, size_t size)
+{
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+
+    if (module_file(name, path, sizeof(path)) && file_sha256(path, out, size)) return;
+    snprintf(out, size, "%s", record);
 }
 
 /* Whether wined3d resident in the process is the renderer that drew.
@@ -319,16 +409,30 @@ static int wined3d_answered(void)
     return !module_loaded("d3d11.dll") && !module_loaded("d3d12.dll");
 }
 
-/* The renderer that actually answered, from the modules the process loaded.
-   When wined3d drew, name its display back end. */
-static void actual_renderer(char *out, size_t size)
+/* The renderer that actually answered: wined3d's display back end when
+   wined3d drew, otherwise the renderer the resident d3d module's file belongs
+   to (``renderer_from_file``), and the configured one only when no d3d module
+   is resident or its file cannot be named. */
+static void actual_renderer(char *out, size_t size, char *source, size_t source_size)
 {
+    static const char *const modules[] = { "d3d12.dll", "d3d11.dll", "d3d10core.dll", "d3d9.dll" };
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    size_t i;
+
+    snprintf(source, source_size, "configured");
     if (wined3d_answered())
     {
+        snprintf(source, source_size, "modules");
         if (module_loaded("opengl32.dll")) snprintf(out, size, "wined3d-gl");
         else if (module_loaded("winevulkan.dll") || module_loaded("vulkan-1.dll"))
             snprintf(out, size, "wined3d-vulkan");
         else snprintf(out, size, "wined3d");
+        return;
+    }
+    for (i = 0; i < sizeof(modules) / sizeof(modules[0]); i++)
+    {
+        if (!module_file(modules[i], path, sizeof(path))) continue;
+        renderer_from_file(path, out, size, source, source_size);
         return;
     }
     snprintf(out, size, "%s", cfg_renderer);
@@ -339,16 +443,21 @@ static void actual_renderer(char *out, size_t size)
    presented a frame. */
 static void note_gfx_header(void)
 {
-    char renderer[64];
+    char renderer[64], source[16], d3d11[80], d3d12[80], dxgi[80];
     int expected = 0;
 
     if (!atomic_compare_exchange_strong(&header_printed, &expected, 1)) return;
-    actual_renderer(renderer, sizeof(renderer));
-    note("renderer=%s toolkit=%s presenter=%s upscaler=%s msync=%s",
-         renderer, cfg_toolkit, layer_off_screen ? "on" : "off",
-         cfg_upscaler[0] ? cfg_upscaler : "off", cfg_msync);
+    actual_renderer(renderer, sizeof(renderer), source, sizeof(source));
+    loaded_hash("d3d11.dll", cfg_d3d11, d3d11, sizeof(d3d11));
+    loaded_hash("d3d12.dll", cfg_d3d12, d3d12, sizeof(d3d12));
+    loaded_hash("dxgi.dll", cfg_dxgi, dxgi, sizeof(dxgi));
+    /* The toolkit version is D3DMetal's; another renderer that answered over a
+       D3DMetal engine did not use it. */
+    note("renderer=%s toolkit=%s presenter=%s upscaler=%s msync=%s source=%s",
+         renderer, strcmp(renderer, "d3dmetal") ? "none" : cfg_toolkit, layer_off_screen ? "on" : "off",
+         cfg_upscaler[0] ? cfg_upscaler : "off", cfg_msync, source);
     note("d3d11=%.*s d3d12=%.*s dxgi=%.*s",
-         SEVO_HASH_CHARS, cfg_d3d11, SEVO_HASH_CHARS, cfg_d3d12, SEVO_HASH_CHARS, cfg_dxgi);
+         SEVO_HASH_CHARS, d3d11, SEVO_HASH_CHARS, d3d12, SEVO_HASH_CHARS, dxgi);
 }
 
 static void note_counters(void)
@@ -380,6 +489,7 @@ void sevo_provenance_init(int presenter_on, const char *upscaler)
 
     image_basename(exe, sizeof(exe));
     engine_paths(engine_dir, sizeof(engine_dir), engine, sizeof(engine));
+    snprintf(cfg_engine_dir, sizeof(cfg_engine_dir), "%s", engine_dir);
     if (!engine[0]) snprintf(engine, sizeof(engine), "unknown");
     if (peb_environment_value("SteamAppId", steam_appid, sizeof(steam_appid)) ||
         peb_environment_value("SteamGameId", steam_appid, sizeof(steam_appid)))
