@@ -130,18 +130,23 @@ record donor "$OUT"/wine/lib/*.dylib
 # Toolkit, which may not be redistributed): the engine ships the folder empty.
 mkdir -p "$OUT/wine/lib/external"
 
-# --- the native server's binary and its libinotify, the universal build,
-# which winebus.so shares. ---
+# --- the server as one universal binary: the native arm64 server, which runs
+# untranslated on Apple silicon, and the x86_64 server the wine build made,
+# which an Intel Mac runs natively. The kernel picks the slice, so nothing in
+# the engine or the app chooses; libinotify beside it is universal already,
+# and winebus.so shares it. ---
 if [ "$SERVER_ARCH" = arm64 ]; then
-    echo "==> native arm64 wineserver"
-    cp "$NATIVE_SERVER" "$OUT/wine/bin/wineserver"
+    echo "==> universal wineserver: native arm64 + the build's x86_64"
+    lipo -create "$NATIVE_SERVER" "$STAGE/bin/wineserver" -output "$OUT/wine/bin/wineserver"
     cp "$ROOT/server-native/deps/lib/libinotify.0.dylib" "$OUT/wine/lib/libinotify.0.dylib"
     install_name_tool -id "@rpath/libinotify.0.dylib" "$OUT/wine/lib/libinotify.0.dylib"
-    otool -L "$OUT/wine/bin/wineserver" | awk '/libinotify/ {print $1}' | while read -r dep; do
+    otool -L "$OUT/wine/bin/wineserver" | awk '/libinotify/ {print $1}' | sort -u | while read -r dep; do
         install_name_tool -change "$dep" "@rpath/libinotify.0.dylib" "$OUT/wine/bin/wineserver"
     done
+    lipo -info "$OUT/wine/bin/wineserver" | sed 's/^/    /'
     lipo -info "$OUT/wine/lib/libinotify.0.dylib" | sed 's/^/    /'
     record native-server "$OUT/wine/bin/wineserver" "$OUT/wine/lib/libinotify.0.dylib"
+    SERVER_ARCH="arm64 x86_64"
 fi
 
 # --- every library configure recorded by name: this build dlopens exactly that
