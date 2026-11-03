@@ -363,10 +363,24 @@ static void RPC_UuidGetSystemTime(ULONGLONG *time)
 /* Assume that a hardware address is at least 6 bytes long */
 #define ADDRESS_BYTES_NEEDED 6
 
+/* The first adapter with a hardware address. Tunnel interfaces have none, and macOS
+   lists two of them (gif0, stf0) before any card; a node of all zeros makes GUIDs
+   some games reject (SnowRunner dies on them). */
+static const IP_ADAPTER_INFO *RPC_UuidFindHardwareAdapter(const IP_ADAPTER_INFO *adapter)
+{
+    static const BYTE none[ADDRESS_BYTES_NEEDED];
+
+    for (; adapter; adapter = adapter->Next)
+        if (adapter->AddressLength >= ADDRESS_BYTES_NEEDED &&
+            memcmp(adapter->Address, none, ADDRESS_BYTES_NEEDED))
+            return adapter;
+    return NULL;
+}
+
 static RPC_STATUS RPC_UuidGetNodeAddress(BYTE *address)
 {
-    int i;
     DWORD status = RPC_S_OK;
+    const IP_ADAPTER_INFO *hardware = NULL;
 
     ULONG buflen = sizeof(IP_ADAPTER_INFO);
     PIP_ADAPTER_INFO adapter = malloc(buflen);
@@ -376,10 +390,11 @@ static RPC_STATUS RPC_UuidGetNodeAddress(BYTE *address)
         adapter = malloc(buflen);
     }
 
-    if (GetAdaptersInfo(adapter, &buflen) == NO_ERROR) {
-        for (i = 0; i < ADDRESS_BYTES_NEEDED; i++) {
-            address[i] = adapter->Address[i];
-        }
+    if (GetAdaptersInfo(adapter, &buflen) == NO_ERROR)
+        hardware = RPC_UuidFindHardwareAdapter(adapter);
+
+    if (hardware) {
+        memcpy(address, hardware->Address, ADDRESS_BYTES_NEEDED);
     }
     /* We can't get a hardware address, just use random numbers.
        Set the multicast bit to prevent conflicts with real cards. */
