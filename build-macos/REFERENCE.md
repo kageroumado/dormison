@@ -284,15 +284,10 @@ backstop: it kills a process that sets an event another process sleeps on.
 ## DXMT
 
 DXMT's DLLs are a binary payload from the upstream release tarball, so a change to DXMT itself
-is a patch here plus a rebuilt DLL, not an engine commit. Both patches apply to dxmt **v0.80**:
-
-- `patches/dxmt-log-airconv-failure.patch`: a failed DXBC-to-AIR translation names its stage and
-  shader hash at ERR level; without it the only trace is one `Shader not found?` per dropped Dispatch.
-- `patches/dxmt-snowrunner-dynamic-array-srv-so-queries.patch`: a one-slice `TEXTURE2DARRAY` view of a
-  dynamic 2D texture is a 2D-array view of the same image, and the stream-output statistics and
-  overflow-predicate queries are dummies that read zero. Stock v0.80 fails both (`Only 2d texture SRV
-  can be created on dynamic texture`, `CreateQuery1: query type not implemented: 6`), and SnowRunner
-  dies a few seconds later. `bispectral/dxmt-dynamic-views` tests both against stock and patched.
+is a patch here plus a rebuilt DLL, not an engine commit.
+`patches/dxmt-log-airconv-failure.patch` applies to dxmt **v0.80** and makes a failed DXBC-to-AIR
+translation name its stage and shader hash at ERR level; without it the only trace is one
+`Shader not found?` per dropped Dispatch.
 
 `d3d11.dll` alone needs only Homebrew's `mingw-w64`, Meson and a Wine build tree. LLVM 15 is linked
 into `winemetal.so` only, so a stub directory satisfies Meson's include check:
@@ -300,23 +295,23 @@ into `winemetal.so` only, so a stub directory satisfies Meson's include check:
 ```bash
 cd ~/Developer/clones/dxmt && git worktree add /Volumes/Ugreen/Build/dxmt-v080 v0.80
 cd /Volumes/Ugreen/Build/dxmt-v080 && git submodule update --init --recursive
-git apply $DORMISON/build-macos/patches/dxmt-*.patch
+git apply $DORMISON/build-macos/patches/dxmt-log-airconv-failure.patch
 mkdir -p /Volumes/Ugreen/Scratch/dxmt-no-llvm/{include,lib}
 meson setup --cross-file build-win64.txt -Dnative_llvm_path=/Volumes/Ugreen/Scratch/dxmt-no-llvm \
   -Dwine_build_path=$DORMISON_BUILD/build -Dcpp_args="-include iomanip" build-win64 --buildtype release
 meson compile -C build-win64 d3d11
 x86_64-w64-mingw32-strip -o d3d11.dll build-win64/src/d3d11/d3d11.dll
 $DORMISON_BUILD/build/tools/winebuild/winebuild --builtin d3d11.dll
-cp d3d11.dll $DORMISON_BUILD/deps-raw/dxmt-patched/x86_64-windows/
+cp d3d11.dll "<engine>/dxmt/d3d11.dll"
 ```
 
 `-include iomanip` covers `com_guid.cpp`, which GCC 16's libstdc++ no longer compiles without it.
 Always stamp with `winebuild --builtin`: an unstamped DLL is a native one, so the
 `d3d11=b` override silently loads whatever builtin `d3d11.dll` the engine tree has staged
 (D3DMetal's on a D3DMetal bottle), which jumps to address 0 in `D3D11CreateDevice`.
-`package-engine.sh` lays every DLL in `deps-raw/dxmt-patched/x86_64-windows/` over the release
-payload, records them as `dxmt-patched` in the manifest's origins and names them in
-`engine-info.json`'s `dxmt` field.
+`bispectral/dxmt-dynamic-views` shows the stamped-DLL route working end to end against a prepended
+renderer directory. Record a rebuild in the engine's `engine-info.json` `dxmt` field so a payload that
+is no longer the stock v0.80 says so.
 
 ## Renderer provenance
 
