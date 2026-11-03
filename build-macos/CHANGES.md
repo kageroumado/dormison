@@ -4,11 +4,10 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>`) as the GitHub release body, and the build names
 itself after the top heading.
 
-## r10
+## r11
 
-- `wine/bin/wineserver` is a universal binary: the native arm64 server and the build's own x86_64 server
-  in one file, so the same engine runs on an Intel Mac, where the whole stack is native x86_64 and only
-  the server was missing. D3DMetal stays Apple-silicon-only; DXMT, DXVK and wined3d render on Intel.
+- Runs on Intel Macs, with DXMT, DXVK and wined3d. D3DMetal stays Apple silicon only.
+- SnowRunner starts. It crashed about 30 seconds after launch on every Mac.
 
 ## r9
 
