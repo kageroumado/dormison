@@ -265,9 +265,22 @@ for so in atidxx64 d3d10 d3d11 d3d12 dxgi nvapi64 nvngx-on-metalfx; do
     record packaging "$OUT/wine/lib/wine/x86_64-unix/$so.so"
 done
 
-# --- renderer bundles, verbatim ---
+# --- renderer bundles, verbatim, with DXMT's DLLs rebuilt from build-macos/patches/dxmt-*.patch
+# laid over the release payload where deps-raw/dxmt-patched holds them (REFERENCE.md § DXMT) ---
 for d in dxmt dxvk; do
     [ -d "$LIVE/$d" ] && cp -R "$LIVE/$d" "$OUT/$d"
+done
+DXMT_PATCHED="$ROOT/deps-raw/dxmt-patched/x86_64-windows"
+DXMT_INFO="https://github.com/3Shain/dxmt/releases/download/v0.80/dxmt-v0.80-builtin.tar.gz"
+if [ -d "$DXMT_PATCHED" ]; then
+    echo "==> patched DXMT from $DXMT_PATCHED"
+    for dll in "$DXMT_PATCHED"/*.dll; do
+        cp "$dll" "$OUT/dxmt/"
+        record dxmt-patched "$OUT/dxmt/$(basename "$dll")"
+    done
+    DXMT_INFO="$DXMT_INFO, with $(cd "$DXMT_PATCHED" && ls *.dll | tr '\n' ' ' | sed 's/ $//') rebuilt from v0.80 + $(cd "$REPO/build-macos/patches" && ls dxmt-*.patch | tr '\n' ' ' | sed 's/ $//')"
+fi
+for d in dxmt dxvk; do
     record donor "$OUT/$d"
 done
 
@@ -363,7 +376,7 @@ cat > "$OUT/engine-info.json" <<EOF
   "repository": "https://github.com/kageroumado/dormison",
   "commit": "$HEAD_COMMIT",
   "wine": "11.16 + wine-staging 11.16",
-  "dxmt": "https://github.com/3Shain/dxmt/releases/download/v0.80/dxmt-v0.80-builtin.tar.gz",
+  "dxmt": "$DXMT_INFO",
   "dxvk": "https://github.com/Gcenx/DXVK-macOS/releases/download/v1.10.3-20230507-repack/dxvk-macOS-async-v1.10.3-20230507-repack-builtin.tar.gz",
   "d3dmetal": "Apple Game Porting Toolkit payloads installed by the app under d3dmetal/",
   "sync": "msync (WINEMSYNC=1)",
@@ -451,6 +464,7 @@ manifest = {
         "deps": "the pinned dependency downloads under DORMISON_BUILD/deps and deps-raw",
         "gstreamer": "upstream GStreamer's macOS packages under DORMISON_BUILD/gstreamer, thinned",
         "donor": "copied from the donor engine: the dependency dylibs, gecko, mono, DXMT, DXVK, winemetal and the Vulkan ICD, until the publish plan's deps tarball replaces them",
+        "dxmt-patched": "DXMT DLLs rebuilt from v0.80 with build-macos/patches/dxmt-*.patch, from DORMISON_BUILD/deps-raw/dxmt-patched",
         "packaging": "written by package-engine.sh",
     },
     "components": components,

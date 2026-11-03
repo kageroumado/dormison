@@ -1,0 +1,175 @@
+diff --git a/src/d3d11/d3d11_context_def.cpp b/src/d3d11/d3d11_context_def.cpp
+index 821a842..ce8039d 100644
+--- a/src/d3d11/d3d11_context_def.cpp
++++ b/src/d3d11/d3d11_context_def.cpp
+@@ -312,6 +312,16 @@ public:
+       break;
+     }
+     case D3D11_QUERY_TIMESTAMP_DISJOINT:
++    case D3D11_QUERY_SO_STATISTICS:
++    case D3D11_QUERY_SO_STATISTICS_STREAM0:
++    case D3D11_QUERY_SO_STATISTICS_STREAM1:
++    case D3D11_QUERY_SO_STATISTICS_STREAM2:
++    case D3D11_QUERY_SO_STATISTICS_STREAM3:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3:
+     case D3D11_QUERY_PIPELINE_STATISTICS: {
+       // ignore
+       break;
+@@ -359,6 +369,16 @@ public:
+       ctx_state.building_visibility_queries.erase(building_query);
+       break;
+     }
++    case D3D11_QUERY_SO_STATISTICS:
++    case D3D11_QUERY_SO_STATISTICS_STREAM0:
++    case D3D11_QUERY_SO_STATISTICS_STREAM1:
++    case D3D11_QUERY_SO_STATISTICS_STREAM2:
++    case D3D11_QUERY_SO_STATISTICS_STREAM3:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3:
+     case D3D11_QUERY_PIPELINE_STATISTICS: {
+       // ignore
+       break;
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index b361f17..8a15cfa 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -328,6 +328,16 @@ public:
+         });
+       break;
+     }
++    case D3D11_QUERY_SO_STATISTICS:
++    case D3D11_QUERY_SO_STATISTICS_STREAM0:
++    case D3D11_QUERY_SO_STATISTICS_STREAM1:
++    case D3D11_QUERY_SO_STATISTICS_STREAM2:
++    case D3D11_QUERY_SO_STATISTICS_STREAM3:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3:
+     case D3D11_QUERY_PIPELINE_STATISTICS: {
+       // ignore
+       break;
+@@ -385,6 +395,16 @@ public:
+       promote_flush = true;
+       break;
+     }
++    case D3D11_QUERY_SO_STATISTICS:
++    case D3D11_QUERY_SO_STATISTICS_STREAM0:
++    case D3D11_QUERY_SO_STATISTICS_STREAM1:
++    case D3D11_QUERY_SO_STATISTICS_STREAM2:
++    case D3D11_QUERY_SO_STATISTICS_STREAM3:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3:
+     case D3D11_QUERY_PIPELINE_STATISTICS: {
+       // ignore
+       break;
+@@ -465,6 +485,20 @@ public:
+       }
+       return S_OK;
+     }
++    case D3D11_QUERY_SO_STATISTICS:
++    case D3D11_QUERY_SO_STATISTICS_STREAM0:
++    case D3D11_QUERY_SO_STATISTICS_STREAM1:
++    case D3D11_QUERY_SO_STATISTICS_STREAM2:
++    case D3D11_QUERY_SO_STATISTICS_STREAM3:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3: {
++      if (pData)
++        memset(pData, 0, pAsync->GetDataSize());
++      return S_OK;
++    }
+     default:
+       ERR("Unknown query type ", desc.Query);
+       return E_FAIL;
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 6a8caca..17fe0f5 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -972,6 +972,22 @@ public:
+       *ppQuery = ref(new MTLD3D11DummyQuery<D3D11_QUERY_DATA_PIPELINE_STATISTICS>(this, pQueryDesc));
+       return S_OK;
+     }
++    case D3D11_QUERY_SO_STATISTICS:
++    case D3D11_QUERY_SO_STATISTICS_STREAM0:
++    case D3D11_QUERY_SO_STATISTICS_STREAM1:
++    case D3D11_QUERY_SO_STATISTICS_STREAM2:
++    case D3D11_QUERY_SO_STATISTICS_STREAM3: {
++      *ppQuery = ref(new MTLD3D11DummyQuery<D3D11_QUERY_DATA_SO_STATISTICS>(this, pQueryDesc));
++      return S_OK;
++    }
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2:
++    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3: {
++      *ppQuery = ref(new MTLD3D11DummyQuery<BOOL>(this, pQueryDesc));
++      return S_OK;
++    }
+     default:
+       ERR("CreateQuery1: query type not implemented: ", pQueryDesc->Query);
+       return E_NOTIMPL;
+diff --git a/src/d3d11/d3d11_texture_linear.cpp b/src/d3d11/d3d11_texture_linear.cpp
+index e250d6e..bdbc5fd 100644
+--- a/src/d3d11/d3d11_texture_linear.cpp
++++ b/src/d3d11/d3d11_texture_linear.cpp
+@@ -93,13 +93,32 @@ HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_2d>::CreateShaderRes
+   if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc, &finalDesc))) {
+     return E_INVALIDARG;
+   }
+-  if (finalDesc.ViewDimension != D3D10_SRV_DIMENSION_TEXTURE2D) {
+-    ERR("Only 2d texture SRV can be created on dynamic texture");
++  // A dynamic linear texture is a single 2D image. A one-slice TEXTURE2DARRAY view of it is the
++  // same image and is what engines that sample everything as arrays ask for (SnowRunner).
++  WMTTextureType view_type;
++  UINT most_detailed_mip, mip_levels;
++  switch (finalDesc.ViewDimension) {
++  case D3D11_SRV_DIMENSION_TEXTURE2D:
++    view_type = WMTTextureType2D;
++    most_detailed_mip = finalDesc.Texture2D.MostDetailedMip;
++    mip_levels = finalDesc.Texture2D.MipLevels;
++    break;
++  case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
++    if (finalDesc.Texture2DArray.FirstArraySlice != 0 || finalDesc.Texture2DArray.ArraySize != 1) {
++      ERR("2d array SRV on dynamic texture must cover its one slice");
++      return E_FAIL;
++    }
++    view_type = WMTTextureType2DArray;
++    most_detailed_mip = finalDesc.Texture2DArray.MostDetailedMip;
++    mip_levels = finalDesc.Texture2DArray.MipLevels;
++    break;
++  default:
++    ERR("SRV dimension ", finalDesc.ViewDimension, " cannot be created on dynamic texture");
+     return E_FAIL;
+   }
+-  if (~finalDesc.Texture2D.MipLevels == 0)
+-    finalDesc.Texture2D.MipLevels = this->desc.MipLevels - finalDesc.Texture2D.MostDetailedMip;
+-  if (finalDesc.Texture2D.MostDetailedMip != 0 || finalDesc.Texture2D.MipLevels != 1) {
++  if (~mip_levels == 0)
++    mip_levels = this->desc.MipLevels - most_detailed_mip;
++  if (most_detailed_mip != 0 || mip_levels != 1) {
+     ERR("2d texture SRV must be non-mipmapped on dynamic texture");
+     return E_FAIL;
+   }
+@@ -114,7 +133,7 @@ HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_2d>::CreateShaderRes
+   auto srv = ref(new SRV(
+       &finalDesc, this, this->m_parent,
+       {.format = format.PixelFormat,
+-       .type = WMTTextureType2D,
++       .type = view_type,
+        .firstMiplevel = 0,
+        .miplevelCount = 1,
+        .firstArraySlice = 0,
