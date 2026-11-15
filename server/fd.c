@@ -1868,6 +1868,60 @@ struct unicode_str get_nt_name( struct fd *fd )
     return name;
 }
 
+/* APFS refuses a file name that holds a code point Unicode has not assigned, and Windows
+ * accepts any 16-bit unit. Returns the path with every UTF-16 unit from 0x80 up in its last
+ * component written as the plane 16 private-use character U+100000 + unit, which APFS takes
+ * and ntdll reads back as the unit, or NULL if the component is plain ASCII. */
+static char *escape_unix_name( const char *name )
+{
+    const unsigned char *p, *last, *end = (const unsigned char *)name + strlen( name );
+    unsigned int cp, units[2];
+    int i, len, count, escaped = 0;
+    char *ret, *dst;
+
+    while (end > (const unsigned char *)name && end[-1] == '/') end--;
+    for (last = end; last > (const unsigned char *)name && last[-1] != '/'; last--) /* nothing */;
+    if (!(ret = malloc( strlen( name ) + 2 * (end - last) + 1 ))) return NULL;
+    memcpy( ret, name, last - (const unsigned char *)name );
+    dst = ret + (last - (const unsigned char *)name);
+
+    for (p = last; p < end; p += len)
+    {
+        if (*p < 0x80)
+        {
+            *dst++ = *p;
+            len = 1;
+            continue;
+        }
+        if (*p >= 0xf0) { len = 4; cp = *p & 0x07; }
+        else if (*p >= 0xe0) { len = 3; cp = *p & 0x0f; }
+        else { len = 2; cp = *p & 0x1f; }
+        if (len > end - p) len = end - p;
+        for (i = 1; i < len; i++) cp = (cp << 6) | (p[i] & 0x3f);
+
+        count = 1;
+        units[0] = cp;
+        if (cp >= 0x10000)
+        {
+            units[0] = 0xd800 | (((cp - 0x10000) >> 10) & 0x3ff);
+            units[1] = 0xdc00 | (cp & 0x3ff);
+            count = 2;
+        }
+        for (i = 0; i < count; i++)
+        {
+            *dst++ = 0xf4;
+            *dst++ = 0x80 | (units[i] >> 12);
+            *dst++ = 0x80 | ((units[i] >> 6) & 0x3f);
+            *dst++ = 0x80 | (units[i] & 0x3f);
+        }
+        escaped = 1;
+    }
+    strcpy( dst, (const char *)end );
+    if (escaped) return ret;
+    free( ret );
+    return NULL;
+}
+
 /* open() wrapper that returns a struct fd with no fd user set */
 struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_name,
                     int flags, mode_t *mode, unsigned int access,
@@ -1877,8 +1931,8 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     struct closed_fd *closed_fd;
     struct fd *fd;
     int root_fd = -1;
-    int rw_mode;
-    char *path;
+    int rw_mode, ret;
+    char *path, *escaped = NULL;
 
     if (((options & FILE_DELETE_ON_CLOSE) && !(access & DELETE)) ||
         ((options & FILE_DIRECTORY_FILE) && (flags & O_TRUNC)))
@@ -1910,7 +1964,13 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     /* create the directory if needed */
     if ((options & FILE_DIRECTORY_FILE) && (flags & O_CREAT))
     {
-        if (mkdir( name, *mode ) == -1)
+        ret = mkdir( name, *mode );
+        if (ret == -1 && errno == EILSEQ && (escaped = escape_unix_name( name )))
+        {
+            name = escaped;
+            ret = mkdir( name, *mode );
+        }
+        if (ret == -1)
         {
             if (errno != EEXIST || (flags & O_EXCL))
             {
@@ -1928,7 +1988,13 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     }
     else rw_mode = O_RDONLY;
 
-    if ((fd->unix_fd = open( name, rw_mode | (flags & ~O_TRUNC), *mode )) == -1)
+    fd->unix_fd = open( name, rw_mode | (flags & ~O_TRUNC), *mode );
+    if (fd->unix_fd == -1 && errno == EILSEQ && !escaped && (escaped = escape_unix_name( name )))
+    {
+        name = escaped;
+        fd->unix_fd = open( name, rw_mode | (flags & ~O_TRUNC), *mode );
+    }
+    if (fd->unix_fd == -1)
     {
         /* if we tried to open a directory for write access, retry read-only */
         if (errno == EISDIR)
@@ -2092,11 +2158,13 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
 #endif
 
     if (root_fd != -1) fchdir( server_dir_fd ); /* go back to the server dir */
+    free( escaped );
     return fd;
 
 error:
     release_object( fd );
     free( closed_fd );
+    free( escaped );
     if (root_fd != -1) fchdir( server_dir_fd ); /* go back to the server dir */
     return NULL;
 }
@@ -2820,7 +2888,8 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
 {
     struct inode *inode;
     struct stat st, st2;
-    char *name;
+    char *name, *escaped;
+    int ret;
     const unsigned int replace = flags & FILE_RENAME_REPLACE_IF_EXISTS;
 
     if (!fd->inode || !fd->unix_name)
@@ -2920,13 +2989,25 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
 
     if (create_link)
     {
-        if (link( fd->unix_name, name ))
-            file_set_error();
+        ret = link( fd->unix_name, name );
+        if (ret && errno == EILSEQ && (escaped = escape_unix_name( name )))
+        {
+            ret = link( fd->unix_name, escaped );
+            free( escaped );
+        }
+        if (ret) file_set_error();
         free( name );
         return;
     }
 
-    if (rename( fd->unix_name, name ))
+    ret = rename( fd->unix_name, name );
+    if (ret && errno == EILSEQ && (escaped = escape_unix_name( name )))
+    {
+        free( name );
+        name = escaped;
+        ret = rename( fd->unix_name, name );
+    }
+    if (ret)
     {
         file_set_error();
         goto failed;

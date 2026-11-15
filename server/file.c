@@ -776,6 +776,7 @@ void file_set_error(void)
     case EPERM:     set_error( STATUS_ACCESS_DENIED ); break;
     case EBUSY:     set_error( STATUS_FILE_LOCK_CONFLICT ); break;
     case ENOENT:    set_error( STATUS_NO_SUCH_FILE ); break;
+    case EILSEQ:    set_error( STATUS_OBJECT_NAME_INVALID ); break;
     case EISDIR:    set_error( STATUS_FILE_IS_A_DIRECTORY ); break;
     case ENFILE:
     case EMFILE:    set_error( STATUS_TOO_MANY_OPENED_FILES ); break;

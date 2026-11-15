@@ -1372,6 +1372,65 @@ static BOOL is_hidden_file( const char *name )
 }
 
 
+/* APFS refuses a file name that holds a code point Unicode has not assigned, and Windows
+ * accepts any 16-bit unit. The server stores such a name with every unit from 0x80 up
+ * written as the plane 16 private-use character U+100000 + unit, which APFS takes. */
+
+/***********************************************************************
+ *           escape_unix_name
+ *
+ * Convert a file name to its escaped spelling. Returns the length, or -1 if the name
+ * has nothing to escape or does not fit.
+ */
+static int escape_unix_name( const WCHAR *name, int length, char *dst, int dstlen )
+{
+    int i, pos = 0, escaped = 0;
+
+    for (i = 0; i < length; i++)
+    {
+        if (name[i] < 0x80)
+        {
+            if (pos >= dstlen) return -1;
+            dst[pos++] = name[i];
+            continue;
+        }
+        if (pos + 4 > dstlen) return -1;
+        dst[pos++] = 0xf4;
+        dst[pos++] = 0x80 | (name[i] >> 12);
+        dst[pos++] = 0x80 | ((name[i] >> 6) & 0x3f);
+        dst[pos++] = 0x80 | (name[i] & 0x3f);
+        escaped = 1;
+    }
+    return escaped ? pos : -1;
+}
+
+/***********************************************************************
+ *           unix_name_to_wcs
+ *
+ * Convert a Unix file name to UTF-16, reading an escaped unit back as itself.
+ */
+static DWORD unix_name_to_wcs( const char *src, DWORD srclen, WCHAR *dst, DWORD dstlen )
+{
+    DWORD i, pos, len = ntdll_umbstowcs( src, srclen, dst, dstlen );
+
+    for (i = pos = 0; i < len; i++)
+    {
+        if (i + 1 < len && dst[i] >= 0xdbc0 && dst[i] <= 0xdbff && dst[i + 1] >= 0xdc00 && dst[i + 1] <= 0xdfff)
+        {
+            WCHAR unit = ((dst[i] - 0xdbc0) << 10) | (dst[i + 1] - 0xdc00);
+            if (unit >= 0x80)
+            {
+                dst[pos++] = unit;
+                i++;
+                continue;
+            }
+        }
+        dst[pos++] = dst[i];
+    }
+    return pos;
+}
+
+
 /***********************************************************************
  *           hash_short_file_name
  *
@@ -1594,14 +1653,14 @@ static BOOL append_entry( struct dir_data *data, const char *long_name,
     WCHAR long_nameW[MAX_DIR_ENTRY_LEN + 1];
     WCHAR short_nameW[13];
 
-    long_len = ntdll_umbstowcs( long_name, strlen(long_name), long_nameW, ARRAY_SIZE(long_nameW) );
+    long_len = unix_name_to_wcs( long_name, strlen(long_name), long_nameW, ARRAY_SIZE(long_nameW) );
     if (long_len == ARRAY_SIZE(long_nameW)) return TRUE;
     if (long_nameW[long_len - 1] == '?') --long_len;
     long_nameW[long_len] = 0;
 
     if (short_name)
     {
-        short_len = ntdll_umbstowcs( short_name, strlen(short_name),
+        short_len = unix_name_to_wcs( short_name, strlen(short_name),
                                      short_nameW, ARRAY_SIZE( short_nameW ) - 1 );
     }
     else  /* generate a short name if necessary */
@@ -3020,6 +3079,12 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
         unix_name[pos + ret] = 0;
         if (!fstatat( root_fd, unix_name, &st, 0 )) return STATUS_SUCCESS;
     }
+    ret = escape_unix_name( name, length, unix_name + pos, MAX_DIR_ENTRY_LEN + 1 );
+    if (ret >= 0 && ret <= MAX_DIR_ENTRY_LEN)
+    {
+        unix_name[pos + ret] = 0;
+        if (!fstatat( root_fd, unix_name, &st, 0 )) return STATUS_SUCCESS;
+    }
     if (check_case) goto not_found;  /* we want an exact match */
 
     if (pos > 1) unix_name[pos - 1] = 0;
@@ -3051,7 +3116,7 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
                 {
                     if (kde[1].d_name[0])
                     {
-                        ret = ntdll_umbstowcs( kde[1].d_name, strlen(kde[1].d_name),
+                        ret = unix_name_to_wcs( kde[1].d_name, strlen(kde[1].d_name),
                                                buffer, MAX_DIR_ENTRY_LEN );
                         if (ret == length && !wcsnicmp( buffer, name, ret ))
                         {
@@ -3060,7 +3125,7 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
                             return STATUS_SUCCESS;
                         }
                     }
-                    ret = ntdll_umbstowcs( kde[0].d_name, strlen(kde[0].d_name),
+                    ret = unix_name_to_wcs( kde[0].d_name, strlen(kde[0].d_name),
                                            buffer, MAX_DIR_ENTRY_LEN );
                     if (ret == length && !wcsnicmp( buffer, name, ret ))
                     {
@@ -3094,7 +3159,7 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     unix_name[pos - 1] = '/';
     while ((de = readdir( dir )))
     {
-        ret = ntdll_umbstowcs( de->d_name, strlen(de->d_name), buffer, MAX_DIR_ENTRY_LEN );
+        ret = unix_name_to_wcs( de->d_name, strlen(de->d_name), buffer, MAX_DIR_ENTRY_LEN );
         if (ret == length && !wcsnicmp( buffer, name, ret ))
         {
             strcpy( unix_name + pos, de->d_name );
@@ -3555,7 +3620,7 @@ done:
         nt_name->MaximumLength = (strlen(unix_name) + 1) * sizeof(WCHAR);
         if ((nt_name->Buffer = malloc( nt_name->MaximumLength )))
         {
-            DWORD i, len = ntdll_umbstowcs( unix_name, strlen(unix_name), nt_name->Buffer, strlen(unix_name) );
+            DWORD i, len = unix_name_to_wcs( unix_name, strlen(unix_name), nt_name->Buffer, strlen(unix_name) );
             nt_name->Buffer[len] = 0;
             nt_name->Length = len * sizeof(WCHAR);
             for (i = 0; i < len; i++) if (nt_name->Buffer[i] == '/') nt_name->Buffer[i] = '\\';
@@ -4418,7 +4483,7 @@ static NTSTATUS find_drive_nt_root( char *unix_name, unsigned int len,
             memcpy( buffer, dos_prefixW, sizeof(dos_prefixW) );
             buffer[4] += i;
             lenW = ARRAY_SIZE(dos_prefixW);
-            lenW += ntdll_umbstowcs( unix_name + pos, len, buffer + lenW, len );
+            lenW += unix_name_to_wcs( unix_name + pos, len, buffer + lenW, len );
             buffer[lenW] = 0;
             *nt_name = collapse_path( buffer );
             return status;
@@ -4449,7 +4514,7 @@ NTSTATUS unix_to_nt_file_name( const char *unix_name, WCHAR **nt, UINT dispositi
     {
         if (!(buffer = malloc( sizeof(unix_prefixW) + len * sizeof(WCHAR) ))) return STATUS_NO_MEMORY;
         memcpy( buffer, unix_prefixW, sizeof(unix_prefixW) );
-        ntdll_umbstowcs( unix_name, len, buffer + ARRAY_SIZE(unix_prefixW), len );
+        unix_name_to_wcs( unix_name, len, buffer + ARRAY_SIZE(unix_prefixW), len );
         collapse_path( buffer );
     }
 
@@ -4621,7 +4686,7 @@ NTSTATUS get_full_path( char *name, const WCHAR *curdir, UNICODE_STRING *nt_name
         memcpy( ret, curdir, prefix_len * sizeof(WCHAR) );
     }
 
-    ntdll_umbstowcs( name, strlen(name) + 1, ret + prefix_len, len - prefix_len );
+    unix_name_to_wcs( name, strlen(name) + 1, ret + prefix_len, len - prefix_len );
     collapse_path( ret );
  done:
     init_unicode_string( nt_name, ret );
@@ -7236,7 +7301,7 @@ static BOOL read_changes_apc( void *user, ULONG_PTR *info, unsigned int *status 
                     if (event->name[i] == '/') event->name[i] = '\\';
 
                 pfni->Action = event->action;
-                pfni->FileNameLength = ntdll_umbstowcs( event->name, event->len, pfni->FileName, len );
+                pfni->FileNameLength = unix_name_to_wcs( event->name, event->len, pfni->FileName, len );
                 last_entry_offset = &pfni->NextEntryOffset;
 
                 if (pfni->FileNameLength == len) break;
