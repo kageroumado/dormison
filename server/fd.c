@@ -1881,7 +1881,7 @@ static char *escape_unix_name( const char *name )
 
     while (end > (const unsigned char *)name && end[-1] == '/') end--;
     for (last = end; last > (const unsigned char *)name && last[-1] != '/'; last--) /* nothing */;
-    if (!(ret = malloc( strlen( name ) + 2 * (end - last) + 1 ))) return NULL;
+    if (!(ret = malloc( strlen( name ) + 4 * (end - last) + 1 ))) return NULL;
     memcpy( ret, name, last - (const unsigned char *)name );
     dst = ret + (last - (const unsigned char *)name);
 
