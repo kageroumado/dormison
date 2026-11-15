@@ -4,6 +4,11 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>`) as the GitHub release body, and the build names
 itself after the top heading.
 
+## r12
+
+- NW.js games whose package name is not ASCII no longer crash at launch (A Simple Life with My
+  Unobtrusive Sister Demo). Programs can create files and folders whose names macOS refuses.
+
 ## r11
 
 - Runs on Intel Macs, with DXMT, DXVK and wined3d. D3DMetal stays Apple silicon only.
