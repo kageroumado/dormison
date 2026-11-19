@@ -172,11 +172,14 @@ else
     gh release download manifest --repo "$ENGINE_REPO" --pattern engine.json --output "$MANIFEST" --clobber
 fi
 python3 - "$MANIFEST" "$NAME" "$URL" "$SHA256" "$SIZE" "$MIN_APP_VERSION" "$STAGE/engine-info.json" <<'PY'
-import hashlib, json, sys, urllib.request
+import hashlib, json, sys, time, urllib.request
 path, version, url, sha256, size, min_app, info_path = sys.argv[1:]
 manifest = json.load(open(path))
 info = json.load(open(info_path))
 manifest["schema"] = max(manifest.get("schema", 1), 2)
+# The app refuses a manifest whose serial is below the highest it has taken, so an old signed
+# manifest cannot be served again. The publish time, never below the one being replaced.
+manifest["serial"] = max(int(time.time()), manifest.get("serial", 0) + 1)
 release = {
     "version": version, "minAppVersion": min_app, "url": url,
     "sha256": sha256, "sizeBytes": int(size),
