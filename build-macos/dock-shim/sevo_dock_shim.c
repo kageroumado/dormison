@@ -637,9 +637,13 @@ static void sevo_try_swizzle(const struct mach_header *header, intptr_t slide) {
 
 // Some games are Chromium applications wearing a Windows exe: NW.js titles,
 // RPG Maker MV and MZ above all. macOS runs the same application natively, so
-// the wine process Steam started is replaced by NW.js right here. The pid is
-// the same, so Steam's running state, playtime and overlay all follow the
-// native process, and the game ending ends Steam's session.
+// the process Steam started forks NW.js under sevo-native-supervisor and goes
+// on as wine running sevo-native.exe --wait, exactly as a macOS build does
+// (below). Steam's CreateProcess returns only once the child's wine startup
+// completes (`init_process_done`), and NW.js exec'd in place never reaches
+// it: Steam would sit in CreatingProcess for the whole run, never count the
+// game as running, and report AppError_46 when it closed. The waiter
+// completes startup, so Steam tracks the game, its playtime and its end.
 //
 // Which games, and with what, the app decides: it writes the answer into the
 // per-program env file ntdll reads at process start
@@ -826,6 +830,40 @@ static unsigned count_sevo_variables(const char *text) {
     return found;
 }
 
+static int exec_native(const char *executable, char *const *arguments, char *const *environment, int keep_fd);
+
+// The Steam app a native NW.js run belongs to, for its session file: the
+// manifest the exe's path runs through, Steam's own SteamAppId, the env
+// file's stub id, or its `# app <id>` header, whichever answers first.
+static void nwjs_app_id(const char *text, char **argv, int argc, char *out, size_t len) {
+    for (int i = 0; i < argc && i < 2; i++) {
+        if (argv[i] && steam_manifest_value(argv[i], "appid", out, len)) return;
+    }
+    const char *inherited = getenv("SteamAppId");
+    if (inherited && *inherited) {
+        snprintf(out, len, "%s", inherited);
+        return;
+    }
+    char *stub = env_file_value(text, "SEVO_STEAM_APPID");
+    if (stub) {
+        snprintf(out, len, "%s", stub);
+        free(stub);
+        return;
+    }
+    const char *header = strstr(text, "# app ");
+    if (header) {
+        header += 6;
+        size_t n = 0;
+        while (n + 1 < len && header[n] >= '0' && header[n] <= '9') {
+            out[n] = header[n];
+            n++;
+        }
+        out[n] = '\0';
+        if (n) return;
+    }
+    snprintf(out, len, "0");
+}
+
 static void sevo_run_natively(void) {
     char **argv = *_NSGetArgv();
     int argc = *_NSGetArgc();
@@ -866,37 +904,85 @@ static void sevo_run_natively(void) {
                 name, nwjs ? nwjs : "(no runtime)");
         goto done;
     }
-    if (stub && strcmp(stub, "1") == 0 && appid) spawn_steam_stub(appid, game_dir, port);
-    if (chdir(directory) != 0) {
-        fprintf(stderr, "sevo-shim: cannot enter %s: %s — staying in wine\n",
-                directory, strerror(errno));
+    char engine[1024], waiter[1300], supervisor[1300];
+    if (!engine_directory(engine, sizeof(engine))) goto done;
+    snprintf(waiter, sizeof(waiter), "%s/sevo-native.exe", engine);
+    snprintf(supervisor, sizeof(supervisor), "%s/sevo-native-supervisor", engine);
+    if (access(waiter, R_OK) != 0 || access(supervisor, X_OK) != 0) {
+        fprintf(stderr, "sevo-shim: no %s or %s — staying in wine\n", waiter, supervisor);
         goto done;
     }
+    char session_appid[32];
+    nwjs_app_id(text, argv, argc, session_appid, sizeof(session_appid));
+    // The bundle the runtime is exec'd through names the session: everything
+    // before `/Contents/MacOS/`, or the binary itself when it has no bundle.
+    char bundle[1400];
+    snprintf(bundle, sizeof(bundle), "%s", nwjs);
+    char *contents = strstr(bundle, "/Contents/MacOS/");
+    if (contents) *contents = '\0';
 
+    int status_pipe[2];
+    if (pipe(status_pipe) != 0) {
+        fprintf(stderr, "sevo-shim: pipe: %s — staying in wine\n", strerror(errno));
+        goto done;
+    }
     // NW.js takes the directory holding the wrapper package as its first
     // argument; whatever Steam put on the game's own command line follows.
-    char **arguments = calloc((size_t)argc + 2, sizeof(char *));
-    if (!arguments) goto done;
-    size_t written = 0;
-    arguments[written++] = nwjs;
-    arguments[written++] = directory;
-    for (int i = 2; i < argc; i++) arguments[written++] = argv[i];
-    arguments[written] = NULL;
-
+    char fd_argument[16], waiter_argument[16];
+    snprintf(fd_argument, sizeof fd_argument, "%d", status_pipe[1]);
+    snprintf(waiter_argument, sizeof waiter_argument, "%d", (int)getpid());
+    char *head[] = {
+        supervisor, "--status-fd", fd_argument, "--waiter", waiter_argument, "--prefix", (char *)prefix,
+        "--appid", session_appid, "--bundle", bundle, "--cwd", directory, "--", nwjs, directory,
+    };
+    size_t head_count = sizeof(head) / sizeof(head[0]);
+    char **arguments = calloc(head_count + (size_t)argc, sizeof(char *));
     static const char *drop[] = { "DYLD_INSERT_LIBRARIES=", "WINE", "SEVO_" };
     char **environment = filtered_environment(drop, 3, count_sevo_variables(text));
-    if (!environment) {
+    if (!arguments || !environment) {
         free(arguments);
+        free(environment);
+        close(status_pipe[0]);
+        close(status_pipe[1]);
         goto done;
     }
+    size_t written = 0;
+    for (size_t i = 0; i < head_count; i++) arguments[written++] = head[i];
+    for (int i = 2; i < argc; i++) arguments[written++] = argv[i];
+    arguments[written] = NULL;
     size_t count = 0;
     while (environment[count]) count++;
     add_sevo_variables(environment, &count, text);
-    fprintf(stderr, "sevo-shim: running %s natively with %s\n", name, nwjs);
+
+    if (stub && strcmp(stub, "1") == 0 && appid) spawn_steam_stub(appid, game_dir, port);
     fflush(stderr);
-    execve(nwjs, arguments, environment);
-    fprintf(stderr, "sevo-shim: exec of %s failed: %s — staying in wine\n",
-            nwjs, strerror(errno));
+    pid_t child = fork();
+    if (child < 0) {
+        fprintf(stderr, "sevo-shim: fork: %s — staying in wine\n", strerror(errno));
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        free(environment);
+        free(arguments);
+        goto done;
+    }
+    if (child == 0) {
+        close(status_pipe[0]);
+        fcntl(status_pipe[1], F_SETFD, 0);
+        int error = exec_native(supervisor, arguments, environment, status_pipe[1]);
+        fprintf(stderr, "sevo-shim: exec of %s failed: %s\n", supervisor, strerror(error));
+        _exit(127);
+    }
+    close(status_pipe[1]);
+    fcntl(status_pipe[0], F_SETFD, 0);
+    fprintf(stderr, "sevo-shim: running %s natively with %s under supervisor pid %d (app %s); "
+            "this process waits for it\n", name, nwjs, (int)child, session_appid);
+    // ntdll runs the waiter in place of the program Steam asked for
+    // (dlls/ntdll/unix/env.c, sevo_native_waiter).
+    char fd_text[16];
+    snprintf(fd_text, sizeof fd_text, "%d", status_pipe[0]);
+    setenv("SEVO_NATIVE_WAITER", waiter, 1);
+    setenv("SEVO_NATIVE_WAIT_FD", fd_text, 1);
+    setenv("SEVO_QUIET", "1", 1);
     free(environment);
     free(arguments);
 done:

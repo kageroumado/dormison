@@ -4,6 +4,11 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>`) as the GitHub release body, and the build names
 itself after the top heading.
 
+## r13
+
+- Steam shows NW.js and RPG Maker games on the native runner as running, counts their playtime,
+  and no longer reports "failed to start" when they close.
+
 ## r12
 
 - NW.js games whose package name is not ASCII no longer crash at launch (A Simple Life with My
