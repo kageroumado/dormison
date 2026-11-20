@@ -626,6 +626,7 @@ typedef struct _RpcServerProtseq_np
 {
     RpcServerProtseq common;
     HANDLE mgr_event;
+    BOOL warned_listener_limit;
 } RpcServerProtseq_np;
 
 static RpcServerProtseq *rpcrt4_protseq_np_alloc(void)
@@ -647,7 +648,8 @@ static void *rpcrt4_protseq_np_get_wait_array(RpcServerProtseq *protseq, void *p
     HANDLE *objs = prev_array;
     RpcConnection_np *conn;
     RpcServerProtseq_np *npps = CONTAINING_RECORD(protseq, RpcServerProtseq_np, common);
-    
+    unsigned int skip;
+
     EnterCriticalSection(&protseq->cs);
     
     /* open and count connections */
@@ -694,12 +696,31 @@ static void *rpcrt4_protseq_np_get_wait_array(RpcServerProtseq *protseq, void *p
         return NULL;
     }
     
+    /* A wait takes MAXIMUM_WAIT_OBJECTS handles and fails outright with more,
+     * which would end the server thread and leave every later registration
+     * waiting on it for good. combase adds a listener for each apartment and
+     * none is ever removed, so a program that keeps making apartments gets
+     * here. Past the limit the oldest listeners are the ones waited on: the
+     * list holds the newest first, and the endpoints that have lived longest
+     * are the ones still in use. */
+    skip = *count > MAXIMUM_WAIT_OBJECTS ? *count - MAXIMUM_WAIT_OBJECTS : 0;
+    if (skip && !npps->warned_listener_limit)
+    {
+        npps->warned_listener_limit = TRUE;
+        WARN("%u listeners, waiting on the %u oldest\n", *count - 1, MAXIMUM_WAIT_OBJECTS - 1);
+    }
+
     objs[0] = npps->mgr_event;
     *count = 1;
     LIST_FOR_EACH_ENTRY(conn, &protseq->listeners, RpcConnection_np, common.protseq_entry)
     {
-        if (conn->listen_event)
-            objs[(*count)++] = conn->listen_event;
+        if (!conn->listen_event) continue;
+        if (skip)
+        {
+            skip--;
+            continue;
+        }
+        objs[(*count)++] = conn->listen_event;
     }
     LeaveCriticalSection(&protseq->cs);
     return objs;
