@@ -896,6 +896,34 @@ NTSTATUS WINAPI D3DKMTOpenAdapterFromGdiDisplayName( D3DKMT_OPENADAPTERFROMGDIDI
     return NtUserD3DKMTOpenAdapterFromGdiDisplayName( desc );
 }
 
+/* The GPU scheduler's priority class of a process, D3DKMT_SCHEDULINGPRIORITYCLASS:
+ * 2 is D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL. Metal schedules by its own rules,
+ * so every process stays at normal and a request to change it succeeds. */
+#define SCHEDULING_PRIORITY_CLASS_NORMAL 2
+
+/***********************************************************************
+ *           D3DKMTSetProcessSchedulingPriorityClass    (GDI32.@)
+ *
+ * Steam's service calls this for the web helper whenever the in-game overlay
+ * comes up.
+ */
+NTSTATUS WINAPI D3DKMTSetProcessSchedulingPriorityClass( HANDLE process, int priority )
+{
+    TRACE( "process %p, priority %d\n", process, priority );
+    return STATUS_SUCCESS;
+}
+
+/***********************************************************************
+ *           D3DKMTGetProcessSchedulingPriorityClass    (GDI32.@)
+ */
+NTSTATUS WINAPI D3DKMTGetProcessSchedulingPriorityClass( HANDLE process, int *priority )
+{
+    TRACE( "process %p, priority %p\n", process, priority );
+    if (!priority) return STATUS_INVALID_PARAMETER;
+    *priority = SCHEDULING_PRIORITY_CLASS_NORMAL;
+    return STATUS_SUCCESS;
+}
+
 /***********************************************************************
  *           SetObjectOwner    (GDI32.@)
  */
