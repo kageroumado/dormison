@@ -4,6 +4,12 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>`) as the GitHub release body, and the build names
 itself after the top heading.
 
+## r14
+
+- Steam no longer freezes after a day or two of running (its window stopped answering and the
+  client restarted itself). Any program that opens many COM apartments is covered.
+- Opening the Steam overlay in a game no longer stops Steam's background service.
+
 ## r13
 
 - Steam shows NW.js and RPG Maker games on the native runner as running, counts their playtime,
