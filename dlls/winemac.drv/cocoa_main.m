@@ -21,6 +21,7 @@
 #import <AppKit/AppKit.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <stdatomic.h>
 
 #include "macdrv_cocoa.h"
 #import "cocoa_app.h"
@@ -38,12 +39,34 @@ enum {
 };
 
 
+/* How long macdrv_start_cocoa_app waits for the main thread. A process that
+   gives up runs without a display driver for the rest of its life, and on a
+   loaded Mac the main thread of a just-started process (Steam's overlay
+   beside a game that is loading) can be busy for much longer than a few
+   seconds. */
+static const NSTimeInterval cocoa_app_start_timeout = 60;
+
+
+/* Shared by macdrv_start_cocoa_app, which waits, and run_cocoa_app, which the
+   main thread reaches whenever its run loop next turns: possibly after the
+   waiter has given up and returned. Each of the two holds one of `owners`,
+   and the last to let go frees the lock and the block. */
 struct cocoa_app_startup_info {
     NSConditionLock*    lock;
     unsigned long long  tickcount;
     uint64_t            uptime_ns;
     BOOL                success;
+    atomic_int          owners;
 };
+
+static void release_startup_info(struct cocoa_app_startup_info* startup_info)
+{
+    if (atomic_fetch_sub(&startup_info->owners, 1) == 1)
+    {
+        [startup_info->lock release];
+        free(startup_info);
+    }
+}
 
 
 /***********************************************************************
@@ -66,6 +89,7 @@ static void run_cocoa_app(void* info)
     struct cocoa_app_startup_info* startup_info = info;
     NSConditionLock* lock = startup_info->lock;
     BOOL created_app = FALSE;
+    BOOL success;
 
     @autoreleasepool
     {
@@ -83,15 +107,13 @@ static void run_cocoa_app(void* info)
             startup_info->success = TRUE;
         }
 
-        /* Retain the lock while we're using it, so macdrv_start_cocoa_app()
-           doesn't deallocate it in the middle of us unlocking it. */
-        [lock retain];
+        success = startup_info->success;
         [lock lock];
         [lock unlockWithCondition:COCOA_APP_RUNNING];
-        [lock release];
+        release_startup_info(startup_info);
     }
 
-    if (created_app && startup_info->success)
+    if (created_app && success)
     {
         @autoreleasepool
         {
@@ -123,7 +145,7 @@ int macdrv_start_cocoa_app(unsigned long long tickcount)
 {
     int ret = -1;
     CFRunLoopSourceRef source;
-    struct cocoa_app_startup_info startup_info;
+    struct cocoa_app_startup_info* startup_info;
     uint64_t uptime_mach = mach_absolute_time();
     mach_timebase_info_data_t mach_timebase;
     NSDate* timeLimit;
@@ -135,35 +157,38 @@ int macdrv_start_cocoa_app(unsigned long long tickcount)
                              toTarget:[NSThread class]
                            withObject:nil];
 
-    startup_info.lock = [[NSConditionLock alloc] initWithCondition:COCOA_APP_NOT_RUNNING];
-    startup_info.tickcount = tickcount;
-    startup_info.success = FALSE;
+    if (!(startup_info = calloc(1, sizeof(*startup_info)))) return ret;
+    startup_info->lock = [[NSConditionLock alloc] initWithCondition:COCOA_APP_NOT_RUNNING];
+    startup_info->tickcount = tickcount;
+    atomic_init(&startup_info->owners, 1);
 
     mach_timebase_info(&mach_timebase);
-    startup_info.uptime_ns = uptime_mach * mach_timebase.numer / mach_timebase.denom;
+    startup_info->uptime_ns = uptime_mach * mach_timebase.numer / mach_timebase.denom;
 
-    timeLimit = [NSDate dateWithTimeIntervalSinceNow:5];
+    timeLimit = [NSDate dateWithTimeIntervalSinceNow:cocoa_app_start_timeout];
 
-    source_context.info = &startup_info;
+    source_context.info = startup_info;
     source_context.perform = run_cocoa_app;
     source = CFRunLoopSourceCreate(NULL, 0, &source_context);
 
-    if (source && startup_info.lock && timeLimit)
+    if (source && startup_info->lock && timeLimit)
     {
+        /* run_cocoa_app's share, taken before the main thread can reach it. */
+        atomic_fetch_add(&startup_info->owners, 1);
         CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
         CFRunLoopSourceSignal(source);
         CFRunLoopWakeUp(CFRunLoopGetMain());
 
-        if ([startup_info.lock lockWhenCondition:COCOA_APP_RUNNING beforeDate:timeLimit])
+        if ([startup_info->lock lockWhenCondition:COCOA_APP_RUNNING beforeDate:timeLimit])
         {
-            [startup_info.lock unlock];
-            ret = !startup_info.success;
+            ret = !startup_info->success;
+            [startup_info->lock unlock];
         }
     }
 
     if (source)
         CFRelease(source);
-    [startup_info.lock release];
+    release_startup_info(startup_info);
     return ret;
 }
 }
