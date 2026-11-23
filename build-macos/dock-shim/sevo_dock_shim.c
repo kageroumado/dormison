@@ -1154,6 +1154,62 @@ static int bridge_port_file(const char *prefix, const char *appid, char *out, si
     return n > 0 && (size_t)n < len;
 }
 
+// A game whose executable is a shell script (the kick scripts of FNA and
+// MonoGame ports: Celeste, Terraria, Bastion) starts through /bin/bash, and
+// macOS removes every DYLD_ variable from a process it starts from a protected
+// binary. The game binary the script then runs has no DYLD_INSERT_LIBRARIES
+// left, never loads the ipc dylib, finds no Steam and quits. Steam for Mac
+// meets the same rule with STEAM_DYLD_INSERT_LIBRARIES, which those scripts
+// copy back; this file does the copy for a bash script that does not, through
+// BASH_ENV, which bash reads before a script's first line. Answers whether
+// the file is in place.
+static int bash_environment_file(const char *prefix, char *out, size_t len) {
+    static const char script[] =
+        "if [ -n \"$STEAM_DYLD_INSERT_LIBRARIES\" ] && [ -z \"$DYLD_INSERT_LIBRARIES\" ]; then\n"
+        "    export DYLD_INSERT_LIBRARIES=\"$STEAM_DYLD_INSERT_LIBRARIES\"\n"
+        "fi\n";
+    struct passwd *user = getpwuid(getuid());
+    if (!user || !user->pw_name) return 0;
+    int n = snprintf(out, len, "%s/drive_c/users/%s/AppData/Local/Sevoflurane/native-launcher.bash",
+                     prefix, user->pw_name);
+    if (n <= 0 || (size_t)n >= len) return 0;
+    int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return 0;
+    ssize_t written = write(fd, script, sizeof(script) - 1);
+    close(fd);
+    return written == (ssize_t)(sizeof(script) - 1);
+}
+
+// The interpreter line of a script, without its `#!`, or 0 for any other file.
+static int script_interpreter(const char *executable, char *out, size_t len) {
+    char line[256];
+    int fd = open(executable, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t got = read(fd, line, sizeof(line) - 1);
+    close(fd);
+    if (got < 3 || line[0] != '#' || line[1] != '!') return 0;
+    line[got] = '\0';
+    line[strcspn(line, "\r\n")] = '\0';
+    const char *start = line + 2;
+    while (*start == ' ' || *start == '\t') start++;
+    snprintf(out, len, "%s", start);
+    return 1;
+}
+
+// Where the game's own arguments start in a native launch's argv. Steam's
+// command line for a mapped game is `<tool>\sevo-native.exe <verb> "<target>"
+// <the game's arguments>`, and a launch that names the executable inside the
+// bundle arrives with all of it after the target: the verb and the target a
+// second time. Those two are Steam's, and the game gets what follows them.
+static int first_game_argument(int argc, char **argv) {
+    for (int i = 3; i + 1 < argc; i++) {
+        int verb = strcmp(argv[i], "waitforexitandrun") == 0 || strcmp(argv[i], "run") == 0;
+        if (verb && bundle_inner_executable(argv[i + 1])) return i + 2;
+        if (verb && ends_with_ci(argv[i + 1], ".app")) return i + 2;
+    }
+    return 3;
+}
+
 // The bridge's helper, started in the bottle this process is still part of.
 // It loads the running client's steamclient64.dll and serves the game's
 // Steamworks calls on a port of its own choosing; it exits when the game's
@@ -1208,11 +1264,12 @@ static int spawn_steam_bridge(const char *appid, const char *token) {
 // of wine's or the app's: the client runs with the engine's PATH, the renderer's
 // variables and no HOME, and a native app must not inherit any of that.
 static char **native_environment(const char *appid, int bridged, const char *ipc, const char *bridge,
-                                 const char *port_file, const char *token, const char *prefix) {
+                                 const char *port_file, const char *token, const char *prefix,
+                                 const char *bash_environment) {
     char **inherited = *_NSGetEnviron();
     size_t inherited_count = 0;
     while (inherited[inherited_count]) inherited_count++;
-    char **out = calloc(inherited_count + 24, sizeof(char *));
+    char **out = calloc(inherited_count + 28, sizeof(char *));
     if (!out) return NULL;
     size_t n = 0;
     struct passwd *user = getpwuid(getuid());
@@ -1238,6 +1295,7 @@ static char **native_environment(const char *appid, int bridged, const char *ipc
     for (size_t i = 0; i < inherited_count; i++) {
         char *entry = inherited[i];
         if (strncmp(entry, "SteamAppId=", 11) == 0 || strncmp(entry, "SteamGameId=", 12) == 0) continue;
+        if (strncmp(entry, "STEAM_DYLD_INSERT_LIBRARIES=", 28) == 0) continue;
         if (strncmp(entry, "Steam", 5) == 0 || strncmp(entry, "STEAM_", 6) == 0 ||
             strncmp(entry, "ENABLE_VK_LAYER_VALVE", 21) == 0)
             out[n++] = entry;
@@ -1249,6 +1307,13 @@ static char **native_environment(const char *appid, int bridged, const char *ipc
     if (bridged) {
         snprintf(buffer, sizeof buffer, "DYLD_INSERT_LIBRARIES=%s", ipc);
         out[n++] = strdup(buffer);
+        // For a game that starts through a shell script (bash_environment_file).
+        snprintf(buffer, sizeof buffer, "STEAM_DYLD_INSERT_LIBRARIES=%s", ipc);
+        out[n++] = strdup(buffer);
+        if (bash_environment && *bash_environment) {
+            snprintf(buffer, sizeof buffer, "BASH_ENV=%s", bash_environment);
+            out[n++] = strdup(buffer);
+        }
         snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_DIR=%s", bridge);
         out[n++] = strdup(buffer);
         snprintf(buffer, sizeof buffer, "SEVO_STEAM_BRIDGE_PORT_FILE=%s", port_file);
@@ -1366,6 +1431,17 @@ static void sevo_run_native_app(void) {
         fprintf(stderr, "sevo-shim: no steam bridge under %s — the game runs without Steam\n", engine);
     }
     if (bridged) warn_if_hardened(bundle);
+    char bash_environment[1400] = "", interpreter[256];
+    // /bin/sh is bash, which reads BASH_ENV only when started under its own name.
+    int through_bash = 0;
+    if (bridged && script_interpreter(executable, interpreter, sizeof(interpreter))) {
+        int covered = bash_environment_file(prefix, bash_environment, sizeof(bash_environment));
+        if (!covered) bash_environment[0] = '\0';
+        through_bash = covered && strcmp(interpreter, "/bin/sh") == 0;
+        fprintf(stderr, "sevo-shim: %s is a script run by %s, which macOS starts without DYLD_INSERT_LIBRARIES; "
+                        "the bridge reaches the game through STEAM_DYLD_INSERT_LIBRARIES%s%s\n",
+                executable, interpreter, covered ? " and BASH_ENV" : "", through_bash ? ", run by /bin/bash" : "");
+    }
 
     // The game runs under sevo-native-supervisor, a child of this process, so
     // the process Steam created lives on: wine runs sevo-native.exe --wait in
@@ -1388,15 +1464,17 @@ static void sevo_run_native_app(void) {
     snprintf(waiter_argument, sizeof waiter_argument, "%d", (int)getpid());
     char *head[] = {
         supervisor, "--status-fd", fd_argument, "--waiter", waiter_argument, "--prefix", (char *)prefix,
-        "--appid", appid, "--bundle", bundle, "--cwd", parent, "--", executable,
+        "--appid", appid, "--bundle", bundle, "--cwd", parent, "--",
     };
     size_t head_count = sizeof(head) / sizeof(head[0]);
-    char **arguments = calloc(head_count + (size_t)argc, sizeof(char *));
-    char **environment = native_environment(appid, bridged, ipc, bridge, port_file, token, prefix);
+    char **arguments = calloc(head_count + 2 + (size_t)argc, sizeof(char *));
+    char **environment = native_environment(appid, bridged, ipc, bridge, port_file, token, prefix, bash_environment);
     if (!arguments || !environment) return;
     size_t written = 0;
     for (size_t i = 0; i < head_count; i++) arguments[written++] = head[i];
-    for (int i = 3; i < argc; i++) arguments[written++] = argv[i];
+    if (through_bash) arguments[written++] = "/bin/bash";
+    arguments[written++] = executable;
+    for (int i = first_game_argument(argc, argv); i < argc; i++) arguments[written++] = argv[i];
     arguments[written] = NULL;
 
     fflush(stderr);
