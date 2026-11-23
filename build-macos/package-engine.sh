@@ -150,7 +150,12 @@ for f in ipag.ttf ipagp.ttf IPA_Font_License_Agreement_v1.0.txt; do
     record deps "$OUT/wine/share/wine/fonts/$f"
 done
 
-# --- strip the PE builds: install-lib leaves full debug info, 1.3 GB of it ---
+# --- strip the PE builds: install-lib leaves full debug info, 1.3 GB of it.
+# strip stamps each file it rewrites with a link time, and so does every
+# mingw link below; SOURCE_DATE_EPOCH makes that the commit's time, so one
+# tree packages to the same bytes on every run. ---
+SOURCE_DATE_EPOCH="$(git -C "$REPO" log -1 --format=%ct)"
+export SOURCE_DATE_EPOCH
 echo "==> stripping PE modules"
 for f in "$OUT"/wine/lib/wine/x86_64-windows/*.dll "$OUT"/wine/lib/wine/x86_64-windows/*.exe; do
     [ -f "$f" ] && x86_64-w64-mingw32-strip --strip-all "$f" 2>/dev/null
@@ -331,10 +336,12 @@ else
     echo "warning: no 32-bit DXMT payload — 32-bit D3D11 goes through wined3d"
 fi
 
-# --- the dock shim, from this repository's source: it is the engine's face ---
+# --- the dock shim, from this repository's source: it is the engine's face.
+# Its install name is its file name: the linker's default is the path it is
+# written to, the packager's own folder. ---
 echo "==> building the dock shim"
 clang -arch arm64 -arch x86_64 -mmacosx-version-min="$MIN" -O2 -Wall -dynamiclib -framework ApplicationServices -framework Security \
-    -o "$OUT/libsevodockshim.dylib" "$HERE/dock-shim/sevo_dock_shim.c"
+    -install_name @rpath/libsevodockshim.dylib -o "$OUT/libsevodockshim.dylib" "$HERE/dock-shim/sevo_dock_shim.c"
 codesign -s - -f "$OUT/libsevodockshim.dylib"
 record source "$OUT/libsevodockshim.dylib"
 
