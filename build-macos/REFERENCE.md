@@ -379,6 +379,14 @@ signature `package-engine.sh` left; `--identity "Developer ID Application:
 …"` re-signs every Mach-O in the staged copy with a secure timestamp,
 leaving the installed engine as it was.
 
+`--gate <script>` runs a script on the staged copy, the one that ships, with
+its directory as the one argument, before the tarball is packed and under
+`--dry-run` too. A script that exits other than 0 ends the release with
+nothing packed, tagged or uploaded; without `--gate` the run says in one line
+that no gate ran. `bispectral/release-gate/run.sh` is such a script: it boots
+a scratch prefix on the engine and runs the probes that prove each release's
+fixes, one line per probe. `tests/packaging-gates.sh` covers the hook itself.
+
 ## Rebasing onto the next wine-staging
 
 ```bash

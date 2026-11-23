@@ -1,8 +1,9 @@
 # shellcheck shell=bash
 # The content checks package-engine.sh runs before it assembles an engine,
-# as functions over file paths so tests/packaging-gates.sh can run them
-# against files it makes up. Each gate prints its refusal and returns 1, or
-# prints nothing and returns 0.
+# and the release gate publish-engine.sh runs on the staged copy, as functions
+# over file paths so tests/packaging-gates.sh can run them against files it
+# makes up. Each gate prints its refusal and returns 1, or prints nothing and
+# returns 0; gate_release also lets through what its script prints.
 #
 # Every check reads what the binaries carry, never when they were written:
 # wine's installer writes a fresh destination file, so a stale winemac.so is
@@ -75,6 +76,17 @@ gate_clean_tree() {
     echo "the tree has uncommitted changes (pass --allow-dirty to package it anyway; the manifest will say so):"
     printf '%s\n' "$dirty" | sed 's/^/    /'
     return 1
+}
+
+# The release gate: a script that takes an engine directory and exits 0 when
+# the engine may ship. It runs with the directory as its one argument, and its
+# output is the caller's.
+#   gate_release <script> <engine directory>
+gate_release() {
+    local script="$1" engine="$2" status=0
+    [ -f "$script" ] && [ -x "$script" ] || { echo "the gate $script is not an executable file"; return 1; }
+    "$script" "$engine" || status=$?
+    [ "$status" = 0 ] || { echo "the gate $script refused $engine (exit $status)"; return 1; }
 }
 
 # Every Mach-O under a directory runs on the engine's floor: each slice's

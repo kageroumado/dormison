@@ -10,7 +10,7 @@
 #                          [--engine <dir>] [--key <ed25519.pem>]
 #                          [--identity "<Developer ID Application: …>"]
 #                          [--notes-file <file>] [--min-app-version <x.y>]
-#                          [--fresh-manifest]
+#                          [--fresh-manifest] [--gate <script>]
 #
 # Every engine is a regular GitHub release named r<N>, and the manifest names
 # it as the engine the app installs. --fresh-manifest writes a manifest that
@@ -23,6 +23,10 @@
 # --identity re-signs every Mach-O in the staged copy with a Developer ID
 # certificate and a secure timestamp instead of the ad-hoc signature
 # package-engine.sh leaves; the installed engine is untouched either way.
+# --gate (or DORMISON_GATE) runs a script with the staged engine directory as
+# its one argument, before the tarball is packed, under --dry-run too: an exit
+# other than 0 ends the release with nothing packed, tagged or uploaded. The
+# staged copy is the one that ships, signed as it will ship.
 # --dry-run does everything up to the tag and the uploads.
 #
 # Needs `gh` signed in to an account that can write both repositories,
@@ -30,7 +34,7 @@
 # Helpers) for the manifest gate.
 set -euo pipefail
 
-VERSION="${1:?usage: publish-engine.sh r<N> [--dry-run] [--engine <dir>] [--key <pem>] [--identity <id>] [--notes-file <file>] [--fresh-manifest]}"
+VERSION="${1:?usage: publish-engine.sh r<N> [--dry-run] [--engine <dir>] [--key <pem>] [--identity <id>] [--notes-file <file>] [--fresh-manifest] [--gate <script>]}"
 shift
 DRY_RUN=0
 ENGINE_DIR=""
@@ -38,6 +42,7 @@ KEY="${DORMISON_ED25519_KEY:-}"
 IDENTITY="${DORMISON_SIGNING_IDENTITY:-}"
 NOTES_FILE=""
 FRESH_MANIFEST=0
+GATE="${DORMISON_GATE:-}"
 MIN_APP_VERSION="${SEVO_MIN_APP_VERSION:-1.0}"
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -48,6 +53,7 @@ while [ $# -gt 0 ]; do
         --notes-file) NOTES_FILE="$2"; shift 2 ;;
         --min-app-version) MIN_APP_VERSION="$2"; shift 2 ;;
         --fresh-manifest) FRESH_MANIFEST=1; shift ;;
+        --gate) GATE="$2"; shift 2 ;;
         *) echo "unknown option $1"; exit 2 ;;
     esac
 done
@@ -56,9 +62,12 @@ done
 [ -n "$KEY" ] || { echo "no engine key: pass --key <ed25519.pem> or set DORMISON_ED25519_KEY"; exit 2; }
 [ -f "$KEY" ] || { echo "engine key not found at $KEY"; exit 2; }
 [ -z "$NOTES_FILE" ] || [ -f "$NOTES_FILE" ] || { echo "notes file not found at $NOTES_FILE"; exit 2; }
+[ -z "$GATE" ] || { [ -f "$GATE" ] && [ -x "$GATE" ]; } || { echo "the gate $GATE is not an executable file"; exit 2; }
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
+# shellcheck source=engine-gates.sh
+. "$HERE/engine-gates.sh"
 ROOT="${DORMISON_BUILD:-$HOME/dormison-build}"
 ENGINES="$HOME/Library/Application Support/Sevoflurane/Engines"
 NAME="dormison-$VERSION"
@@ -136,6 +145,14 @@ if [ -n "$IDENTITY" ]; then
         SIGNED=$((SIGNED + 1))
     done < <(find "$STAGE" -type f -print0)
     echo "    $SIGNED files signed"
+fi
+
+# --- the release gate, on the copy that ships ---
+if [ -n "$GATE" ]; then
+    echo "==> gate: $GATE"
+    gate_release "$GATE" "$STAGE" || { echo "nothing was packed, tagged or uploaded"; exit 1; }
+else
+    echo "==> no gate ran (--gate <script> runs one on the staged engine)"
 fi
 
 # --- pack, hash, sign ---

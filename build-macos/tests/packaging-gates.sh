@@ -130,4 +130,20 @@ clang -arch arm64 -mmacosx-version-min=27.0 -o "$T/y" "$T/floor.c"
 lipo -create -output "$T/floor-mixed/lib/mixed" "$T/x" "$T/y"
 expect_refusal "a universal binary with one slice too new is refused" "lib/mixed needs macOS 27.0" gate_macos_floor "$T/floor-mixed" 26.0
 
+# --- the release gate: a script given the engine directory ---
+mkdir -p "$T/staged engine"
+printf '#!/bin/bash\n[ -d "$1" ] && [ $# = 1 ] && echo "probed $1"\n' > "$T/gate-pass.sh"
+printf '#!/bin/bash\necho "FAIL  rpc-listeners  HUNG at 64 of 70"\nexit 1\n' > "$T/gate-fail.sh"
+cp "$T/gate-pass.sh" "$T/gate-plain.sh"
+chmod +x "$T/gate-pass.sh" "$T/gate-fail.sh"
+expect_acceptance "a gate that exits 0 lets the engine through" gate_release "$T/gate-pass.sh" "$T/staged engine"
+case "$(gate_release "$T/gate-pass.sh" "$T/staged engine")" in
+    "probed $T/staged engine") pass "the gate is given the engine directory as its one argument" ;;
+    *) fail "the gate is given the engine directory as its one argument" ;;
+esac
+expect_refusal "a gate that exits 1 refuses the engine" "refused $T/staged engine (exit 1)" gate_release "$T/gate-fail.sh" "$T/staged engine"
+expect_refusal "a refusing gate's own lines are shown" "HUNG at 64 of 70" gate_release "$T/gate-fail.sh" "$T/staged engine"
+expect_refusal "a gate that is not executable is refused" "is not an executable file" gate_release "$T/gate-plain.sh" "$T/staged engine"
+expect_refusal "a gate that does not exist is refused" "is not an executable file" gate_release "$T/no-such-gate.sh" "$T/staged engine"
+
 [ "$FAILED" = 0 ] && echo "every gate behaved" || exit 1
