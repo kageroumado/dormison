@@ -4,6 +4,14 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>`) as the GitHub release body, and the build names
 itself after the top heading.
 
+## r15
+
+- macOS versions of games that start through a script now launch (Celeste, Terraria). They showed
+  a Dock icon and quit.
+- A Steam helper that starts while the Mac is busy no longer crashes or runs without its window
+  (the in-game overlay beside Counter-Strike 2).
+- A game's macOS version no longer receives Steam's own launch words as arguments.
+
 ## r14
 
 - Steam no longer freezes after a day or two of running (its window stopped answering and the
