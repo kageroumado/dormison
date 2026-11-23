@@ -10,7 +10,7 @@ These scripts assemble Sevoflurane’s Wine engine, including its Swift Mac driv
 
 ## Prepare
 
-Install mingw-w64 and bison, then prepare the Intel dependency bottles and GStreamer as described in the [toolchain reference](REFERENCE.md#toolchain). Packaging also requires an installed Sevoflurane engine as a donor, or `SEVO_LIVE_ENGINE` pointing to one.
+Install mingw-w64 and bison, then prepare the Intel dependency bottles and GStreamer as described in the [toolchain reference](REFERENCE.md#toolchain). Packaging also requires an installed Sevoflurane engine as a donor (or `SEVO_LIVE_ENGINE` pointing to one), or an engine-deps tarball passed as `--deps`.
 
 **Use Xcode 27.0’s linker or validate Genshin scene loads before publishing.** Some builds corrupt asset reads despite intact files on disk; see the [failure evidence and working configuration](REFERENCE.md#a-build-that-corrupts-genshins-asset-reads).
 

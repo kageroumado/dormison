@@ -219,11 +219,22 @@ downloads under `deps/` and `deps-raw/`), `gstreamer`, `donor` (copied from
 the live engine) or `packaging` (written by the script). It also records the
 source HEAD, `git describe`, whether the tree was dirty, the donor's path and
 its own `engine-info.json` version and commit, the server's architecture and
-protocol version, and the Swift build id. The payloads under `donor` are the
-part a release still takes from an installed engine; the publish plan's deps
-tarball is the step that replaces them, and the manifest names which files
-that concerns. A file the script did not record an origin for fails the
-packaging, so the list is complete by construction.
+protocol version, and the Swift build id. A file the script did not record
+an origin for fails the packaging, so the list is complete by construction.
+
+The payloads under `donor` are the part a wine build does not produce: the
+dependency libraries in `wine/lib`, gecko and mono, `winemetal.so` and the
+Vulkan ICD manifest, and the DXMT and DXVK bundles. `pack-engine-deps.sh
+<engine> <output directory>` writes exactly those as
+`engine-deps-<first 16 hex digits of its sha256>.tar.xz`, with
+`engine-deps.json` inside listing every file and its hash, and
+`package-engine.sh <version> --deps <tarball>` takes them from it in place of
+a donor: the tarball is expanded beside itself once, every file is checked
+against that list, and the manifest records them as `deps-tarball` with the
+tarball's name and sha256. `--output <dir>` assembles the engine as
+`<dir>/<version>`. No renderer DLL goes into the module trees from either
+source: the app stages the picked renderer's at every boot, D3DMetal's from
+the user's own toolkit.
 
 DXMT is packaged for both architectures. The x86_64 DLLs sit flat at the top
 of `dxmt/`, which is where the app reads them from; the 32-bit ones go in
@@ -379,6 +390,14 @@ What the app verifies, and the script therefore produces:
 - After the upload, the tarball's digest as GitHub reports it is compared
   with the local sha256; the manifest is published only when they agree.
 
+The staged copy is the engine as packaged, whatever the app has done to the
+installed one since: the `renderer-hashes` file, the toolkit in
+`wine/lib/external`, the builtins set aside in `<tree>-original` (put back)
+and the renderer DLLs and bridge links staged with nothing to set aside are
+undone, each named as it goes, and the copy is then held to
+`engine-manifest.json` file by file and read for Apple's toolkit by content.
+A file that differs, is missing or is not listed ends the release.
+
 The script refuses a dirty tree, a version that is not `r<N>`, a tag that
 exists locally or on origin, an engine packaged from a commit other than
 HEAD, and a HEAD that is not on `origin/main`. Binaries carry the ad-hoc
@@ -390,14 +409,6 @@ leaving the installed engine as it was.
 its directory as the one argument, before the tarball is packed and under
 `--dry-run` too. A script that exits other than 0 ends the release with
 nothing packed, tagged or uploaded; without `--gate` the run says in one line
-The staged copy is the engine as packaged, whatever the app has done to the
-installed one since: the `renderer-hashes` file, the toolkit in
-`wine/lib/external`, the builtins set aside in `<tree>-original` (put back)
-and the renderer DLLs and bridge links staged with nothing to set aside are
-undone, each named as it goes, and the copy is then held to
-`engine-manifest.json` file by file and read for Apple's toolkit by content.
-A file that differs, is missing or is not listed ends the release.
-
 that no gate ran. `bispectral/release-gate/run.sh` is such a script: it boots
 a scratch prefix on the engine and runs the probes that prove each release's
 fixes, one line per probe. `tests/packaging-gates.sh` covers the hook itself.

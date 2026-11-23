@@ -5,7 +5,15 @@
 # the live engine, which stays read-only. D3DMetal is not: the app places the user's own
 # copy of Apple's toolkit into each engine it runs.
 #
-# usage: package-engine.sh <version> [--allow-dirty]   e.g. dormison-b1
+# usage: package-engine.sh <version> [--allow-dirty] [--deps <tarball>] [--output <dir>]
+#        e.g. package-engine.sh dormison-b1
+#
+# --deps takes those payloads from an engine-deps tarball (pack-engine-deps.sh)
+# in place of a live engine, so the engine comes from this repository, the
+# build tree and that one file. The tarball's sha256 must be the one in its
+# name; it is expanded once beside itself and every file in it is checked
+# against its manifest. --output assembles the engine as <dir>/<version>
+# where the default is the app's Engines folder.
 #
 # Before anything is copied, the tree is checked by content (engine-gates.sh):
 # the Swift archive carries the build id its sources give now and the staged
@@ -20,12 +28,16 @@
 # another): build-macos/README.md.
 set -euo pipefail
 
-VERSION="${1:?usage: package-engine.sh <version> [--allow-dirty]}"
+VERSION="${1:?usage: package-engine.sh <version> [--allow-dirty] [--deps <tarball>] [--output <dir>]}"
 shift
 ALLOW_DIRTY=0
+DEPS=""
+OUTPUT=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --allow-dirty) ALLOW_DIRTY=1; shift ;;
+        --deps) DEPS="${2:?--deps takes an engine-deps tarball}"; shift 2 ;;
+        --output) OUTPUT="${2:?--output takes a directory}"; shift 2 ;;
         *) echo "unknown option $1"; exit 2 ;;
     esac
 done
@@ -35,17 +47,41 @@ REPO="$(dirname "$HERE")"
 ROOT="${DORMISON_BUILD:-$HOME/dormison-build}"
 STAGE="$ROOT/stage"
 ENGINES="$HOME/Library/Application Support/Sevoflurane/Engines"
-# The newest installed Dormison unless SEVO_LIVE_ENGINE names another.
-LIVE="${SEVO_LIVE_ENGINE:-$ENGINES/$(ls "$ENGINES" 2>/dev/null | grep -E '^dormison-[rb][0-9]+$' | sort -t- -k2.2 -n | tail -1)}"
-OUT="$ENGINES/$VERSION"
+OUT="${OUTPUT:-$ENGINES}/$VERSION"
 
 MIN="$(cat "$HERE/macos-min")"
 # shellcheck source=engine-gates.sh
 . "$HERE/engine-gates.sh"
 
 [ -d "$STAGE/bin" ] || { echo "no staging tree at $STAGE"; exit 1; }
-[ -n "$LIVE" ] && [ -d "$LIVE" ] || { echo "no live engine under $ENGINES (SEVO_LIVE_ENGINE names one)"; exit 1; }
 [ -e "$OUT" ] && { echo "$OUT already exists — refusing to overwrite"; exit 1; }
+
+# --- where the payloads a wine build does not produce come from: the deps
+# tarball, expanded and checked file by file, or a live engine, the newest
+# installed Dormison unless SEVO_LIVE_ENGINE names another. PAYLOADS is the
+# origin the manifest gives them. ---
+if [ -n "$DEPS" ]; then
+    [ -f "$DEPS" ] || { echo "no deps tarball at $DEPS"; exit 1; }
+    DEPS_SHA256="$(shasum -a 256 "$DEPS" | cut -d' ' -f1)"
+    case "$(basename "$DEPS")" in
+        engine-deps-"$(printf '%s' "$DEPS_SHA256" | cut -c1-16)".tar.xz) ;;
+        *) echo "$DEPS is not the file its name says: its sha256 is $DEPS_SHA256"; exit 1 ;;
+    esac
+    DEPS_DIR="${DEPS%.tar.xz}"
+    if [ ! -f "$DEPS_DIR/engine-deps/engine-deps.json" ]; then
+        echo "==> expanding $(basename "$DEPS")"
+        mkdir -p "$DEPS_DIR"
+        tar -xJf "$DEPS" -C "$DEPS_DIR"
+    fi
+    gate_deps_tree "$DEPS_DIR/engine-deps" || exit 1
+    LIVE="$DEPS_DIR/engine-deps"
+    PAYLOADS=deps-tarball
+else
+    LIVE="${SEVO_LIVE_ENGINE:-$ENGINES/$(ls "$ENGINES" 2>/dev/null | grep -E '^dormison-[rb][0-9]+$' | sort -t- -k2.2 -n | tail -1)}"
+    [ -n "$LIVE" ] && [ -d "$LIVE" ] || { echo "no live engine under $ENGINES (SEVO_LIVE_ENGINE names one, --deps a tarball in its place)"; exit 1; }
+    DEPS_SHA256=""
+    PAYLOADS=donor
+fi
 
 # --- the source: committed, or said to be dirty ---
 gate_clean_tree "$REPO" "$ALLOW_DIRTY" || exit 1
@@ -79,8 +115,8 @@ gate_server_pairing "$SERVER" "$STAGE/lib/wine/x86_64-unix/ntdll.so" "$REPO/incl
 PROTOCOL="$(stamp_of "$SERVER" sevo:server-protocol)"
 
 # --- where each file came from, recorded as it lands: build (stage/),
-# native-server, donor (the live engine), deps, gstreamer, source (built here
-# from build-macos/), packaging (written by this script). ---
+# native-server, donor (the live engine) or deps-tarball, deps, gstreamer,
+# source (built here from build-macos/), packaging (written by this script). ---
 ORIGINS="$(mktemp -t engine-origins)"
 trap 'rm -f "$ORIGINS"' EXIT
 record() {
@@ -123,9 +159,9 @@ for f in "$OUT"/wine/lib/wine/i386-windows/*.dll "$OUT"/wine/lib/wine/i386-windo
     [ -f "$f" ] && i686-w64-mingw32-strip --strip-all "$f" 2>/dev/null
 done
 
-# --- dependency dylibs, from the live engine (built by MacPorts, not rebuilt here) ---
+# --- dependency dylibs, from the live engine or the deps tarball (built by MacPorts, not rebuilt here) ---
 find "$LIVE/wine/lib" -maxdepth 1 -name '*.dylib' -exec cp -a {} "$OUT/wine/lib/" \;
-record donor "$OUT"/wine/lib/*.dylib
+record "$PAYLOADS" "$OUT"/wine/lib/*.dylib
 # lib/external is where the app places the user's own D3DMetal (Apple's Game Porting
 # Toolkit, which may not be redistributed): the engine ships the folder empty.
 mkdir -p "$OUT/wine/lib/external"
@@ -182,7 +218,7 @@ done
 # --- gecko and mono, which a wine build does not produce ---
 for d in gecko mono; do
     [ -d "$LIVE/wine/share/wine/$d" ] && cp -R "$LIVE/wine/share/wine/$d" "$OUT/wine/share/wine/$d"
-    record donor "$OUT/wine/share/wine/$d"
+    record "$PAYLOADS" "$OUT/wine/share/wine/$d"
 done
 
 # --- GStreamer, which Media Foundation reaches through winegstreamer.
@@ -256,7 +292,7 @@ fi
 # has run D3DMetal they are Apple's.
 cp -R "$LIVE/wine/lib/wine/x86_64-unix/vulkan" "$OUT/wine/lib/wine/x86_64-unix/vulkan"
 cp "$LIVE/wine/lib/wine/x86_64-unix/winemetal.so" "$OUT/wine/lib/wine/x86_64-unix/"
-record donor "$OUT/wine/lib/wine/x86_64-unix/vulkan" "$OUT/wine/lib/wine/x86_64-unix/winemetal.so"
+record "$PAYLOADS" "$OUT/wine/lib/wine/x86_64-unix/vulkan" "$OUT/wine/lib/wine/x86_64-unix/winemetal.so"
 
 # --- D3DMetal's unix-side shims: symlinks into ../../external/libd3dshared.dylib ---
 for so in atidxx64 d3d10 d3d11 d3d12 dxgi nvapi64 nvngx-on-metalfx; do
@@ -267,7 +303,7 @@ done
 # --- renderer bundles, verbatim ---
 for d in dxmt dxvk; do
     [ -d "$LIVE/$d" ] && cp -R "$LIVE/$d" "$OUT/$d"
-    record donor "$OUT/$d"
+    record "$PAYLOADS" "$OUT/$d"
 done
 
 # --- DXMT's 32-bit half, in a subdirectory of the same payload dir. A 32-bit
@@ -284,7 +320,7 @@ for d in "$ROOT"/deps-raw/dxmt/*/i386-windows; do
 done
 if [ -z "$DXMT32" ] && [ -d "$LIVE/dxmt/i386-windows" ]; then
     DXMT32="$LIVE/dxmt/i386-windows"
-    DXMT32_ORIGIN=donor
+    DXMT32_ORIGIN="$PAYLOADS"
 fi
 if [ -n "$DXMT32" ]; then
     echo "==> 32-bit DXMT from $DXMT32"
@@ -381,19 +417,18 @@ gate_macos_floor "$OUT" "$MIN" || { echo "$OUT is incomplete: trash it, fix the 
 # --- nothing of Apple's Game Porting Toolkit, which a live engine the app has
 # run carries and which may not be redistributed. ---
 echo "==> checking that no file is Apple's toolkit"
-gate_no_apple_toolkit "$OUT" || { echo "$OUT is incomplete: trash it, fix the donor, package again"; exit 1; }
+gate_no_apple_toolkit "$OUT" || { echo "$OUT is incomplete: trash it, fix the donor or the deps tarball, package again"; exit 1; }
 
 # --- the manifest: every file, its sha256 and where it came from, the source
-# the build was made from, and the donor the payloads were taken from. The
-# payloads still come from the donor; the publish plan's deps tarball is the
-# step that replaces them. ---
+# the build was made from, and the donor or the deps tarball the payloads were
+# taken from. ---
 echo "==> writing engine-manifest.json"
 DONOR_INFO="$LIVE/engine-info.json"
 python3 - "$OUT" "$ORIGINS" "$VERSION" "$HEAD_COMMIT" "$(git -C "$REPO" describe --always --dirty --tags 2>/dev/null || echo "$HEAD_COMMIT")" \
-    "$DIRTY" "$LIVE" "$DONOR_INFO" "$SERVER_ARCH" "$PROTOCOL" "$SWIFT_ID" <<'PY'
+    "$DIRTY" "$LIVE" "$DONOR_INFO" "$SERVER_ARCH" "$PROTOCOL" "$SWIFT_ID" "$(basename "${DEPS:-}")" "$DEPS_SHA256" <<'PY'
 import datetime, hashlib, json, os, sys
 
-out, origins_path, version, head, describe, dirty, donor, donor_info, server_arch, protocol, swift_id = sys.argv[1:12]
+out, origins_path, version, head, describe, dirty, donor, donor_info, server_arch, protocol, swift_id, deps, deps_sha256 = sys.argv[1:14]
 
 origins = {}
 with open(origins_path) as f:
@@ -427,14 +462,18 @@ unrecorded = [c["path"] for c in components if c["from"] == "unrecorded"]
 if unrecorded:
     sys.exit("files with no recorded origin: " + ", ".join(unrecorded))
 
-donor_record = {"path": donor}
-try:
-    with open(donor_info) as f:
-        info = json.load(f)
-    donor_record["version"] = info.get("version")
-    donor_record["commit"] = info.get("commit")
-except (OSError, ValueError):
-    donor_record["engine-info"] = "unreadable"
+if deps:
+    payloads = {"deps": {"tarball": deps, "sha256": deps_sha256}}
+else:
+    donor_record = {"path": donor}
+    try:
+        with open(donor_info) as f:
+            info = json.load(f)
+        donor_record["version"] = info.get("version")
+        donor_record["commit"] = info.get("commit")
+    except (OSError, ValueError):
+        donor_record["engine-info"] = "unreadable"
+    payloads = {"donor": donor_record}
 
 manifest = {
     "version": version,
@@ -445,7 +484,7 @@ manifest = {
         "describe": describe,
         "dirty": dirty == "true",
     },
-    "donor": donor_record,
+    **payloads,
     "server": {"arch": server_arch, "protocol": int(protocol)},
     "swift": {"build_id": swift_id},
     "origins": {
@@ -454,7 +493,8 @@ manifest = {
         "source": "built by package-engine.sh from build-macos/",
         "deps": "the pinned dependency downloads under DORMISON_BUILD/deps and deps-raw",
         "gstreamer": "upstream GStreamer's macOS packages under DORMISON_BUILD/gstreamer, thinned",
-        "donor": "copied from the donor engine: the dependency dylibs, gecko, mono, DXMT, DXVK, winemetal and the Vulkan ICD, until the publish plan's deps tarball replaces them",
+        "donor": "copied from the donor engine: the dependency dylibs, gecko, mono, DXMT, DXVK, winemetal and the Vulkan ICD",
+        "deps-tarball": "the same payloads, from the engine-deps tarball pack-engine-deps.sh wrote",
         "packaging": "written by package-engine.sh",
     },
     "components": components,

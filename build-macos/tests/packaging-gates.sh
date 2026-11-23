@@ -227,4 +227,22 @@ expect_refusal "a missing file is refused" "dxmt/d3d11.dll: missing" gate_matche
 mkdir "$T/no-manifest"
 expect_refusal "an engine with no manifest is refused" "no readable engine-manifest.json" gate_matches_manifest "$T/no-manifest"
 
+# --- an expanded deps tarball against its own manifest ---
+D="$T/engine-deps"
+mkdir -p "$D/wine/lib" "$D/dxmt"
+binary_with "$D/wine/lib/libz.1.dylib" "zlib"
+ln -s libz.1.dylib "$D/wine/lib/libz.dylib"
+binary_with "$D/dxmt/d3d11.dll" "DXMT's d3d11"
+python3 - "$D" <<'PY'
+import hashlib, json, os, sys
+root = sys.argv[1]
+files = [{"path": "dxmt/d3d11.dll", "sha256": hashlib.sha256(open(os.path.join(root, "dxmt/d3d11.dll"), "rb").read()).hexdigest()},
+         {"path": "wine/lib/libz.1.dylib", "sha256": hashlib.sha256(open(os.path.join(root, "wine/lib/libz.1.dylib"), "rb").read()).hexdigest()},
+         {"path": "wine/lib/libz.dylib", "link": "libz.1.dylib"}]
+json.dump({"files": files}, open(os.path.join(root, "engine-deps.json"), "w"))
+PY
+expect_acceptance "an expanded deps tarball that matches its manifest is accepted" gate_deps_tree "$D"
+binary_with "$D/dxmt/d3d11.dll" "another d3d11"
+expect_refusal "a changed deps file is refused" "dxmt/d3d11.dll is not the file the manifest lists" gate_deps_tree "$D"
+
 [ "$FAILED" = 0 ] && echo "every gate behaved" || exit 1

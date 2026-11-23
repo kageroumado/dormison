@@ -89,6 +89,50 @@ gate_release() {
     [ "$status" = 0 ] || { echo "the gate $script refused $engine (exit $status)"; return 1; }
 }
 
+# An expanded engine-deps tarball holds exactly the files its manifest lists,
+# each with the sha256 or the link target recorded for it.
+#   gate_deps_tree <the expanded engine-deps directory>
+gate_deps_tree() {
+    python3 - "$1" <<'PY'
+import hashlib, json, os, sys
+
+tree = sys.argv[1]
+try:
+    with open(os.path.join(tree, "engine-deps.json")) as f:
+        listed = {entry["path"]: entry for entry in json.load(f)["files"]}
+except (OSError, ValueError, KeyError) as error:
+    sys.exit(f"{tree} has no readable engine-deps.json: {error}")
+
+refused = []
+found = set()
+for root, _, names in os.walk(tree):
+    for name in names:
+        full = os.path.join(root, name)
+        path = os.path.relpath(full, tree)
+        if path == "engine-deps.json":
+            continue
+        found.add(path)
+        entry = listed.get(path)
+        if entry is None:
+            refused.append(f"    {path} is not in the manifest")
+        elif os.path.islink(full):
+            if entry.get("link") != os.readlink(full):
+                refused.append(f"    {path} links to {os.readlink(full)}, the manifest says {entry.get('link')}")
+        else:
+            digest = hashlib.sha256()
+            with open(full, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    digest.update(chunk)
+            if entry.get("sha256") != digest.hexdigest():
+                refused.append(f"    {path} is not the file the manifest lists")
+refused += [f"    {path} is missing" for path in sorted(set(listed) - found)]
+if refused:
+    print(f"{tree} does not match its engine-deps.json ({len(refused)} file(s)): trash it and expand the tarball again")
+    print("\n".join(sorted(refused)[:20]))
+    sys.exit(1)
+PY
+}
+
 # Every Mach-O under a directory runs on the engine's floor: each slice's
 # LC_BUILD_VERSION minos (or LC_VERSION_MIN_MACOSX) is at most the version in
 # macos-min. clang stamps the build Mac's own version when no deployment target
