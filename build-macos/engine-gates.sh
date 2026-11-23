@@ -357,3 +357,58 @@ if refused:
     sys.exit(1)
 PY
 }
+
+# A release names nobody. In an engine directory or an expanded deps tree,
+# engine-info.json, engine-manifest.json and engine-deps.json hold no path
+# under /Users/<name>, the packager's home. In a packed tarball the same three
+# files are read out of it, and every entry is owned by root:wheel (0:0),
+# carries no extended attribute, and none is an AppleDouble `._` file, which is
+# how macOS tar stores one.
+#   gate_names_nobody <engine directory | expanded deps directory | tarball>
+gate_names_nobody() {
+    python3 - "$1" <<'PY'
+import os, re, sys, tarfile
+
+target = sys.argv[1]
+DESCRIPTIONS = ("engine-info.json", "engine-manifest.json", "engine-deps.json")
+HOME = re.compile(rb"/Users/[^/\"\\\s]+")
+refused = []
+
+def read_description(name, data):
+    homes = sorted({match.decode("utf-8", "replace") for match in HOME.findall(data)})
+    if homes:
+        refused.append(f"    {name} names {', '.join(homes[:3])}")
+
+if os.path.isdir(target):
+    for name in DESCRIPTIONS:
+        path = os.path.join(target, name)
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                read_description(name, f.read())
+else:
+    owners, doubles, attributes = set(), 0, 0
+    try:
+        with tarfile.open(target) as tar:
+            for member in tar:
+                if (member.uid, member.gid) != (0, 0) or member.uname not in ("root", "") or member.gname not in ("wheel", ""):
+                    owners.add(f"{member.uname or member.uid}:{member.gname or member.gid}")
+                if os.path.basename(member.name).startswith("._"):
+                    doubles += 1
+                if any("xattr" in key for key in member.pax_headers):
+                    attributes += 1
+                if member.isfile() and member.name.count("/") == 1 and os.path.basename(member.name) in DESCRIPTIONS:
+                    read_description(member.name, tar.extractfile(member).read())
+    except (OSError, tarfile.TarError) as error:
+        sys.exit(f"{target} is not a readable tarball: {error}")
+    if owners:
+        refused.append(f"    entries are owned by {', '.join(sorted(owners)[:3])}, not root:wheel")
+    if doubles:
+        refused.append(f"    {doubles} AppleDouble entries (._ files holding extended attributes)")
+    if attributes:
+        refused.append(f"    {attributes} entries carry extended attributes")
+if refused:
+    print(f"{target} names the Mac it was made on:")
+    print("\n".join(refused))
+    sys.exit(1)
+PY
+}

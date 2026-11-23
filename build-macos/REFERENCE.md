@@ -217,7 +217,7 @@ target of a symlink) and where it came from: `build` (wine, from `stage/`),
 `native-server`, `source` (built from `build-macos/`), `deps` (the pinned
 downloads under `deps/` and `deps-raw/`), `gstreamer`, `donor` (copied from
 the live engine) or `packaging` (written by the script). It also records the
-source HEAD, `git describe`, whether the tree was dirty, the donor's path and
+source HEAD, `git describe`, whether the tree was dirty, the donor's name and
 its own `engine-info.json` version and commit, the server's architecture and
 protocol version, and the Swift build id. A file the script did not record
 an origin for fails the packaging, so the list is complete by construction.
@@ -397,6 +397,13 @@ and the renderer DLLs and bridge links staged with nothing to set aside are
 undone, each named as it goes, and the copy is then held to
 `engine-manifest.json` file by file and read for Apple's toolkit by content.
 A file that differs, is missing or is not listed ends the release.
+
+A release names nobody. The tarball is packed with every entry owned by
+root:wheel and with no extended attributes, neither as AppleDouble `._`
+entries nor in headers, and `engine-info.json`, `engine-manifest.json` and
+`engine-deps.json` hold no path under `/Users/`: the manifest records a donor
+by its folder name. `gate_names_nobody` checks the staged copy and then the
+packed tarball, and `pack-engine-deps.sh` holds its tarball to the same.
 
 The script refuses a dirty tree, a version that is not `r<N>`, a tag that
 exists locally or on origin, an engine packaged from a commit other than

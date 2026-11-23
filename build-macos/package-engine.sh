@@ -472,7 +472,8 @@ if unrecorded:
 if deps:
     payloads = {"deps": {"tarball": deps, "sha256": deps_sha256}}
 else:
-    donor_record = {"path": donor}
+    # By name: its path is the packager's home.
+    donor_record = {"name": os.path.basename(donor.rstrip("/"))}
     try:
         with open(donor_info) as f:
             info = json.load(f)
@@ -514,6 +515,8 @@ for c in components:
     counts[c["from"]] = counts.get(c["from"], 0) + 1
 print("    " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
 PY
+
+gate_names_nobody "$OUT" || { echo "$OUT is incomplete: trash it and package again"; exit 1; }
 
 echo "==> done: $OUT"
 du -sh "$OUT"

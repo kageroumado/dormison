@@ -227,6 +227,24 @@ expect_refusal "a missing file is refused" "dxmt/d3d11.dll: missing" gate_matche
 mkdir "$T/no-manifest"
 expect_refusal "an engine with no manifest is refused" "no readable engine-manifest.json" gate_matches_manifest "$T/no-manifest"
 
+# --- a release names nobody ---
+mkdir -p "$T/named/dormison-r1" "$T/nameless/dormison-r1"
+printf '{"donor": {"path": "/Users/somebody/Library/Application Support/Sevoflurane/Engines/dormison-r0"}}\n' > "$T/named/dormison-r1/engine-manifest.json"
+printf '{"donor": {"name": "dormison-r0"}, "note": "/Users/ alone names nobody"}\n' > "$T/nameless/dormison-r1/engine-manifest.json"
+printf '{"version": "dormison-r1"}\n' > "$T/nameless/dormison-r1/engine-info.json"
+binary_with "$T/nameless/dormison-r1/module.dll" "/Users/somebody/src/module.c is a build path, not a description"
+expect_refusal "a manifest that names a home folder is refused" "engine-manifest.json names /Users/somebody" gate_names_nobody "$T/named/dormison-r1"
+expect_acceptance "an engine whose descriptions name nobody is accepted" gate_names_nobody "$T/nameless/dormison-r1"
+xattr -w com.apple.provenance test "$T/nameless/dormison-r1/module.dll"
+tar -C "$T/nameless" -cf - dormison-r1 | xz > "$T/plain.tar.xz"
+expect_refusal "a tarball packed plainly is refused for its owner" "not root:wheel" gate_names_nobody "$T/plain.tar.xz"
+expect_refusal "and for the extended attributes it carries" "AppleDouble entries" gate_names_nobody "$T/plain.tar.xz"
+COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --no-acls --no-fflags --uid 0 --gid 0 --uname root --gname wheel \
+    -C "$T/nameless" -cf - dormison-r1 | xz > "$T/nameless.tar.xz"
+expect_acceptance "a tarball packed as root:wheel with no extended attributes is accepted" gate_names_nobody "$T/nameless.tar.xz"
+COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --uid 0 --gid 0 --uname root --gname wheel -C "$T/named" -cf - dormison-r1 | xz > "$T/named.tar.xz"
+expect_refusal "a tarball whose manifest names a home folder is refused" "engine-manifest.json names /Users/somebody" gate_names_nobody "$T/named.tar.xz"
+
 # --- an expanded deps tarball against its own manifest ---
 D="$T/engine-deps"
 mkdir -p "$D/wine/lib" "$D/dxmt"

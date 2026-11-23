@@ -130,6 +130,7 @@ echo "==> the engine as packaged"
 stage_as_packaged "$STAGE"
 gate_matches_manifest "$STAGE" || { echo "nothing was packed, tagged or uploaded"; exit 1; }
 gate_no_apple_toolkit "$STAGE" || { echo "nothing was packed, tagged or uploaded"; exit 1; }
+gate_names_nobody "$STAGE" || { echo "nothing was packed, tagged or uploaded: package the engine again"; exit 1; }
 
 # --- Developer ID: every Mach-O in the staged copy, timestamped ---
 is_macho() {
@@ -160,10 +161,13 @@ else
     echo "==> no gate ran (--gate <script> runs one on the staged engine)"
 fi
 
-# --- pack, hash, sign ---
+# --- pack, hash, sign. The tarball names nobody: every entry is root:wheel,
+# and no extended attribute rides along, as a `._` file or in a header. ---
 mkdir -p "$RELEASES"
 echo "==> packing $TARBALL"
-tar -C "$RELEASES/stage" -cf - "$NAME" | xz -T0 -9 > "$TARBALL"
+COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --no-acls --no-fflags \
+    --uid 0 --gid 0 --uname root --gname wheel -C "$RELEASES/stage" -cf - "$NAME" | xz -T0 -9 > "$TARBALL"
+gate_names_nobody "$TARBALL" || { echo "nothing was tagged or uploaded"; exit 1; }
 SHA256="$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)"
 SIZE="$(stat -f %z "$TARBALL")"
 echo "$SHA256  $NAME.tar.xz" > "$TARBALL.sha256"

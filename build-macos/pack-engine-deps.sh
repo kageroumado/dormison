@@ -22,7 +22,7 @@
 # payloads are read for the toolkit by content before they are packed.
 #
 # The tar stream is the same bytes for the same payloads (names sorted, no
-# times, owners or extended attributes), and its sha256 is printed; the
+# times or extended attributes, every entry root:wheel), and its sha256 is printed; the
 # compressed file's bytes also depend on the xz that wrote them. The donor is
 # only read.
 set -euo pipefail
@@ -108,7 +108,7 @@ with open(os.path.join(tree, "engine-deps.json"), "w") as f:
 
 def plain(member):
     member.uid = member.gid = 0
-    member.uname = member.gname = ""
+    member.uname, member.gname = "root", "wheel"
     member.mtime = 0
     if member.isdir() or member.mode & 0o100:
         member.mode = 0o755
@@ -132,8 +132,11 @@ print(f"    {len(files)} files, {manifest['bytes']:,} bytes")
 print(f"    tar stream sha256 {sha256(tar_path)}")
 PY
 
+gate_names_nobody "$TREE" || { echo "refusing to pack"; trash "$WORK" 2>/dev/null || true; exit 1; }
+
 echo "==> compressing"
 xz -T0 -9 "$WORK/engine-deps.tar"
+gate_names_nobody "$WORK/engine-deps.tar.xz" || { trash "$WORK" 2>/dev/null || true; exit 1; }
 SHA256="$(shasum -a 256 "$WORK/engine-deps.tar.xz" | cut -d' ' -f1)"
 NAME="engine-deps-$(printf '%s' "$SHA256" | cut -c1-16).tar.xz"
 [ -e "$OUTPUT/$NAME" ] && { echo "$OUTPUT/$NAME already exists — the payloads are packed"; trash "$WORK" 2>/dev/null || true; exit 0; }
