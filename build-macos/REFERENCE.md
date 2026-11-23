@@ -200,6 +200,13 @@ be.
   so a native tree left behind by a protocol change is refused rather than
   packaged beside a newer ntdll. A binary built from a source without the
   stamp is refused too: rebuild it.
+- **No file is Apple's Game Porting Toolkit.** The app places the user's own
+  copy of the toolkit into an engine it runs, DLLs included, and the toolkit
+  may not be redistributed. Once the engine is assembled, every file is read
+  for what Apple's binaries carry (their build root,
+  `/Library/Caches/com.apple.xbs/`, and the bridge's thread name), whatever
+  the file is called. `publish-engine.sh` and `pack-engine-deps.sh` run the
+  same gate.
 
 Any refusal names the file and the command that repairs it.
 
@@ -383,6 +390,14 @@ leaving the installed engine as it was.
 its directory as the one argument, before the tarball is packed and under
 `--dry-run` too. A script that exits other than 0 ends the release with
 nothing packed, tagged or uploaded; without `--gate` the run says in one line
+The staged copy is the engine as packaged, whatever the app has done to the
+installed one since: the `renderer-hashes` file, the toolkit in
+`wine/lib/external`, the builtins set aside in `<tree>-original` (put back)
+and the renderer DLLs and bridge links staged with nothing to set aside are
+undone, each named as it goes, and the copy is then held to
+`engine-manifest.json` file by file and read for Apple's toolkit by content.
+A file that differs, is missing or is not listed ends the release.
+
 that no gate ran. `bispectral/release-gate/run.sh` is such a script: it boots
 a scratch prefix on the engine and runs the probes that prove each release's
 fixes, one line per probe. `tests/packaging-gates.sh` covers the hook itself.

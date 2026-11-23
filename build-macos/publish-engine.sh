@@ -118,13 +118,18 @@ echo "==> staging $ENGINE_DIR → $STAGE"
 [ ! -e "$STAGE" ] || rm -rf "$STAGE"
 cp -Rp "$ENGINE_DIR" "$STAGE"
 
-# --- Apple's D3DMetal never ships: the Game Porting Toolkit may not be redistributed, and
-# the app places the user's own copy into each engine. An engine directory the app has
-# run carries it, so the staged copy is cleared of it and checked. ---
-rm -rf "$STAGE/d3dmetal" "$STAGE/wine/lib/external/D3DMetal.framework" "$STAGE/wine/lib/external/libd3dshared.dylib"
-if find "$STAGE" \( -name 'D3DMetal*' -o -name 'libd3dshared*' \) -not -type l | grep -q .; then
-    echo "D3DMetal files remain in $STAGE — refusing to pack"; exit 1
-fi
+# --- the staged copy is the engine as packaged, never as the app left it. An
+# engine the app has run carries the user's own copy of Apple's Game Porting
+# Toolkit, which may not be redistributed: the bridge and the framework in
+# wine/lib/external, and the toolkit's DLLs over wine's own in the module
+# trees, with the displaced builtins in <tree>-original and a renderer-hashes
+# file beside them. All of that is undone here, then the copy is held to
+# engine-manifest.json, file by file, and read for anything of the toolkit's
+# by content. Signing comes after: it rewrites every Mach-O. ---
+echo "==> the engine as packaged"
+stage_as_packaged "$STAGE"
+gate_matches_manifest "$STAGE" || { echo "nothing was packed, tagged or uploaded"; exit 1; }
+gate_no_apple_toolkit "$STAGE" || { echo "nothing was packed, tagged or uploaded"; exit 1; }
 
 # --- Developer ID: every Mach-O in the staged copy, timestamped ---
 is_macho() {

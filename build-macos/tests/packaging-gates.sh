@@ -146,4 +146,85 @@ expect_refusal "a refusing gate's own lines are shown" "HUNG at 64 of 70" gate_r
 expect_refusal "a gate that is not executable is refused" "is not an executable file" gate_release "$T/gate-plain.sh" "$T/staged engine"
 expect_refusal "a gate that does not exist is refused" "is not an executable file" gate_release "$T/no-such-gate.sh" "$T/staged engine"
 
+# --- Apple's toolkit, by what a file carries and never by its name ---
+mkdir -p "$T/clean/wine/lib/wine/x86_64-windows" "$T/clean/wine/lib/wine/x86_64-unix" "$T/apple/wine/lib/wine/x86_64-windows" "$T/bridge/wine/lib"
+binary_with "$T/clean/wine/lib/wine/x86_64-windows/d3d11.dll" "wine's own d3d11, which says D3DMetal in a message"
+ln -s ../../external/libd3dshared.dylib "$T/clean/wine/lib/wine/x86_64-unix/d3d11.so"
+expect_acceptance "an engine with none of the toolkit is accepted, its bridge links included" gate_no_apple_toolkit "$T/clean"
+binary_with "$T/apple/wine/lib/wine/x86_64-windows/nvngx.dll" "/Library/Caches/com.apple.xbs/Sources/D3DMetalDLLsBase/D3D4Mac/nvngx/nvngx.c"
+expect_refusal "a toolkit DLL under another name is refused" "wine/lib/wine/x86_64-windows/nvngx.dll" gate_no_apple_toolkit "$T/apple"
+binary_with "$T/bridge/wine/lib/libsomething.dylib" "D3DMetalWineThread"
+expect_refusal "the toolkit's bridge under another name is refused" "wine/lib/libsomething.dylib" gate_no_apple_toolkit "$T/bridge"
+
+# --- the staged copy: what the app does to an engine is undone, and the rest is held to the manifest ---
+manifest_of() {
+    python3 - "$1" <<'PY'
+import hashlib, json, os, sys
+root = sys.argv[1]
+components = []
+for directory, _, names in os.walk(root):
+    for name in sorted(names):
+        path = os.path.join(directory, name)
+        entry = {"path": os.path.relpath(path, root), "from": "build"}
+        if os.path.islink(path):
+            entry["link"] = os.readlink(path)
+        else:
+            entry["sha256"] = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        components.append(entry)
+json.dump({"components": components}, open(os.path.join(root, "engine-manifest.json"), "w"))
+PY
+}
+E="$T/engine"
+mkdir -p "$E/wine/lib/wine/x86_64-windows" "$E/wine/lib/wine/x86_64-unix" "$E/wine/lib/external" "$E/dxmt"
+binary_with "$E/wine/lib/wine/x86_64-windows/d3d11.dll" "wine's own d3d11"
+binary_with "$E/wine/lib/wine/x86_64-windows/kernel32.dll" "wine's own kernel32"
+binary_with "$E/dxmt/d3d11.dll" "DXMT's d3d11"
+binary_with "$E/dxmt/winemetal.dll" "DXMT's winemetal"
+ln -s ../../external/libd3dshared.dylib "$E/wine/lib/wine/x86_64-unix/d3d11.so"
+manifest_of "$E"
+expect_acceptance "an engine as packaged matches its manifest" gate_matches_manifest "$E"
+
+# As the app leaves it with D3DMetal staged: the toolkit placed, its DLLs over
+# wine's with the builtin set aside, the stubs under their export names with
+# bridge links, and the provenance file.
+cp -R "$E" "$T/ran-d3dmetal"
+R="$T/ran-d3dmetal"
+mkdir -p "$R/wine/lib/wine/x86_64-windows-original" "$R/wine/lib/external/D3DMetal.framework"
+cp "$R/wine/lib/wine/x86_64-windows/d3d11.dll" "$R/wine/lib/wine/x86_64-windows-original/d3d11.dll"
+binary_with "$R/wine/lib/wine/x86_64-windows/d3d11.dll" "/Library/Caches/com.apple.xbs/Sources/D3DMetalDLLsBase/D3D4Mac/d3d11/d3d11.c"
+binary_with "$R/wine/lib/wine/x86_64-windows/nvapi.dll" "/Library/Caches/com.apple.xbs/Sources/D3DMetalDLLsBase/D3D4Mac/nvapi/nvapi.c"
+ln -s ../../external/libd3dshared.dylib "$R/wine/lib/wine/x86_64-unix/nvapi.so"
+binary_with "$R/wine/lib/external/libd3dshared.dylib" "D3DMetalWineThread"
+binary_with "$R/wine/lib/external/D3DMetal.framework/D3DMetal" "/Library/Caches/com.apple.xbs/Binaries/D3DMetal"
+printf 'renderer=d3dmetal\n' > "$R/renderer-hashes"
+expect_refusal "an engine the app ran D3DMetal on does not match its manifest" "not the file that was packaged" gate_matches_manifest "$R"
+expect_refusal "and carries the toolkit" "wine/lib/wine/x86_64-windows/nvapi.dll" gate_no_apple_toolkit "$R"
+stage_as_packaged "$R" > "$T/staging.log"
+expect_acceptance "undone, it matches its manifest" gate_matches_manifest "$R"
+expect_acceptance "and carries none of the toolkit" gate_no_apple_toolkit "$R"
+[ -d "$R/wine/lib/external" ] && [ -z "$(ls -A "$R/wine/lib/external")" ] && pass "wine/lib/external stays, empty" || fail "wine/lib/external stays, empty"
+
+# With DXMT staged: its DLLs over wine's, and winemetal.dll with nothing set aside.
+cp -R "$E" "$T/ran-dxmt"
+R="$T/ran-dxmt"
+mkdir -p "$R/wine/lib/wine/x86_64-windows-original"
+cp "$R/wine/lib/wine/x86_64-windows/d3d11.dll" "$R/wine/lib/wine/x86_64-windows-original/d3d11.dll"
+cp "$R/dxmt/d3d11.dll" "$R/dxmt/winemetal.dll" "$R/wine/lib/wine/x86_64-windows/"
+stage_as_packaged "$R" > "$T/staging.log"
+expect_acceptance "an engine the app ran DXMT on, undone, matches its manifest" gate_matches_manifest "$R"
+
+# What nobody can account for stays, and is refused by name.
+cp -R "$E" "$T/stranger"
+binary_with "$T/stranger/wine/lib/wine/x86_64-windows/stranger.dll" "nobody's"
+stage_as_packaged "$T/stranger" > "$T/staging.log"
+expect_refusal "a file the manifest does not list is refused" "wine/lib/wine/x86_64-windows/stranger.dll: not in the manifest" gate_matches_manifest "$T/stranger"
+cp -R "$E" "$T/changed"
+binary_with "$T/changed/wine/lib/wine/x86_64-windows/kernel32.dll" "another kernel32"
+expect_refusal "a changed file is refused" "kernel32.dll: not the file that was packaged" gate_matches_manifest "$T/changed"
+cp -R "$E" "$T/short"
+mv "$T/short/dxmt/d3d11.dll" "$T/short-d3d11.dll"
+expect_refusal "a missing file is refused" "dxmt/d3d11.dll: missing" gate_matches_manifest "$T/short"
+mkdir "$T/no-manifest"
+expect_refusal "an engine with no manifest is refused" "no readable engine-manifest.json" gate_matches_manifest "$T/no-manifest"
+
 [ "$FAILED" = 0 ] && echo "every gate behaved" || exit 1

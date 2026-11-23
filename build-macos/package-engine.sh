@@ -245,19 +245,18 @@ else
     FEATURES='"env-files", "discord-bridge", "fps-unlock", "steam-play-macos"'
 fi
 
-# --- pieces DXMT and D3DMetal contribute that a wine build does not produce ---
-# winemetal is DXMT's Metal backend, shipped as a matched .dll/.so pair; nvngx and nvapi64
-# likewise come from DXMT. The ICD manifest points the Vulkan loader at libMoltenVK.
+# --- pieces DXMT contributes that a wine build does not produce ---
+# winemetal.so is the unix half of DXMT's Metal backend; the ICD manifest points
+# the Vulkan loader at libMoltenVK. No renderer DLL goes into the module trees
+# here: the app stages the picked renderer's over wine's own at every boot
+# (EngineRenderers.stage), DXMT's winemetal, nvapi64 and nvngx from dxmt/ and
+# D3DMetal's from the user's own toolkit, with nvapi and nvngx beside them
+# under the names they export. Never copy nvapi64.dll, nvngx.dll or
+# nvngx-on-metalfx.dll from a live engine's x86_64-windows: in an engine that
+# has run D3DMetal they are Apple's.
 cp -R "$LIVE/wine/lib/wine/x86_64-unix/vulkan" "$OUT/wine/lib/wine/x86_64-unix/vulkan"
 cp "$LIVE/wine/lib/wine/x86_64-unix/winemetal.so" "$OUT/wine/lib/wine/x86_64-unix/"
 record donor "$OUT/wine/lib/wine/x86_64-unix/vulkan" "$OUT/wine/lib/wine/x86_64-unix/winemetal.so"
-for dll in winemetal.dll nvngx.dll nvapi64.dll nvngx-on-metalfx.dll; do
-    src="$LIVE/wine/lib/wine/x86_64-windows-original/$dll"
-    [ -f "$src" ] || src="$LIVE/wine/lib/wine/x86_64-windows/$dll"
-    [ -f "$src" ] || continue
-    cp "$src" "$OUT/wine/lib/wine/x86_64-windows/$dll"
-    record donor "$OUT/wine/lib/wine/x86_64-windows/$dll"
-done
 
 # --- D3DMetal's unix-side shims: symlinks into ../../external/libd3dshared.dylib ---
 for so in atidxx64 d3d10 d3d11 d3d12 dxgi nvapi64 nvngx-on-metalfx; do
@@ -378,6 +377,11 @@ record packaging "$OUT/engine-info.json"
 # donor's dylibs, GStreamer's. ---
 echo "==> checking every binary against the macOS $MIN floor"
 gate_macos_floor "$OUT" "$MIN" || { echo "$OUT is incomplete: trash it, fix the build, package again"; exit 1; }
+
+# --- nothing of Apple's Game Porting Toolkit, which a live engine the app has
+# run carries and which may not be redistributed. ---
+echo "==> checking that no file is Apple's toolkit"
+gate_no_apple_toolkit "$OUT" || { echo "$OUT is incomplete: trash it, fix the donor, package again"; exit 1; }
 
 # --- the manifest: every file, its sha256 and where it came from, the source
 # the build was made from, and the donor the payloads were taken from. The

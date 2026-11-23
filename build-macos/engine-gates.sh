@@ -151,3 +151,165 @@ if refused:
     sys.exit(1)
 PY
 }
+
+# No file under a directory is part of Apple's Game Porting Toolkit, whatever
+# it is named: the toolkit may not be redistributed, and the app places the
+# user's own copy into an engine it runs. Read from what the files carry: every
+# binary Apple built names its build root, /Library/Caches/com.apple.xbs/, and
+# the toolkit's bridge, libd3dshared.dylib, names its thread D3DMetalWineThread.
+# Links are skipped: the engine's D3DMetal unix halves are links to a bridge
+# the engine does not hold.
+#   gate_no_apple_toolkit <directory>
+gate_no_apple_toolkit() {
+    python3 - "$1" <<'PY'
+import os, sys
+
+root = sys.argv[1]
+MARKERS = (b"/Library/Caches/com.apple.xbs/", b"D3DMetalWineThread")
+found = []
+for directory, _, names in os.walk(root):
+    for name in names:
+        path = os.path.join(directory, name)
+        if os.path.islink(path):
+            continue
+        with open(path, "rb") as f:
+            data = f.read()
+        if any(marker in data for marker in MARKERS):
+            found.append("    " + os.path.relpath(path, root))
+if found:
+    print(f"{len(found)} file(s) under {root} are Apple's Game Porting Toolkit, which may not be redistributed:")
+    print("\n".join(sorted(found)))
+    sys.exit(1)
+PY
+}
+
+# Undo what the app does to an engine it runs, in a copy of one: the provenance
+# file it writes at renderer staging, the toolkit it places in wine/lib/external,
+# the builtins it set aside in <tree>-original (put back), and the renderer DLLs
+# and bridge links it staged with nothing to set aside. Only a file
+# engine-manifest.json does not list is removed, and only when it is one of
+# those; each is named as it goes. What is left is for gate_matches_manifest.
+#   stage_as_packaged <copy of an engine directory>
+stage_as_packaged() {
+    python3 - "$1" <<'PY'
+import filecmp, json, os, shutil, sys
+
+root = sys.argv[1]
+try:
+    with open(os.path.join(root, "engine-manifest.json")) as f:
+        listed = {entry["path"] for entry in json.load(f)["components"]}
+except (OSError, ValueError, KeyError) as error:
+    sys.exit(f"{root} has no readable engine-manifest.json ({error}): package the engine again")
+
+MARKERS = (b"/Library/Caches/com.apple.xbs/", b"D3DMetalWineThread")
+BRIDGE = "../../external/libd3dshared.dylib"
+modules = os.path.join(root, "wine/lib/wine")
+
+def drop(path, why):
+    print(f"    removed {os.path.relpath(path, root)}: {why}")
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.remove(path)
+
+# The builtins a staging set aside go back over the renderer's.
+for name in sorted(os.listdir(modules)) if os.path.isdir(modules) else []:
+    originals = os.path.join(modules, name)
+    if not name.endswith("-original") or not os.path.isdir(originals):
+        continue
+    tree = originals[: -len("-original")]
+    for dll in sorted(os.listdir(originals)):
+        shutil.copy2(os.path.join(originals, dll), os.path.join(tree, dll))
+        print(f"    restored {os.path.relpath(os.path.join(tree, dll), root)}")
+    shutil.rmtree(originals)
+
+def is_apple(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    return any(marker in data for marker in MARKERS)
+
+def is_staged_renderer(path):
+    """A module-tree file that is a renderer bundle's own DLL of the same name."""
+    relative = os.path.relpath(path, modules).split(os.sep)
+    if len(relative) != 2:
+        return False
+    tree, name = relative
+    bundles = ["dxmt/i386-windows"] if tree == "i386-windows" else ["dxmt", "dxvk"]
+    for bundle in bundles:
+        candidate = os.path.join(root, bundle, name)
+        if os.path.isfile(candidate) and filecmp.cmp(candidate, path, shallow=False):
+            return True
+    return False
+
+for directory, names, files in os.walk(root, topdown=True):
+    for name in list(names):
+        path = os.path.join(directory, name)
+        relative = os.path.relpath(path, root)
+        if relative == "d3dmetal" or os.path.dirname(relative) == "wine/lib/external":
+            drop(path, "the toolkit the app placed")
+            names.remove(name)
+    for name in files:
+        path = os.path.join(directory, name)
+        relative = os.path.relpath(path, root)
+        if relative in listed or relative == "engine-manifest.json":
+            continue
+        if relative == "renderer-hashes":
+            drop(path, "the app's record of its renderer staging")
+        elif os.path.dirname(relative) == "wine/lib/external":
+            drop(path, "the toolkit the app placed")
+        elif os.path.islink(path):
+            if os.readlink(path) == BRIDGE:
+                drop(path, "a bridge link the app made for a staged toolkit DLL")
+        elif is_apple(path):
+            drop(path, "Apple's toolkit, staged by the app")
+        elif is_staged_renderer(path):
+            drop(path, "a renderer DLL the app staged from the engine's own bundle")
+PY
+}
+
+# A directory holds exactly the engine package-engine.sh assembled: every file
+# engine-manifest.json lists, with the sha256 or the link target recorded for
+# it, and no other.
+#   gate_matches_manifest <engine directory>
+gate_matches_manifest() {
+    python3 - "$1" <<'PY'
+import hashlib, json, os, sys
+
+root = sys.argv[1]
+try:
+    with open(os.path.join(root, "engine-manifest.json")) as f:
+        listed = {entry["path"]: entry for entry in json.load(f)["components"]}
+except (OSError, ValueError, KeyError) as error:
+    sys.exit(f"{root} has no readable engine-manifest.json ({error}): package the engine again")
+
+refused = []
+found = set()
+for directory, _, names in os.walk(root):
+    for name in names:
+        path = os.path.join(directory, name)
+        relative = os.path.relpath(path, root)
+        if relative == "engine-manifest.json":
+            continue
+        found.add(relative)
+        entry = listed.get(relative)
+        if entry is None:
+            refused.append(f"    {relative}: not in the manifest")
+        elif os.path.islink(path):
+            if entry.get("link") != os.readlink(path):
+                refused.append(f"    {relative}: links to {os.readlink(path)}, packaged as {entry.get('link', 'a file')}")
+        elif "sha256" not in entry:
+            refused.append(f"    {relative}: a file, packaged as a link to {entry.get('link')}")
+        else:
+            digest = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != entry["sha256"]:
+                refused.append(f"    {relative}: not the file that was packaged")
+refused += [f"    {relative}: missing" for relative in sorted(set(listed) - found)]
+if refused:
+    print(f"{root} is not the engine engine-manifest.json describes ({len(refused)} file(s)):")
+    print("\n".join(sorted(refused)[:40]))
+    sys.exit(1)
+PY
+}
