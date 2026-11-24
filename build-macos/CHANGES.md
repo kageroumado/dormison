@@ -4,6 +4,11 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>`) as the GitHub release body, and the build names
 itself after the top heading.
 
+## r16
+
+- The engine download no longer includes files from Apple's Game Porting Toolkit. DirectX 12 and
+  DLSS work as before once the toolkit is installed.
+
 ## r15
 
 - macOS versions of games that start through a script now launch (Celeste, Terraria). They showed
