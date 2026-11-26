@@ -4,6 +4,11 @@ One section per release, written when the work lands. `publish-engine.sh`
 uses the section for the version (`r<N>`) as the GitHub release body, and the build names
 itself after the top heading.
 
+## r17
+
+- Jurassic World Evolution 2 starts. It crashed about 10 seconds after launch, before its
+  window. Other games that run their work on fibers are covered.
+
 ## r16
 
 - The engine download no longer includes files from Apple's Game Porting Toolkit. DirectX 12 and
