@@ -876,12 +876,170 @@ struct fiber_data
     void                 *stack_base;        /* 08/10 top of fiber stack */
     void                 *stack_limit;       /* 0c/18 fiber stack low-water mark */
     void                 *stack_allocation;  /* 10/20 base of the fiber stack allocation */
-    CONTEXT               context;           /* 14/30 fiber context */
+    CONTEXT              *context;           /* 14/28 fiber context, at the start of the fiber's page */
     DWORD                 flags;             /*       fiber flags */
     LPFIBER_START_ROUTINE start;             /*       start routine */
     void                 *fls_slots;         /*       fiber storage slots */
     struct fiber_actctx   actctx;            /*       activation context state */
+    void                 *allocation;        /*       heap block holding this structure, if any */
+    void                 *host_slot;         /*       %gs:0x20 before ConvertThreadToFiber */
 };
+
+/* GetCurrentFiber() in Windows code is an inline load of %gs:0x20. On macOS,
+ * GSBASE is the host's thread-specific data and that slot is the thread's QoS
+ * word: ntdll swaps Tib.FiberData into it whenever Windows code runs on a
+ * fiber, and these functions keep it current between system calls. Where
+ * GSBASE is the TEB, the slot is Tib.FiberData itself. */
+#ifdef __x86_64__
+static inline void *get_fiber_slot(void)
+{
+    void *value;
+    __asm__ volatile( "movq %%gs:0x20,%0" : "=r" (value) );
+    return value;
+}
+
+static inline void set_fiber_slot( void *value )
+{
+    __asm__ volatile( "movq %0,%%gs:0x20" :: "r" (value) : "memory" );
+}
+#else
+static inline void *get_fiber_slot(void)
+{
+    return NtCurrentTeb()->Tib.FiberData;
+}
+
+static inline void set_fiber_slot( void *value )
+{
+    NtCurrentTeb()->Tib.FiberData = value;
+}
+#endif
+
+/* Native code reached straight from Windows code, such as D3DMetal's Metal
+ * calls, reads the slot while it holds a fiber pointer, and libdispatch takes
+ * that for the thread's priority word: it stores it back as 32 bits, and
+ * adopting a word with bit 23, 24, 25 or 29 set fails in the kernel or trips
+ * libdispatch's own checks. So a fiber lives below 4 GB with those bits clear,
+ * at page offset 0x8ff, where its pointer reads as QOS_CLASS_DEFAULT at
+ * relative priority 0, the priority every Wine thread already has. Its
+ * CONTEXT, which needs 16-byte alignment, takes the start of the same page. */
+#define FIBER_PAGE_SIZE      0x1000
+#define FIBER_PAGE_OFFSET    0x8ff
+#define FIBER_CHUNK_SIZE     0x10000
+#define FIBER_ADDRESS_LIMIT  0x100000000ull
+#define FIBER_FORBIDDEN_BITS 0x23800000
+
+C_ASSERT( sizeof(CONTEXT) <= FIBER_PAGE_OFFSET );
+C_ASSERT( FIBER_PAGE_OFFSET + sizeof(struct fiber_data) <= FIBER_PAGE_SIZE );
+
+struct fiber_page
+{
+    struct fiber_page *next;
+};
+
+static struct fiber_page *free_fiber_pages;
+static ULONG64 fiber_chunk_cursor = FIBER_CHUNK_SIZE;
+static RTL_SRWLOCK fiber_page_lock = RTL_SRWLOCK_INIT;
+
+static ULONG64 next_fiber_chunk_address( ULONG64 addr )
+{
+    addr = (addr + FIBER_CHUNK_SIZE - 1) & ~(ULONG64)(FIBER_CHUNK_SIZE - 1);
+    while (addr & FIBER_FORBIDDEN_BITS)
+    {
+        if (addr & 0x20000000) addr = (addr | 0x3fffffff) + 1;
+        else addr = (addr | 0x03ffffff) + 1;
+    }
+    return addr;
+}
+
+/* Called with fiber_page_lock held. */
+static BOOL add_fiber_chunk(void)
+{
+    MEMORY_BASIC_INFORMATION info;
+    ULONG64 addr = fiber_chunk_cursor;
+    unsigned int i;
+
+    for (;;)
+    {
+        void *base;
+        SIZE_T size = FIBER_CHUNK_SIZE;
+
+        addr = next_fiber_chunk_address( addr );
+        if (addr + FIBER_CHUNK_SIZE > FIBER_ADDRESS_LIMIT) return FALSE;
+        base = (void *)(ULONG_PTR)addr;
+        if (NtQueryVirtualMemory( GetCurrentProcess(), base, MemoryBasicInformation,
+                                  &info, sizeof(info), NULL ))
+            return FALSE;
+        if (info.State != MEM_FREE ||
+            (ULONG64)(ULONG_PTR)info.BaseAddress + info.RegionSize < addr + FIBER_CHUNK_SIZE)
+        {
+            addr = max( addr + FIBER_CHUNK_SIZE,
+                        (ULONG64)(ULONG_PTR)info.BaseAddress + info.RegionSize );
+            continue;
+        }
+        if (NtAllocateVirtualMemory( GetCurrentProcess(), &base, 0, &size,
+                                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE ))
+        {
+            addr += FIBER_CHUNK_SIZE;
+            continue;
+        }
+        for (i = 0; i < FIBER_CHUNK_SIZE / FIBER_PAGE_SIZE; i++)
+        {
+            struct fiber_page *page = (struct fiber_page *)((char *)base + i * FIBER_PAGE_SIZE);
+            page->next = free_fiber_pages;
+            free_fiber_pages = page;
+        }
+        fiber_chunk_cursor = addr + FIBER_CHUNK_SIZE;
+        return TRUE;
+    }
+}
+
+/* Returns zeroed fiber data with its context attached. Where no address
+ * below 4 GB is left, the fiber comes from the heap and works as before,
+ * except under native code that reads the slot. */
+static struct fiber_data *alloc_fiber(void)
+{
+    struct fiber_page *page;
+    struct fiber_data *fiber;
+    char *block;
+
+    RtlAcquireSRWLockExclusive( &fiber_page_lock );
+    if (!free_fiber_pages) add_fiber_chunk();
+    if ((page = free_fiber_pages)) free_fiber_pages = page->next;
+    RtlReleaseSRWLockExclusive( &fiber_page_lock );
+
+    if (page)
+    {
+        memset( page, 0, FIBER_PAGE_SIZE );
+        fiber = (struct fiber_data *)((char *)page + FIBER_PAGE_OFFSET);
+        fiber->context = (CONTEXT *)page;
+        return fiber;
+    }
+
+    WARN( "no fiber page below 4 GB left, using the heap\n" );
+    if (!(block = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY,
+                             sizeof(CONTEXT) + 16 + sizeof(struct fiber_data) )))
+        return NULL;
+    fiber = (struct fiber_data *)(block + sizeof(CONTEXT) + 16);
+    fiber->context = (CONTEXT *)(((ULONG_PTR)block + 15) & ~(ULONG_PTR)15);
+    fiber->allocation = block;
+    return fiber;
+}
+
+static void free_fiber( struct fiber_data *fiber )
+{
+    struct fiber_page *page;
+
+    if (fiber->allocation)
+    {
+        HeapFree( GetProcessHeap(), 0, fiber->allocation );
+        return;
+    }
+    page = (struct fiber_page *)fiber->context;
+    RtlAcquireSRWLockExclusive( &fiber_page_lock );
+    page->next = free_fiber_pages;
+    free_fiber_pages = page;
+    RtlReleaseSRWLockExclusive( &fiber_page_lock );
+}
 
 #ifdef __i386__
 extern void WINAPI switch_fiber( CONTEXT *old, CONTEXT *new );
@@ -1050,20 +1208,20 @@ static void CDECL start_fiber(void)
 static void init_fiber_context( struct fiber_data *fiber )
 {
 #ifdef __i386__
-    fiber->context.Esp = (ULONG_PTR)fiber->stack_base - 4;
-    fiber->context.Eip = (ULONG_PTR)start_fiber;
+    fiber->context->Esp = (ULONG_PTR)fiber->stack_base - 4;
+    fiber->context->Eip = (ULONG_PTR)start_fiber;
 #elif defined(__arm64ec__)
-    fiber->context.Rsp = (ULONG_PTR)fiber->stack_base;
-    fiber->context.Rip = (ULONG_PTR)start_fiber;
+    fiber->context->Rsp = (ULONG_PTR)fiber->stack_base;
+    fiber->context->Rip = (ULONG_PTR)start_fiber;
 #elif defined(__x86_64__)
-    fiber->context.Rsp = (ULONG_PTR)fiber->stack_base - 0x28;
-    fiber->context.Rip = (ULONG_PTR)start_fiber;
+    fiber->context->Rsp = (ULONG_PTR)fiber->stack_base - 0x28;
+    fiber->context->Rip = (ULONG_PTR)start_fiber;
 #elif defined(__arm__)
-    fiber->context.Sp = (ULONG_PTR)fiber->stack_base;
-    fiber->context.Pc = (ULONG_PTR)start_fiber;
+    fiber->context->Sp = (ULONG_PTR)fiber->stack_base;
+    fiber->context->Pc = (ULONG_PTR)start_fiber;
 #elif defined(__aarch64__)
-    fiber->context.Sp = (ULONG_PTR)fiber->stack_base;
-    fiber->context.Pc = (ULONG_PTR)start_fiber;
+    fiber->context->Sp = (ULONG_PTR)fiber->stack_base;
+    fiber->context->Pc = (ULONG_PTR)start_fiber;
 #endif
 }
 
@@ -1118,7 +1276,7 @@ LPVOID WINAPI DECLSPEC_HOTPATCH CreateFiberEx( SIZE_T stack_commit, SIZE_T stack
     struct fiber_data *fiber;
     INITIAL_TEB stack;
 
-    if (!(fiber = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*fiber) )))
+    if (!(fiber = alloc_fiber()))
     {
         SetLastError( ERROR_NOT_ENOUGH_MEMORY );
         return NULL;
@@ -1126,7 +1284,7 @@ LPVOID WINAPI DECLSPEC_HOTPATCH CreateFiberEx( SIZE_T stack_commit, SIZE_T stack
 
     if (!set_ntstatus( RtlCreateUserStack( stack_commit, stack_reserve, 0, 1, 1, &stack )))
     {
-        HeapFree( GetProcessHeap(), 0, fiber );
+        free_fiber( fiber );
         return NULL;
     }
 
@@ -1157,9 +1315,10 @@ BOOL WINAPI DECLSPEC_HOTPATCH ConvertFiberToThread(void)
         return FALSE;
     }
     relocate_thread_actctx_stack( &NtCurrentTeb()->ActivationContextStack );
+    set_fiber_slot( fiber->host_slot );
     NtCurrentTeb()->Tib.FiberData = NULL;
     NtCurrentTeb()->HasFiberData = FALSE;
-    HeapFree( GetProcessHeap(), 0, fiber );
+    free_fiber( fiber );
     return TRUE;
 }
 
@@ -1186,7 +1345,7 @@ LPVOID WINAPI DECLSPEC_HOTPATCH ConvertThreadToFiberEx( LPVOID param, DWORD flag
         return NULL;
     }
 
-    if (!(fiber = HeapAlloc( GetProcessHeap(), 0, sizeof(*fiber) )))
+    if (!(fiber = alloc_fiber()))
     {
         SetLastError( ERROR_NOT_ENOUGH_MEMORY );
         return NULL;
@@ -1200,8 +1359,10 @@ LPVOID WINAPI DECLSPEC_HOTPATCH ConvertThreadToFiberEx( LPVOID param, DWORD flag
     fiber->flags            = flags;
     fiber->fls_slots        = NtCurrentTeb()->FlsSlots;
     relocate_thread_actctx_stack( &fiber->actctx.stack_space );
+    fiber->host_slot        = get_fiber_slot();
     NtCurrentTeb()->Tib.FiberData = fiber;
     NtCurrentTeb()->HasFiberData = TRUE;
+    set_fiber_slot( fiber );
     return fiber;
 }
 
@@ -1217,13 +1378,13 @@ void WINAPI DECLSPEC_HOTPATCH DeleteFiber( LPVOID fiber_ptr )
     if (fiber == NtCurrentTeb()->Tib.FiberData)
     {
         relocate_thread_actctx_stack( &NtCurrentTeb()->ActivationContextStack );
-        HeapFree( GetProcessHeap(), 0, fiber );
+        free_fiber( fiber );
         RtlExitUserThread( 1 );
     }
     RtlFreeUserStack( fiber->stack_allocation );
     RtlProcessFlsData( fiber->fls_slots, 3 );
     RtlFreeActivationContextStack( &fiber->actctx.stack_space );
-    HeapFree( GetProcessHeap(), 0, fiber );
+    free_fiber( fiber );
 }
 
 
@@ -1252,13 +1413,14 @@ void WINAPI DECLSPEC_HOTPATCH SwitchToFiber( LPVOID fiber )
 
     /* FIXME: should save floating point context if requested in fiber->flags */
     NtCurrentTeb()->Tib.FiberData     = new_fiber;
+    set_fiber_slot( new_fiber );
     NtCurrentTeb()->Tib.ExceptionList = new_fiber->except;
     NtCurrentTeb()->Tib.StackBase     = new_fiber->stack_base;
     NtCurrentTeb()->Tib.StackLimit    = new_fiber->stack_limit;
     NtCurrentTeb()->DeallocationStack = new_fiber->stack_allocation;
     NtCurrentTeb()->FlsSlots          = new_fiber->fls_slots;
     NtCurrentTeb()->ActivationContextStackPointer = new_fiber->actctx.stack_ptr;
-    switch_fiber( &current_fiber->context, &new_fiber->context );
+    switch_fiber( current_fiber->context, new_fiber->context );
 }
 
 

@@ -517,6 +517,7 @@ struct amd64_thread_data
     DWORD                 fs;            /* 0338 WOW TEB selector */
     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
     char                  syscall_dispatch; /* 0340 */
+    ULONG_PTR             host_qos;      /* 0348 macOS QoS word that the fiber mirror displaces from %gs:0x20 */
 };
 
 C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
@@ -526,6 +527,38 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, ins
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
 C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, syscall_dispatch ) == 0x340 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, host_qos ) == 0x348 );
+
+#ifdef __APPLE__
+/* Windows code reads the current fiber as %gs:0x20 (GetCurrentFiber() is an
+ * inline load). GSBASE here is the macOS thread-specific data, where that slot
+ * is the thread's QoS word, which libdispatch and libpthread read and write.
+ * So while Windows code runs on a thread with fiber data the slot holds
+ * Tib.FiberData, and while unix code runs it holds the QoS word, kept in
+ * amd64_thread_data()->host_qos. The fiber functions in kernelbase write the
+ * slot on every switch. Both macros expect the TEB in %r13. */
+
+/* Entering unix code: put the QoS word back. Clobbers %rsi. */
+# define FIBER_SLOT_ENTER \
+    "movq 0x348(%r13),%rsi\n\t"      /* amd64_thread_data()->host_qos */ \
+    "movq %rsi,%gs:0x20\n\t"
+/* Leaving for Windows code: keep the QoS word and, on a fiber, show the fiber.
+ * A slot that already holds the fiber is skipped so the QoS word is never
+ * overwritten with it. Clobbers %rdx and %rsi. */
+# define FIBER_SLOT_LEAVE \
+    "movq %gs:0x20,%rdx\n\t" \
+    "testw $4,0x17ee(%r13)\n\t"      /* teb->HasFiberData */ \
+    "jz 8f\n\t" \
+    "movq 0x20(%r13),%rsi\n\t"       /* teb->Tib.FiberData */ \
+    "cmpq %rsi,%rdx\n\t" \
+    "je 9f\n\t" \
+    "movq %rsi,%gs:0x20\n" \
+    "8:\tmovq %rdx,0x348(%r13)\n" \
+    "9:\n\t"
+#else
+# define FIBER_SLOT_ENTER
+# define FIBER_SLOT_LEAVE
+#endif
 
 static inline struct amd64_thread_data *amd64_thread_data( struct thread_data *data )
 {
@@ -1696,6 +1729,7 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
                    "movw %ax,%fs\n"
                    "1:\n\t"
 #endif
+                   FIBER_SLOT_LEAVE
                    "movq 0x330(%r13),%r10\n\t" /* amd64_thread_data()->instrumentation_callback */
                    "movq (%r10),%r10\n\t"
                    "test %r10,%r10\n\t"
@@ -3133,6 +3167,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
     /* alloc_tls_slot() pokes a value at an address relative to each thread's
        gsbase.  Record the gsbase in the TEB so it can find it. */
     teb->Instrumentation[0] = thread_data->pthread_teb;
+    __asm__ volatile ("movq %%gs:0x20,%0" : "=r" (thread_data->host_qos));
 #else
 # error Please define setting %gs for your architecture
 #endif
@@ -3367,7 +3402,8 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "leaq -0x98(%rbp),%rcx\n"
                    "2:\n\t"
 #elif defined __APPLE__
-                   "leaq -0x98(%rbp),%rcx\n"
+                   "leaq -0x98(%rbp),%rcx\n\t"
+                   FIBER_SLOT_ENTER
 #endif
                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
                    "movl 0xb0(%rcx),%eax\n\t"      /* frame->syscall_id */
@@ -3408,6 +3444,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    __ASM_CFI(".cfi_remember_state\n\t")
                    __ASM_CFI_CFA_IS_AT2(rcx, 0xa8, 0x01) /* frame->syscall_cfa */
                    "leaq 0x70(%rcx),%rsp\n\t"      /* %rsp > frame means no longer inside syscall */
+                   FIBER_SLOT_LEAVE
 #if defined(__linux__) || defined(__FreeBSD__)
                    "movb $1,0x340(%r13)\n\t"       /* amd64_thread_data()->syscall_dispatch */
                    "movw 0x338(%r13),%dx\n"        /* amd64_thread_data()->fs */
@@ -3673,6 +3710,7 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "popq %r8\n\t"
                    "2:\n\t"
 #endif
+                   FIBER_SLOT_ENTER
                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
                    "movq %r8,%rdi\n\t"             /* args */
                    "callq *(%r10,%rdx,8)\n\t"
@@ -3706,6 +3744,7 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
 # endif
                    "1:\n\t"
 #endif
+                   FIBER_SLOT_LEAVE
                    "movq 0x58(%rcx),%r13\n\t"
                    "movq 0x28(%rcx),%rdi\n\t"
                    "movq 0x20(%rcx),%rsi\n\t"
